@@ -1,0 +1,40 @@
+[package]
+name = "ecash-wallet"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+description = "Wallet library for PSP, ESP and FSP Service Points, with a thin command line"
+
+[features]
+default = ["http"]
+# The HTTP calls to the mints, used by the command line. The rest of the library
+# does no I/O except its own note file, so an app can send requests its own way.
+http = ["dep:reqwest", "dep:mint-server"]
+
+[dependencies]
+mint-types = { git = "https://github.com/dav-anderson/mint-core", tag = "v0.1.2" }
+bdhke = { git = "https://github.com/dav-anderson/mint-core", tag = "v0.1.2" }
+mint-server = { git = "https://github.com/dav-anderson/mint-core", tag = "v0.1.2", optional = true }
+secp256k1 = { version = "0.30", default-features = false, features = ["global-context", "rand", "serde"] }
+air = { path = "../air" }
+psp-mint = { path = "../psp-mint" }
+esp-mint = { path = "../esp-mint" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4.3"
+sha2 = "0.10"
+rand = "0.8.5"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"], optional = true }
+
+[dev-dependencies]
+mint-core = { git = "https://github.com/dav-anderson/mint-core", tag = "v0.1.2" }
+
+[lib]
+name = "ecash_wallet"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ecash-wallet"
+path = "src/main.rs"
+required-features = ["http"]

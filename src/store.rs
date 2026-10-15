@@ -81,6 +81,9 @@ pub struct PendingExchange {
     pub outputs: Vec<PendingOutput>,
     /// Kept so that a retry sends exactly the same request.
     pub request: ExchangeRequest,
+    /// ESP units among the outputs that are change (see `esp.rs`).
+    #[serde(default)]
+    pub change_esp: u128,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

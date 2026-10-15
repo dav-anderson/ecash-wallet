@@ -13,7 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use air::names::secp256k1::SecretKey as DidSecretKey;
 use ecash_wallet::psp::parse_signatures;
 use ecash_wallet::{Kind, Wallet, WalletError};
-use esp_mint::exchange::{self, Psp};
+use esp_mint::exchange::{self, ExchangeError, Psp, Rejection};
 use esp_mint::responses::Responses;
 use esp_mint::terms::Terms;
 use mint_core::MintLogic;
@@ -24,6 +24,8 @@ use psp_mint::settle::{self, Settlement};
 use secp256k1::{PublicKey, XOnlyPublicKey};
 
 const G_X: &str = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+const ONE_PSP_ESP: u128 = 1_000_000_000_000;
+
 /// $100,000 per BTC in cents: 5,000 sats is exactly 5 PSP.
 const BTC_100K: u64 = 10_000_000;
 
@@ -138,9 +140,27 @@ fn buy_claim_and_exchange_end_to_end() {
     // a second claim of the same signatures finds nothing pending
     assert!(wallet.claim_psp(&signatures, &keys).is_err());
 
-    // exchange 5 PSP for ESP bound to the service
-    let built = wallet.build_exchange(5, service(), None).unwrap();
-    assert_eq!(wallet.balance().reserved, 2);
+    // Exchange 3 PSP for ESP bound to the service. The wallet holds a 4 and a 1,
+    // so it spends the 4 and asks the mint for all of it: 3 PSP of ESP for the
+    // service and 1 PSP of change, as ESP under the same terms.
+    let built = wallet.build_exchange(3, service(), None).unwrap();
+    assert_eq!((built.psp_spent, built.change_esp), (4, ONE_PSP_ESP));
+    assert_eq!(wallet.balance().reserved, 1);
+
+    // a request that is off by one ESP unit is refused before anything is burned
+    let mut off = built.request.clone();
+    off.outputs[0].amount = Amount::from_units(off.outputs[0].amount.units + 1);
+    let refused = exchange::exchange(&esp_logic, &master, &LocalPsp(&psp), &mut responses, now(), &off)
+        .unwrap_err();
+    assert!(
+        matches!(refused, ExchangeError::Rejected(Rejection::NotExact { .. })),
+        "{refused}"
+    );
+    for stored in wallet.notes() {
+        assert!(!psp.is_spent(stored.note.nonce).unwrap());
+    }
+    assert!(responses.is_empty());
+
     let response = exchange::exchange(
         &esp_logic,
         &master,
@@ -150,9 +170,9 @@ fn buy_claim_and_exchange_end_to_end() {
         &built.request,
     )
     .unwrap();
-    // the PSP notes are burned
+    // the 4 is burned at the PSP and the 1 is not
     for stored in wallet.notes() {
-        assert!(psp.is_spent(stored.note.nonce).unwrap());
+        assert_eq!(psp.is_spent(stored.note.nonce).unwrap(), stored.amount == 4);
     }
 
     // a lost reply: the same request gets the same answer, burning nothing more
@@ -168,26 +188,47 @@ fn buy_claim_and_exchange_end_to_end() {
     assert_eq!(response, again);
 
     let done = wallet.finish_exchange(&built.id, &response).unwrap();
-    assert_eq!(done.esp_units, 5 * 1_000_000_000_000);
-    assert_eq!(done.credit_esp, 0);
+    assert_eq!(done.esp_units, 4 * ONE_PSP_ESP);
+    assert_eq!(done.change_esp, ONE_PSP_ESP);
     let balance = wallet.balance();
-    assert_eq!((balance.psp, balance.esp, balance.notes), (0, 5_000_000_000_000, 1));
+    assert_eq!((balance.psp, balance.esp, balance.notes), (1, 4 * ONE_PSP_ESP, 3));
     assert_eq!(balance.pending_exchanges, 0);
 
-    // the ESP note verifies against the key the mint derives for its terms
-    let esp_note = &wallet.notes()[0];
-    assert_eq!(esp_note.kind, Kind::Esp);
-    let terms = Terms {
-        service: service(),
-        redeemable_after_day: done.redeemable_after_day,
-    };
-    assert_eq!(esp_note.terms.as_ref().unwrap().redeemable_after_day, terms.redeemable_after_day);
-    let sk = master.key_for(Amount::from_units(esp_note.amount), &terms);
-    assert!(bdhke::verify_message(
-        &sk,
-        esp_note.note.signature,
-        &esp_note.note.nonce.as_hash_preimage()
-    ));
+    // the last PSP note is exactly 1 PSP, the smallest exchange: no change
+    let last = wallet.build_exchange(1, service(), None).unwrap();
+    assert_eq!((last.psp_spent, last.change_esp), (1, 0));
+    let response = exchange::exchange(
+        &esp_logic,
+        &master,
+        &LocalPsp(&psp),
+        &mut responses,
+        now(),
+        &last.request,
+    )
+    .unwrap();
+    let done = wallet.finish_exchange(&last.id, &response).unwrap();
+    assert_eq!((done.esp_units, done.change_esp), (ONE_PSP_ESP, 0));
+    let balance = wallet.balance();
+    assert_eq!((balance.psp, balance.esp, balance.notes), (0, 5 * ONE_PSP_ESP, 3));
+
+    // every ESP note, change included, verifies against the key the mint derives
+    // for its terms
+    let mut checked = 0;
+    for note in wallet.notes() {
+        assert_eq!(note.kind, Kind::Esp);
+        let terms = Terms {
+            service: service(),
+            redeemable_after_day: note.terms.as_ref().unwrap().redeemable_after_day,
+        };
+        let sk = master.key_for(Amount::from_units(note.amount), &terms);
+        assert!(bdhke::verify_message(
+            &sk,
+            note.note.signature,
+            &note.note.nonce.as_hash_preimage()
+        ));
+        checked += 1;
+    }
+    assert_eq!(checked, 3);
 
     // the file on disk has the same balance
     let reopened = Wallet::open(&wallet_file).unwrap();

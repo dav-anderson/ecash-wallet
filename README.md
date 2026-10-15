@@ -70,7 +70,7 @@ finish_exchange(id, response) -> FinishResult
 cancel_exchange(id)
 ```
 
-`build_exchange` picks PSP notes that add up to exactly `psp_units`, so the mint never sees an excess. It splits the ESP into `esp_amounts` (default one note of `psp_units * 10^12`, which fits up to 18,446,744 PSP), signs every PSP input over the exchange memo, and reserves the notes. `finish_exchange` unblinds the mint's reply into ESP notes, each with the service and redeemable-after day, and removes the PSP notes that paid for them. `cancel_exchange` frees the reserved notes, and is only safe when the mint refused the request. After a timeout or a fault, send the same request again: the mint stores its answers by request hash.
+The mint's exchange is exact, and the smallest exchange is 1 PSP (10^12 ESP). So `build_exchange` always asks for the full value of the PSP notes it spends. It picks PSP notes with the smallest total that is at least `psp_units` (exactly `psp_units` whenever some set of its notes adds up to it). The amount asked for becomes the service's ESP notes: `esp_amounts` splits it (default one note of `psp_units * 10^12`, which fits up to 18,446,744 PSP). Anything the chosen notes are worth beyond `psp_units` is added as extra ESP notes under the same terms (the same service and redeemable-after day), so the request always matches. That change is ESP, not PSP, and cannot be turned back into PSP, which is why the wallet looks for the tightest cover. It signs every PSP input over the exchange memo and reserves the notes. `ExchangeBuild` reports `psp_spent` and `change_esp`, and `FinishResult` reports `change_esp`. `finish_exchange` unblinds the mint's reply into ESP notes, each with the service and redeemable-after day, and removes the PSP notes that paid for them. `cancel_exchange` frees the reserved notes, and is only safe when the mint refused the request. After a timeout or a fault, send the same request again: the mint stores its answers by request hash.
 
 `http::fetch_psp_keys(base)` and `http::send_exchange(base, &request)` make the two HTTP calls. A `400` is `WalletError::Refused` (nothing was burned). Anything else that goes wrong is `WalletError::Mint` (the outcome may be unknown).
 
@@ -92,7 +92,7 @@ ecash-wallet [--wallet FILE] <command>
 |---|---|
 | `buy-psp --mint-key HEX [--reply-did HEX] AMOUNT...` | Prints the encrypted payload as hex on standard output and the purchase id on standard error. |
 | `claim-psp [--psp-url URL] [--file FILE\|-] [BLIND_NONCE:SIGNATURE...]` | Claims the PSP's signatures. With no file or pairs it reads standard input. |
-| `exchange --service HEX --psp N [--amounts A,B,C] [--esp-url URL] [--resume ID]` | Exchanges N PSP for ESP bound to a service (32-byte x-only key, hex). `--resume` sends a pending request again. |
+| `exchange --service HEX --psp N [--amounts A,B,C] [--esp-url URL] [--resume ID]` | Exchanges at least N PSP (N is 1 or more) for ESP bound to a service (32-byte x-only key, hex). Whole PSP notes are spent and the difference comes back as ESP change. `--resume` sends a pending request again. |
 | `balance` | PSP, ESP (by service and day) and FSP held, and what is waiting. |
 | `transfer`, `redeem`, `fsp` | Print "not built yet". |
 
@@ -162,7 +162,7 @@ cargo run -q -- balance
 Expected:
 
 - `claim-psp` prints `claimed 5 PSP in 2 note(s); 0 output(s) still waiting`. The first `balance` shows `psp 5`.
-- `exchange` prints `received 5000000000000 ESP in 1 note(s), redeemable after day ...`. The second `balance` shows `psp 0` and `esp 5000000000000`.
+- `exchange` prints `received 5000000000000 ESP in 1 note(s), redeemable after day ...`. The second `balance` shows `psp 0` and `esp 5000000000000`. Asking for less than the notes held shows the change: with a 4 and a 1, `--psp 3` spends the 4 and prints `received 4000000000000 ESP in 2 note(s)`, with `1000000000000 of that is change`.
 - Terminal 2's `curl -s http://127.0.0.1:3100/audit` shows `issued` 5000000000000, and terminal 1's `/audit` on port 3000 shows the 5 PSP as `redeemed`.
 
 If `exchange` times out, run it again with `--resume <id>` (the id was printed). It sends the same request and gets the same answer, and nothing is burned twice.
@@ -174,8 +174,8 @@ If `exchange` times out, run it again with `--resume <id>` (the id was printed).
 - **Blinding.** An unblinded signature verifies against the mint's key. A wrong key or wrong blinding factor does not.
 - **Note file.** A change is saved before the call returns. A reopened wallet has the same notes. A corrupt file is an error and is not replaced. The file is `0600`.
 - **PSP.** A payload round trip: build, decrypt with the mint's key, decode, and the outputs match. A payload sealed to another key does not decrypt. Claimed signatures become notes the PSP accepts. A partial claim leaves the rest pending. A signature cannot be claimed twice. A bad claim changes nothing. The denomination and output-count limits.
-- **ESP.** The PSP notes are chosen to add up exactly. The memo and request hash match the ESP mint's. Spend signatures verify with mint-core's own check. A refused exchange frees the reserved notes. A finished one swaps PSP notes for ESP notes. The ESP amounts must add up.
-- **`tests/flow.rs`, in one process, with no network.** Build the payload, reopen the wallet, open the payload as the mint does, settle it with the PSP's real settlement code, read the printed signature lines, claim, check every note with the PSP's own check, then exchange against the ESP mint's real exchange code and check the ESP note against the key the mint derives for its terms. A retry gets the same reply and burns nothing more. Also: a payload sealed to another key is ignored and leaves no record, a payload with any one byte flipped is ignored, an exchange without enough PSP is refused before anything is reserved, and a signature the wallet did not ask for is refused.
+- **ESP.** The request is always exact: the PSP notes spent, times 10^12, equal the outputs' total, with and without change. The cover is the exact set when one exists and otherwise the tightest the wallet can find, checked on several holdings. The memo and request hash match the ESP mint's. Spend signatures cover the memo. A refused exchange frees the reserved notes. A finished one swaps PSP notes for ESP notes, change included. The asked-for split must add up. Not enough PSP, and an exchange below 1 PSP, are refused before anything is reserved.
+- **`tests/flow.rs`, in one process, with no network.** Build the payload, reopen the wallet, open the payload as the mint does, settle it with the PSP's real settlement code, read the printed signature lines, claim, check every note with the PSP's own check, then exchange against the ESP mint's real exchange code: 3 PSP from a 4 and a 1 (the 4 is spent, 3 PSP of ESP plus 1 PSP of change), a request made one ESP unit off is refused before anything is burned, and the last 1 PSP is exchanged exactly. Every ESP note, change included, is checked against the key the mint derives for its terms. A retry gets the same reply and burns nothing more. Also: a payload sealed to another key is ignored and leaves no record, a payload with any one byte flipped is ignored, an exchange without enough PSP is refused before anything is reserved, and a signature the wallet did not ask for is refused.
 
 The regtest run above is the end-to-end test with a real Bitcoin node.
 
@@ -186,10 +186,10 @@ The regtest run above is the end-to-end test with a real Bitcoin node.
 - **A real reply DID.** The command line uses a made-up one. An AIR app passes its own.
 - **Mint API calls over the AIR (deferred).** The HTTP client is the development transport.
 - **Transfer, redemption and FSP.** The entry points are there. They wait on the ESP mint and fsp-mint.
-- **Shared wire crate.** The library depends on `psp-mint` and `esp-mint` by path for the payload format, the sealing and the exchange types, so it pulls in their servers and the AIR tree. A small crate for just the wire format would be lighter for apps that embed the wallet. Not decided.
-- **AIR as a path dependency.** It builds only with `../air` and `../substance` beside it.
+- **Shared wire crate.** The library depends on `psp-mint` and `esp-mint` by path for the payload format, the sealing and the exchange types, so it pulls in their servers and the AIR tree. A small crate for just the wire format would be lighter for apps that embed the wallet. Path dependencies are fine while this is in development. Before anyone else needs to clone and build it, move the wire format into a small crate, or switch to git dependencies with pinned tags like mint-core.
+- **AIR as a path dependency.** It builds only with `../air` and `../substance` beside it. The same rule applies: fine for development, to be replaced before others build it.
 - **Key protection.** Spend keys are stored in plain JSON with `0600` permissions. How they are protected in the AIR store is not decided.
-- **Amount selection.** PSP notes are chosen to add up exactly, and the exchange fails when no exact subset exists. Splitting a note needs a PSP-side swap, which the PSP does not offer (the PSP has no `/swap`).
+- **Change is ESP.** When no set of PSP notes adds up to the amount, the difference comes back as ESP bound to the same service, not as PSP. Making PSP change needs a PSP-side swap, which the PSP does not offer (it has no `/swap`), so buy PSP in the sizes you will exchange to avoid locking value to a service.
 
 ## Not decided yet
 

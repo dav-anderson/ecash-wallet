@@ -25,7 +25,11 @@ ecash-wallet [--wallet FILE] <command>
       Turn the PSP's signatures into notes. Paste the PSP's output into a file,
       or pass pairs. With neither, reads standard input.
   exchange --service HEX --psp N [--amounts A,B,C] [--esp-url URL] [--resume ID]
-      Exchange N PSP for ESP bound to a service (32 byte x-only key, hex).
+      Exchange at least N PSP for ESP bound to a service (32 byte x-only key,
+      hex). The smallest exchange is 1 PSP. The mint's exchange is exact, so the
+      wallet spends whole PSP notes worth at least N and asks for all of their
+      value: N PSP of ESP, plus any difference as extra ESP notes (change) under
+      the same terms.
   balance
       What the wallet holds and what is waiting.
   transfer | redeem | fsp
@@ -160,6 +164,8 @@ fn exchange(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
             ExchangeBuild {
                 id: pending.id.clone(),
                 request: pending.request.clone(),
+                psp_spent: pending.request.psp_inputs.iter().map(|i| i.amount.units).sum(),
+                change_esp: pending.change_esp,
             }
         }
         None => {
@@ -189,7 +195,7 @@ fn exchange(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
             wallet.build_exchange(psp, service, amounts.as_deref())?
         }
     };
-    eprintln!("exchange {}", built.id);
+    eprintln!("exchange {} (spends {} PSP)", built.id, built.psp_spent);
     match http::send_exchange(&base, &built.request) {
         Ok(response) => {
             let done = wallet.finish_exchange(&built.id, &response)?;
@@ -199,8 +205,11 @@ fn exchange(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
                 done.notes.len(),
                 done.redeemable_after_day
             );
-            if done.credit_esp > 0 {
-                println!("the mint recorded {} ESP as credit", done.credit_esp);
+            if done.change_esp > 0 {
+                println!(
+                    "{} of that is change: the PSP notes spent were worth more than the amount asked for, and the rest came back as ESP under the same terms",
+                    done.change_esp
+                );
             }
             Ok(())
         }

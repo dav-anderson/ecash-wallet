@@ -19,8 +19,8 @@
 use mint_types::{Amount, MintInput, melt_sighash};
 use secp256k1::{Keypair, SECP256K1, XOnlyPublicKey};
 
-use esp_mint::exchange::{self, ExchangeRequest, ExchangeResponse};
-use esp_mint::units::ESP_PER_PSP;
+use sp_wire::esp::exchange::{self, ExchangeRequest, ExchangeResponse};
+use sp_wire::units::ESP_PER_PSP;
 
 use crate::blind::PendingOutput;
 use crate::error::WalletError;
@@ -195,7 +195,7 @@ impl Wallet {
             None => vec![u64::try_from(target).map_err(|_| {
                 WalletError::Invalid(format!(
                     "{psp_units} PSP is too much for one ESP note (the most is {}). Split it with --amounts",
-                    esp_mint::units::MAX_PSP_PER_NOTE
+                    sp_wire::units::MAX_PSP_PER_NOTE
                 ))
             })?],
             Some(list) => {
@@ -812,7 +812,7 @@ mod tests {
     fn one_esp_note_holds_at_most_184_467_440_psp_and_a_split_gets_past_it() {
         let (mut w, dir) = wallet_with("limit", &[16_777_216]);
         // 184,467,441 PSP is 1.84467441e19 ESP, over u64::MAX, so not one note
-        assert!(esp_mint::units::MAX_PSP_PER_NOTE < 184_467_441);
+        assert!(sp_wire::units::MAX_PSP_PER_NOTE < 184_467_441);
         assert!(w.build_exchange(16_777_216, service(), None).is_ok());
         let (mut big, dir2) = wallet_with("limit2", &[]);
         assert!(matches!(

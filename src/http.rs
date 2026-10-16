@@ -7,12 +7,12 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use esp_mint::exchange::{ExchangeRequest, ExchangeResponse};
-use esp_mint::redeem::{RedeemResponse, Totals};
-use esp_mint::transfer::{TransferRequest, TransferResponse};
 use mint_server::api::KeysResponse;
 use mint_types::Amount;
 use secp256k1::PublicKey;
+use sp_wire::esp::exchange::{ExchangeRequest, ExchangeResponse};
+use sp_wire::esp::redeem::{RedeemResponse, Totals};
+use sp_wire::esp::transfer::{TransferRequest, TransferResponse};
 
 use crate::Wallet;
 use crate::error::WalletError;
@@ -40,10 +40,21 @@ pub fn check_network(url: &str, expected: &str, reported: Option<&str>) -> Resul
     }
 }
 
-/// Ask a mint which network it is on (`GET /health`) and refuse if it is not
-/// `expected`. Called before anything else is sent to it. `/health` may answer
-/// `503` while the mint is unwell; the network is in that body too.
-pub fn verify_network(base: &str, expected: &str) -> Result<(), WalletError> {
+/// Check the `wire_version` a mint reported in its `GET /health` against the
+/// wire version this wallet speaks (`sp_wire::WIRE_VERSION`). A mint that
+/// reports another number, or none, is refused.
+pub fn check_wire(url: &str, health: &serde_json::Value) -> Result<(), WalletError> {
+    sp_wire::version::check_health(health).map_err(|why| WalletError::Wire {
+        url: url.to_string(),
+        why,
+    })
+}
+
+/// Ask a mint (`GET /health`) which wire version it speaks and which network it
+/// is on, and refuse if the wire version is not this wallet's or the network is
+/// not `expected`. Called before anything else is sent to it. `/health` may
+/// answer `503` while the mint is unwell; both fields are in that body too.
+pub fn verify_mint(base: &str, expected: &str) -> Result<(), WalletError> {
     let url = format!("{}/health", base.trim_end_matches('/'));
     let response = client()?
         .get(&url)
@@ -52,12 +63,13 @@ pub fn verify_network(base: &str, expected: &str) -> Result<(), WalletError> {
     let body: serde_json::Value = response
         .json()
         .map_err(|e| WalletError::Mint(format!("{url}: {e}")))?;
+    check_wire(base, &body)?;
     check_network(base, expected, body.get("network").and_then(|n| n.as_str()))
 }
 
 /// The PSP's public key for each note size (`GET /keys`).
 /// The PSP's live keysets (`GET /keysets`).
-pub fn fetch_psp_keysets(base: &str) -> Result<psp_mint::server::KeysetsResponse, WalletError> {
+pub fn fetch_psp_keysets(base: &str) -> Result<sp_wire::psp::KeysetsResponse, WalletError> {
     let url = format!("{}/keysets", base.trim_end_matches('/'));
     let response = client()?
         .get(&url)
@@ -305,9 +317,9 @@ pub fn parse_redeem_fees(text: &str) -> Result<RedeemFees, String> {
         .ok_or("no redeem.max_memo_bytes")? as usize;
     let size = &redeem["size"];
     let expected = [
-        ("fixed", esp_mint::redeem::FIXED_BYTES),
-        ("per_input", esp_mint::redeem::INPUT_BYTES),
-        ("per_output", esp_mint::redeem::OUTPUT_BYTES),
+        ("fixed", sp_wire::esp::redeem::FIXED_BYTES),
+        ("per_input", sp_wire::esp::redeem::INPUT_BYTES),
+        ("per_output", sp_wire::esp::redeem::OUTPUT_BYTES),
     ];
     for (name, bytes) in expected {
         if size[name].as_u64() != Some(bytes) {
@@ -370,7 +382,7 @@ pub fn redeem_refusal(text: &str) -> WalletError {
         error: Option<String>,
         code: Option<String>,
         totals: Option<Totals>,
-        notes: Option<Vec<esp_mint::redeem::NoteResult>>,
+        notes: Option<Vec<sp_wire::esp::redeem::NoteResult>>,
     }
     match serde_json::from_str::<Body>(text) {
         Ok(body) => WalletError::RedeemRefused {
@@ -401,7 +413,7 @@ mod tests {
                 assert_eq!(notes.len(), 2);
                 assert_eq!(
                     notes[0].reason,
-                    Some(esp_mint::redeem::Reason::AlreadySpent)
+                    Some(sp_wire::esp::redeem::Reason::AlreadySpent)
                 );
                 assert_eq!(notes[1].reason, None);
             }
@@ -588,7 +600,7 @@ fn fsp_refusal(body: &serde_json::Value, code: &str, why: &str) -> WalletError {
 }
 
 /// An FSP mint's keysets (`GET /keys`).
-pub fn fetch_fsp_keys(base: &str) -> Result<fsp_mint::api::KeysResponse, WalletError> {
+pub fn fetch_fsp_keys(base: &str) -> Result<sp_wire::fsp::KeysResponse, WalletError> {
     let url = format!("{}/keys", base.trim_end_matches('/'));
     let r = client()?
         .get(&url)
@@ -602,7 +614,7 @@ pub fn fetch_fsp_keys(base: &str) -> Result<fsp_mint::api::KeysResponse, WalletE
 }
 
 /// An FSP mint's rotation schedule (`GET /rotation`).
-pub fn fetch_fsp_rotation(base: &str) -> Result<fsp_mint::api::RotationResponse, WalletError> {
+pub fn fetch_fsp_rotation(base: &str) -> Result<sp_wire::fsp::RotationResponse, WalletError> {
     let url = format!("{}/rotation", base.trim_end_matches('/'));
     let r = client()?
         .get(&url)
@@ -615,7 +627,7 @@ pub fn fetch_fsp_rotation(base: &str) -> Result<fsp_mint::api::RotationResponse,
         .map_err(|e| WalletError::Mint(format!("{url}: {e}")))
 }
 
-pub fn fetch_fsp_fees(base: &str) -> Result<fsp_mint::api::FeesResponse, WalletError> {
+pub fn fetch_fsp_fees(base: &str) -> Result<sp_wire::fsp::FeesResponse, WalletError> {
     let url = format!("{}/fees", base.trim_end_matches('/'));
     let r = client()?
         .get(&url)
@@ -627,15 +639,15 @@ pub fn fetch_fsp_fees(base: &str) -> Result<fsp_mint::api::FeesResponse, WalletE
 
 pub fn send_fsp_issue(
     base: &str,
-    request: &fsp_mint::api::IssueRequest,
-) -> Result<fsp_mint::api::IssueResponse, WalletError> {
+    request: &sp_wire::fsp::IssueRequest,
+) -> Result<sp_wire::fsp::IssueResponse, WalletError> {
     fsp_post(base, "issue", request)
 }
 
 pub fn send_fsp_spend(
     base: &str,
-    request: &fsp_mint::api::SpendRequest,
-) -> Result<fsp_mint::api::SpendResponse, WalletError> {
+    request: &sp_wire::fsp::SpendRequest,
+) -> Result<sp_wire::fsp::SpendResponse, WalletError> {
     fsp_post(base, "spend", request)
 }
 
@@ -760,8 +772,13 @@ mod network_tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
 
+    /// A health body for `network`, with a `wire_version`.
+    fn body(network: &str, wire: impl std::fmt::Display) -> String {
+        format!(r#"{{"status":"ok","network":"{network}","wire_version":{wire}}}"#)
+    }
+
     /// A one-request server that answers `/health` with `body`.
-    fn health(body: &'static str) -> String {
+    fn health(body: String) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         std::thread::spawn(move || {
@@ -779,18 +796,73 @@ mod network_tests {
 
     #[test]
     fn a_mint_on_another_network_is_refused() {
-        let base = health(r#"{"status":"ok","network":"regtest"}"#);
-        let e = verify_network(&base, "main").unwrap_err();
+        let base = health(body("regtest", sp_wire::WIRE_VERSION));
+        let e = verify_mint(&base, "main").unwrap_err();
         assert!(matches!(e, WalletError::Invalid(_)), "{e}");
         assert!(
             e.to_string()
                 .contains("is on regtest, but this wallet is on main"),
             "{e}"
         );
-        let base = health(r#"{"status":"ok","network":"regtest"}"#);
-        verify_network(&base, "regtest").unwrap();
-        let base = health(r#"{"status":"ok"}"#);
-        assert!(verify_network(&base, "regtest").is_err());
+        let base = health(body("regtest", sp_wire::WIRE_VERSION));
+        verify_mint(&base, "regtest").unwrap();
+        let base = health(format!(
+            r#"{{"status":"ok","wire_version":{}}}"#,
+            sp_wire::WIRE_VERSION
+        ));
+        assert!(verify_mint(&base, "regtest").is_err());
+    }
+
+    #[test]
+    fn a_mint_on_another_wire_version_is_refused_with_a_clear_error() {
+        let other = u64::from(sp_wire::WIRE_VERSION) + 1;
+        let base = health(body("regtest", other));
+        let e = verify_mint(&base, "regtest").unwrap_err();
+        assert!(matches!(e, WalletError::Wire { .. }), "{e}");
+        let text = e.to_string();
+        assert!(
+            text.contains(&format!("wire version {other}"))
+                && text.contains(&format!("speaks {}", sp_wire::WIRE_VERSION))
+                && text.contains("update whichever is older")
+                && text.contains("Nothing was sent"),
+            "{text}"
+        );
+        assert!(text.contains(&base), "{text}");
+    }
+
+    #[test]
+    fn a_mint_that_reports_no_wire_version_is_refused() {
+        let base = health(r#"{"status":"ok","network":"regtest"}"#.to_string());
+        let e = verify_mint(&base, "regtest").unwrap_err();
+        assert!(matches!(e, WalletError::Wire { .. }), "{e}");
+        assert!(
+            e.to_string().contains("does not report a wire_version"),
+            "{e}"
+        );
+        // not an integer
+        let base = health(body("regtest", "\"1\""));
+        assert!(matches!(
+            verify_mint(&base, "regtest").unwrap_err(),
+            WalletError::Wire { .. }
+        ));
+    }
+
+    #[test]
+    fn the_wire_version_is_checked_before_the_network() {
+        // An old mint on the wrong network is told it is old, which is the
+        // thing to fix first.
+        let base = health(r#"{"status":"ok","network":"regtest"}"#.to_string());
+        let e = verify_mint(&base, "main").unwrap_err();
+        assert!(matches!(e, WalletError::Wire { .. }), "{e}");
+    }
+
+    #[test]
+    fn check_wire_reads_the_health_body() {
+        let ok: serde_json::Value =
+            serde_json::from_str(&body("main", sp_wire::WIRE_VERSION)).unwrap();
+        assert!(check_wire("http://m", &ok).is_ok());
+        let bad: serde_json::Value = serde_json::from_str(&body("main", 99)).unwrap();
+        assert!(check_wire("http://m", &bad).is_err());
     }
 }
 
@@ -832,7 +904,7 @@ fn send_rollover_retry(wallet: &mut Wallet, id: &str, retry: bool) -> Result<Str
         Ok(v) => {
             let (epoch, keyset, sigs, keys) = match p.kind {
                 Kind::Psp => {
-                    let r: psp_mint::rotation::RolloverResponse =
+                    let r: sp_wire::psp::RolloverResponse =
                         serde_json::from_value(v).map_err(|e| WalletError::Mint(e.to_string()))?;
                     (
                         r.epoch,
@@ -842,7 +914,7 @@ fn send_rollover_retry(wallet: &mut Wallet, id: &str, retry: bool) -> Result<Str
                     )
                 }
                 _ => {
-                    let r: esp_mint::rotation::RolloverResponse =
+                    let r: sp_wire::esp::rollover::RolloverResponse =
                         serde_json::from_value(v).map_err(|e| WalletError::Mint(e.to_string()))?;
                     (r.epoch, r.keyset, r.signatures, r.keys)
                 }
@@ -980,9 +1052,7 @@ pub fn receive_psp(wallet: &mut Wallet, token: &str) -> Result<crate::send::Rece
             .find(|p| p.id == id)
             .cloned()
             .expect("just stored");
-        return match fsp_post::<_, psp_mint::rotation::RolloverResponse>(
-            &p.url, "rollover", &p.body,
-        ) {
+        return match fsp_post::<_, sp_wire::psp::RolloverResponse>(&p.url, "rollover", &p.body) {
             Ok(r) => {
                 let sigs: Vec<_> = r.outcomes.into_iter().map(|o| o.0).collect();
                 wallet.finish_rollover(&id, r.epoch, &r.keyset, &sigs, &r.keys)?;

@@ -437,7 +437,7 @@ fn esp_rolls_over_keeping_its_service_and_day() {
 fn settle_now(
     m: &PspMint,
     dir: &PathBuf,
-    key: &air::names::secp256k1::SecretKey,
+    key: &sp_wire::seal::SecretKey,
     txid: &str,
     payload: Vec<u8>,
 ) -> String {
@@ -470,7 +470,7 @@ fn purchases_around_a_psp_rotation_are_claimed_with_the_keys_of_the_set_that_sig
     let dir = scratch("psp-claim");
     let m = start_psp(&rt, &dir);
     let _ = m.note(1);
-    let mint_key = air::names::secp256k1::SecretKey::new();
+    let mint_key = sp_wire::seal::SecretKey::new();
     let mut w = Wallet::open(&dir.join("w.json")).unwrap();
     let reply = w.reply_did().unwrap();
     // Both purchases are prepared before the rotation; `a` is settled before

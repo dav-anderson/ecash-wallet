@@ -3,7 +3,7 @@
 //! Only the owner of a service's DID key can redeem ESP for that service. The
 //! wallet builds the request the ESP mint takes on `POST /redeem` (see the
 //! esp-mint README, "Redemption"): its canonical binary encoding, made with the
-//! mint's own `esp_mint::redeem::encode`, signed by the service's key, with every
+//! mint's own `sp_wire::esp::redeem::encode`, signed by the service's key, with every
 //! note's spend signature over the same digest.
 //!
 //! What the wallet does, step by step:
@@ -51,15 +51,30 @@ use mint_types::{Amount, MintInput};
 use secp256k1::{Keypair, SECP256K1, SecretKey, XOnlyPublicKey};
 use serde::{Deserialize, Serialize};
 
-use esp_mint::queue::Status;
-use esp_mint::redeem::{
+use sp_wire::esp::queue::Status;
+use sp_wire::esp::redeem::{
     self, NoteResult, Reason, RedeemInput, RedeemOutput, RedeemRequest, RedeemResponse, Totals,
 };
-use esp_mint::terms::Terms;
+use sp_wire::esp::terms::Terms;
 
 use crate::blind::PendingOutput;
 use crate::error::WalletError;
 use crate::store::{Kind, StoredNote, StoredTerms, Wallet};
+
+/// The fee rate to assume (ESP units per encoded byte) until `/fees` has been
+/// read. It is the mint's placeholder default, not part of the wire format: the
+/// mint's own rate is read from `GET /fees` and replaces it.
+const DEFAULT_FEE_PER_BYTE: u128 = 1_000_000;
+
+/// The request ceiling to assume (64 MiB) until `/fees` has been read. Also the
+/// mint's default, not wire format.
+const DEFAULT_MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
+
+/// The fee for a request of `size` encoded bytes at `fee_per_byte`: the size
+/// times the rate, the way the mint charges it.
+fn fee_for(size: u64, fee_per_byte: u128) -> u128 {
+    u128::from(size).saturating_mul(fee_per_byte)
+}
 
 /// What the ESP mint says about redemption (`GET /fees`, `redeem`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,8 +91,8 @@ impl Default for RedeemFees {
     /// The mint's documented defaults.
     fn default() -> Self {
         RedeemFees {
-            fee_per_byte: redeem::DEFAULT_FEE_PER_BYTE,
-            max_request_bytes: redeem::DEFAULT_MAX_REQUEST_BYTES as u64,
+            fee_per_byte: DEFAULT_FEE_PER_BYTE,
+            max_request_bytes: DEFAULT_MAX_REQUEST_BYTES as u64,
             max_memo_bytes: redeem::DEFAULT_MAX_MEMO_BYTES,
         }
     }
@@ -252,7 +267,7 @@ pub fn allocate(
     let mut seen = Vec::new();
     loop {
         let size = redeem::encoded_len(inputs, memo_bytes, counts.0, counts.1);
-        let fee = redeem::fee_for(size, fee_per_byte);
+        let fee = fee_for(size, fee_per_byte);
         if a + r < fee {
             return Err(WalletError::NotEnough(format!(
                 "the notes are worth {} ESP units, less than the fee of {fee} ({size} bytes at {fee_per_byte} a byte). The mint would refuse: nothing is sent",
@@ -276,7 +291,7 @@ pub fn allocate(
         }
         if seen.contains(&next) && a > 0 {
             let size = redeem::encoded_len(inputs, memo_bytes, next.0, next.1).max(size);
-            let fee = redeem::fee_for(size, fee_per_byte);
+            let fee = fee_for(size, fee_per_byte);
             // The value is about the fee: with its decline output the fee takes
             // everything, and without one the request is smaller and owes a
             // little, which needs the output again. Either way it is not worth
@@ -1148,9 +1163,9 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
-    use esp_mint::queue::{EntryView, SignedOutput};
-    use esp_mint::redeem::NoteResult;
     use secp256k1::PublicKey;
+    use sp_wire::esp::queue::{EntryView, SignedOutput};
+    use sp_wire::esp::redeem::NoteResult;
 
     /// Day 20_735 at noon.
     const NOW: u64 = 20_735 * 86_400 + 43_200;
@@ -1237,7 +1252,7 @@ mod tests {
     }
 
     fn fee_of(inputs: usize, decline: usize, refund: usize) -> u128 {
-        redeem::fee_for(
+        fee_for(
             redeem::encoded_len(inputs, MEMO.len(), decline, refund),
             RATE,
         )
@@ -1355,7 +1370,7 @@ mod tests {
         assert_eq!(b.esp_units, u128::from(5 * ONE));
         assert_eq!(b.body.len() as u64, b.size_bytes);
         assert_eq!(b.size_bytes, redeem::encoded_len(2, MEMO.len(), 2, 0));
-        assert_eq!(b.fee_esp, redeem::fee_for(b.size_bytes, RATE));
+        assert_eq!(b.fee_esp, fee_for(b.size_bytes, RATE));
         assert_eq!(b.owed_esp, b.esp_units - b.fee_esp);
         let request = redeem::decode(&b.body).unwrap();
         assert_eq!(redeem::request_hash(&request), b.id);

@@ -23,7 +23,16 @@ FSP has unit tests and HTTP flow tests against a real esp-mint and fsp-mint in o
 
 ## Setup
 
-The crate depends on its sibling crates by path, so these folders must sit next to `ecash-wallet`: `psp-mint`, `esp-mint`, `air` and `substance` (which `air` needs). The mint-core crates come from git, tag `v0.1.2`.
+The wallet builds from tagged dependencies: mint-core at `v0.1.3` and `sp-wire` at `v0.1.0` (git tags), and, through `sp-wire`'s `seal` feature, the `air` crate at commit `6dd0117` (AIR has no tags). **It does not depend on the mint crates.** Every type it exchanges with the mints, the PSP payload and its encryption, the request hashes, the unit constants and the error codes come from `sp-wire` (see "Wire format and versions"). The mints (`psp-mint`, `esp-mint`, `fsp-mint`, each `v0.1.1`) are dev-dependencies only: the tests start real ones in the process, and nothing in the library or the command line links them.
+
+AIR's own manifest names `../substance` by path, which a build from a git checkout cannot find. Until that is changed upstream, build against local folders with a `[patch]` for `air` in `.cargo/config.toml` (git-ignored; the exact recipe, for every repo, is in the top-level README in `sandbox-mint`):
+
+```toml
+[patch."https://github.com/ramp-stack/air"]
+air = { path = "../air" }
+```
+
+`../air` needs `../substance` next to it. To test against unpushed local copies of `sp-wire`, the mints or mint-core, `source ~/sandbox-mint/scripts/local-git.sh` points git at the local folders and their local tags.
 
 ```
 cd ~/ecash-wallet
@@ -31,6 +40,12 @@ cargo test
 ```
 
 The `http` feature is on by default. It adds the HTTP client and the command line. An app that sends requests its own way can turn it off and use only the library.
+
+## Wire format and versions
+
+The request and response bodies, the PSP payload and its sealed form, the key-set ID, the request hashes and digests, the redeem encoding, the unit constants and the error codes are defined in the `sp-wire` crate, shared with the mints, so the wallet cannot drift from a mint by a byte. What stays here is the wallet's own: the note file, coin selection, blinding, the schedules and the command line. Two small things are the wallet's own copies and are not wire format: the date parser for `esp-schedule --by` (`src/date.rs`), and the assumed redemption fee rate and request ceiling used before `GET /fees` has been read (`src/redeem.rs`).
+
+Every mint's `GET /health` returns `wire_version`. `http::verify_mint(url, network)` reads it, along with the network, before anything is sent, and refuses a mint that reports another number or none: `WalletError::Wire`, which says the mint's number and the wallet's and to update whichever is older. The command line calls it for every mint. An app that sends its own requests should call `http::check_wire(url, &health_body)` on the body it gets. **Changing any encoded byte or JSON field in `sp-wire` means bumping `WIRE_VERSION`.**
 
 ## Notes and the wallet file
 
@@ -58,8 +73,8 @@ claim_psp(signatures, keys) -> ClaimResult
 
 1. Takes the note sizes in PSP (powers of two from 1 to 16,777,216, at most 255; a PSP is $0.10, so 10 PSP are $1) and a 33-byte `reply_did`.
 2. Blinds each output with a fresh spend key and blinding factor.
-3. Encodes the payload with psp-mint's `payload::encode` (reply DID, then each amount and blind nonce).
-4. Encrypts it to `mint_did_pubkey` with AIR's secp256k1 encryption (psp-mint's `seal::encrypt`).
+3. Encodes the payload with `sp-wire`'s `payload::encode` (reply DID, then each amount and blind nonce).
+4. Encrypts it to `mint_did_pubkey` with AIR's secp256k1 encryption (`sp-wire`'s `seal::encrypt`).
 5. Saves the pending purchase (the blinding factors and spend keys), then returns the bytes.
 
 `id` is the SHA-256 of the sealed payload. `claim_psp` takes the pairs the PSP prints, `signature <blind nonce> <signature>`, and the PSP's public keys from `GET /keys`. It matches each pair to the pending output by blind nonce, unblinds it and stores the note. It is all or nothing: a pair that matches no pending output, or an amount the PSP has no key for, changes nothing. A signature can be claimed once. When the PSP signed only some outputs (a payment short by more than 1%), the rest stay pending.
@@ -114,13 +129,13 @@ This follows esp-mint's `POST /redeem` as it is built (see "Redemption" in the e
 
 What goes in. `build_redemption` takes every free ESP note for the service whose key is `service_secret` and whose redeemable-after day has come on the wallet's clock (`now_unix / 86400 >= day`). Mixed days are allowed. Notes of other services, and notes not yet mature, are left alone. The memo says where the payout goes (for example `btc:ADDRESS`). It must not be empty or blank and must fit `max_memo_bytes`.
 
-Size and fee. The size is exact: `119 + 186 per input + memo bytes + 81 per output` (decline and refund outputs alike), which is `esp_mint::redeem::encoded_len`. The fee is `size × fee_per_byte`, with the rate taken from `GET /fees` (the `redeem` block, whose size constants the wallet checks against 119, 186 and 81). `RedeemBuild` and `RedeemOutcome` report `size_bytes`, `fee_per_byte` and `fee_esp`, and the command prints them before sending.
+Size and fee. The size is exact: `119 + 186 per input + memo bytes + 81 per output` (decline and refund outputs alike), which is `sp_wire::esp::redeem::encoded_len`. The fee is `size × fee_per_byte`, with the rate taken from `GET /fees` (the `redeem` block, whose size constants the wallet checks against 119, 186 and 81). `RedeemBuild` and `RedeemOutcome` report `size_bytes`, `fee_per_byte` and `fee_esp`, and the command prints them before sending.
 
 Outputs. The accepted value minus the fee comes back as decline outputs, held under each note's own service and day (the mint checks the total against what it owes and each day against what it accepted). The fee is taken from the service and day with the most value first, then the next largest, so small days keep their value. The mint does not fix where the fee comes from: it checks only the total and each day's cap. Amounts over `u64::MAX` are split into several outputs. The output count changes the size and so the fee, so the wallet repeats the sum until it settles. If the notes are worth less than the fee, or the fee would take all of them so that the mint would owe nothing, that request is not sent and the wallet says why (`not sent: ...`, printed by the command). Its notes stay free. When no request is left the result is `NotEnough` with the same reason. `plan_redemption` returns the built requests together with these reasons; `build_redemption` returns just the requests.
 
 Splitting. If the request would be larger than `max_request_bytes` (from `/fees`, or lower with `--max-bytes`), the notes are split, oldest day first, into several requests that each fit, counting the worst case for outputs. Each part is its own request with its own fee and its own payout entry. A ceiling too small for one note is refused.
 
-Crash safety. Each request is stored in the wallet file by its request hash (`esp_mint::redeem::request_hash`, also the mint's entry id) with its exact bytes, and its notes are reserved by that id before it is sent. The blinding factors for its decline and refund outputs are stored with it. After a lost reply or a fault, send the same bytes again: the mint keeps its answers by request hash, so nothing is burned or queued twice. `finish_redemption` can be given the same answer more than once.
+Crash safety. Each request is stored in the wallet file by its request hash (`sp_wire::esp::redeem::request_hash`, also the mint's entry id) with its exact bytes, and its notes are reserved by that id before it is sent. The blinding factors for its decline and refund outputs are stored with it. After a lost reply or a fault, send the same bytes again: the mint keeps its answers by request hash, so nothing is burned or queued twice. `finish_redemption` can be given the same answer more than once.
 
 Bad proofs. A note the mint rejects for a bad proof (in a reply or in a refusal's totals) stays in the wallet and in the balance, but its id is saved in the wallet file (`bad_proof`) and redemptions no longer pick it. `balance` prints `bad proof N note(s) worth X ESP`. `is_flagged_bad_proof(id)` checks the flag and `clear_bad_proof(id)` clears it.
 
@@ -169,7 +184,7 @@ For a developer that sells PSP to its users by in-app purchase, with this wallet
 
 ## Command line
 
-**Network.** The wallet is on mainnet unless given `--regtest`, `--signet` or `--testnet` (`--mainnet` may be given; at most one). Before it sends anything to a mint it asks the mint's `GET /health` which network it is on, and stops if the mint is on another network or does not say; nothing is sent. Every walkthrough below passes `--regtest`. The wallet file is per network (see "Notes and the wallet file"). *Why mainnet by default:* the default should be the network a real user is on; development passes a flag.
+**Network.** The wallet is on mainnet unless given `--regtest`, `--signet` or `--testnet` (`--mainnet` may be given; at most one). Before it sends anything to a mint it asks the mint's `GET /health` which wire version it speaks and which network it is on, and stops if the mint is on another wire version or network or does not say; nothing is sent. Every walkthrough below passes `--regtest`. The wallet file is per network (see "Notes and the wallet file"). *Why mainnet by default:* the default should be the network a real user is on; development passes a flag.
 
 
 ```
@@ -219,6 +234,7 @@ The end-to-end runs (steps 0 to 49: purchase, claim, exchange, transfer, redempt
 - **`tests/transfer_flow.rs`, in one process, with no network.** Buy 5 PSP as a 4 and a 1 and settle. Exchange 3 PSP and then 1 PSP, which gives ESP notes of 3, 1 and 1 PSP. An inexact hand-over is refused. Hand over 3 PSP, receive it as the service, build the transfer and run the ESP mint's real transfer code. The mint's supply is unchanged, a retry gets the same reply, and the new note verifies against the mint's key. Presenting the same notes again is refused as already spent, and cancelling frees them. A different service key finds nothing. The new note can be split into 1 and 2 PSP. A reopened wallet equals the one in memory.
 - **Spent notes the mint names** (`src/redeem.rs`, `src/transfer.rs`, `src/rotate.rs`, `src/http.rs`, `tests/redeem_flow.rs`). `refuse_redemption` moves the notes a `below_fee` refusal calls `already_spent` to the spent record, flags a bad proof, frees the rest, and with no list just frees the notes. `mark_spent_in_transfer` and `mark_spent_in_rollover` do the same for the positions the mint names, and refuse a position the request lacks. The refusal bodies are read (`redeem_refusal`, `exchange_refusal`, and the rollover reader, with no stray `: ` when the mint sends no code). `tests/redeem_flow.rs` runs it against a real esp-mint: a copy of a spent note is refused `below_fee`, moved to the spent record, and not offered again.
 - **Single error print** (`src/main.rs`). A failed redemption request is printed once, by `main`; later failures get their own line.
+- **Wire version** (`src/http.rs`). A mint that reports another `wire_version`, or none, or one that is not an integer, is refused with a message naming both numbers and saying nothing was sent. The version is checked before the network. A matching mint passes. `src/date.rs` has the date parser's known answers and refusals.
 - **Note limits** (`src/esp.rs`, `src/http.rs`). The exchange limit is the mint's, read from `/fees`; with none read the wallet checks nothing of its own.
 
 The regtest runs in [REGTEST.md](REGTEST.md) are the end-to-end tests with a real Bitcoin node.

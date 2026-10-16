@@ -12,7 +12,6 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use air::names::secp256k1::SecretKey as DidSecretKey;
 use ecash_wallet::psp::parse_signatures;
 use ecash_wallet::{Kind, Wallet, WalletError};
 use esp_mint::exchange::{self, Burn, ExchangeError, Psp, Rejection};
@@ -24,6 +23,7 @@ use psp_mint::records::Records;
 use psp_mint::scan::Received;
 use psp_mint::settle::{self, Settlement};
 use secp256k1::{PublicKey, XOnlyPublicKey};
+use sp_wire::seal::SecretKey as DidSecretKey;
 
 const G_X: &str = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
 const ONE_PSP_ESP: u128 = 100_000_000_000;

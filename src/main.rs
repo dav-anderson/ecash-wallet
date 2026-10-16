@@ -12,8 +12,8 @@ use ecash_wallet::redeem::{EntryOutcome, RedeemOutcome, RedemptionState};
 use ecash_wallet::store::{Handover, parse_did};
 use ecash_wallet::transfer::TransferBuild;
 use ecash_wallet::{Wallet, WalletError, http};
-use esp_mint::units::ESP_PER_PSP;
 use secp256k1::{SecretKey, XOnlyPublicKey};
+use sp_wire::units::ESP_PER_PSP;
 
 const DEFAULT_PSP_URL: &str = "http://127.0.0.1:3000";
 const DEFAULT_ESP_URL: &str = "http://127.0.0.1:3100";
@@ -220,7 +220,7 @@ fn take_network(args: &mut Args) -> Result<&'static str, WalletError> {
 /// run's network. Nothing is sent to a mint on another network.
 fn mint_url(flag: Option<String>, var: &str, default: &str) -> Result<String, WalletError> {
     let base = url(flag, var, default);
-    http::verify_network(&base, network())?;
+    http::verify_mint(&base, network())?;
     Ok(base)
 }
 
@@ -237,7 +237,7 @@ fn buy_psp(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
         .iter()
         .map(|a| number(a, "an amount"))
         .collect::<Result<Vec<_>, _>>()?;
-    let mint_key = psp_mint::seal::parse_public_key(&mint_key)
+    let mint_key = sp_wire::seal::parse_public_key(&mint_key)
         .map_err(|e| WalletError::Invalid(e.to_string()))?;
     let built = wallet.build_psp_payload(&amounts, &reply, &mint_key)?;
     eprintln!("purchase {}", built.id);
@@ -674,7 +674,7 @@ fn transfer(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
 /// ESP units as US dollars ($1 = 10^12 units; 1 PSP is $0.10 = 10^11 units), all
 /// 12 decimals. It divides by the ESP-per-dollar rate, not the ESP-per-PSP one.
 fn usd(units: u128) -> String {
-    let per = esp_mint::queue::ESP_PER_USD;
+    let per = sp_wire::units::ESP_PER_USD;
     format!("${}.{:012}", units / per, units % per)
 }
 
@@ -1075,7 +1075,7 @@ fn startup_fsp_sync(wallet: &mut Wallet) {
 
 fn sync_and_log(wallet: &mut Wallet, service: XOnlyPublicKey, url: &str) {
     let result =
-        http::verify_network(url, network()).and_then(|_| http::fsp_sync(wallet, service, url));
+        http::verify_mint(url, network()).and_then(|_| http::fsp_sync(wallet, service, url));
     match result {
         Ok(sync) => {
             for line in sync.log {
@@ -1206,7 +1206,7 @@ fn fsp_window(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
 
 fn esp_schedule(wallet: &Wallet, mut args: Args) -> Result<(), WalletError> {
     let by = match args.flag("--by")? {
-        Some(d) => Some(fsp_mint::keysets::parse_date(&d).map_err(WalletError::Invalid)?),
+        Some(d) => Some(ecash_wallet::date::parse_date(&d).map_err(WalletError::Invalid)?),
         None => None,
     };
     args.done()?;

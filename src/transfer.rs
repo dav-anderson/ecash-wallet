@@ -26,7 +26,7 @@ use std::collections::{BTreeSet, HashSet};
 use mint_types::{Amount, MintInput};
 use secp256k1::{Keypair, SECP256K1, SecretKey, XOnlyPublicKey};
 
-use esp_mint::transfer::{self, TransferRequest, TransferResponse};
+use sp_wire::esp::transfer::{self, TransferRequest, TransferResponse};
 
 use crate::blind::PendingOutput;
 use crate::error::WalletError;

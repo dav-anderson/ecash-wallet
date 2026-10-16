@@ -16,14 +16,14 @@
 
 use std::collections::BTreeMap;
 
-use fsp_mint::api::{
-    FspInput, GroupResult, HandedEsp, IssueGroup, IssueRequest, IssueResponse, KeysResponse,
-    SpendRequest, SpendResponse, issue_group_size,
-};
 use mint_types::{Amount, MintInput};
 use secp256k1::schnorr::Signature;
 use secp256k1::{Keypair, SECP256K1, XOnlyPublicKey};
 use serde::{Deserialize, Serialize};
+use sp_wire::fsp::{
+    FspInput, GroupResult, HandedEsp, IssueGroup, IssueRequest, IssueResponse, KeysResponse,
+    SpendRequest, SpendResponse, issue_group_size,
+};
 
 use crate::blind::PendingOutput;
 use crate::error::WalletError;

@@ -2,7 +2,7 @@ use std::error::Error;
 use std::fmt;
 use std::io;
 
-use psp_mint::seal::SealError;
+use sp_wire::seal::SealError;
 
 #[derive(Debug)]
 pub enum WalletError {
@@ -33,17 +33,23 @@ pub enum WalletError {
     RedeemRefused {
         code: String,
         why: String,
-        totals: Option<Box<esp_mint::redeem::Totals>>,
+        totals: Option<Box<sp_wire::esp::redeem::Totals>>,
         /// What the mint made of each note, in the request's order. Sent with
         /// `below_fee` (empty from a mint that does not send it), so the wallet
         /// can retire the notes the mint says are spent.
-        notes: Vec<esp_mint::redeem::NoteResult>,
+        notes: Vec<sp_wire::esp::redeem::NoteResult>,
     },
     /// The mint could not be reached, or answered with a fault. The outcome may
     /// be unknown, and retrying the same request is safe.
     Mint(String),
     /// A feature that waits on its mint.
     NotBuilt(&'static str),
+    /// The mint speaks another wire version than this wallet (or reports none).
+    /// Nothing was sent. Update whichever is older.
+    Wire {
+        url: String,
+        why: sp_wire::version::WireMismatch,
+    },
 }
 
 impl fmt::Display for WalletError {
@@ -64,6 +70,12 @@ impl fmt::Display for WalletError {
             }
             WalletError::Mint(e) => write!(f, "{e}"),
             WalletError::NotBuilt(what) => write!(f, "not built yet: {what}"),
+            WalletError::Wire { url, why } => {
+                write!(
+                    f,
+                    "the mint at {url} cannot be used: {why}. Nothing was sent"
+                )
+            }
         }
     }
 }

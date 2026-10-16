@@ -21,6 +21,7 @@
 //! - [`http`] (feature `http`): the calls to the mints.
 
 pub mod blind;
+pub mod date;
 pub mod error;
 pub mod esp;
 pub mod fsp;

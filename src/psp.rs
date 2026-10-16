@@ -8,11 +8,11 @@
 
 use std::collections::BTreeMap;
 
-use air::names::secp256k1::PublicKey as DidPublicKey;
 use mint_types::{Amount, BlindNonce};
-use psp_mint::payload::{self, Payload};
 use secp256k1::PublicKey;
 use sha2::{Digest, Sha256};
+use sp_wire::payload::{self, Payload};
+use sp_wire::seal::PublicKey as DidPublicKey;
 
 use crate::blind::PendingOutput;
 use crate::error::WalletError;
@@ -88,7 +88,7 @@ impl Wallet {
             outputs: pending.iter().map(PendingOutput::mint_output).collect(),
         })
         .map_err(|e| WalletError::Invalid(e.to_string()))?;
-        let sealed = psp_mint::seal::encrypt(mint_did_pubkey, &plaintext)?;
+        let sealed = sp_wire::seal::encrypt(mint_did_pubkey, &plaintext)?;
         let id = hex::encode(Sha256::digest(&sealed));
         let record = PendingPurchase {
             id: id.clone(),
@@ -168,7 +168,7 @@ impl Wallet {
                     reserved_by: None,
                 };
                 // The keyset is the one whose keys unblinded the note.
-                d.keysets.insert(note.id(), psp_mint::rotation::keyset_id(keys));
+                d.keysets.insert(note.id(), sp_wire::keyset::keyset_id(keys));
                 claimed.push(note.id());
                 claimed_units = claimed_units
                     .checked_add(output.amount)
@@ -248,9 +248,9 @@ pub fn parse_signatures(text: &str) -> Result<Vec<(BlindNonce, PublicKey)>, Wall
 #[cfg(test)]
 mod tests {
     use super::*;
-    use air::names::secp256k1::SecretKey as DidSecretKey;
     use psp_mint::scan::Received;
     use secp256k1::{SECP256K1, SecretKey};
+    use sp_wire::seal::SecretKey as DidSecretKey;
     use std::fs;
     use std::path::PathBuf;
 

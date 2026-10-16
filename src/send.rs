@@ -150,7 +150,7 @@ pub(crate) fn build_psp_swap(
         i.spend_signature =
             SECP256K1.sign_schnorr(&h, &Keypair::from_secret_key(SECP256K1, &n.spend_secret));
     }
-    let r = psp_mint::rotation::RolloverRequest {
+    let r = sp_wire::psp::RolloverRequest {
         input_keysets: notes
             .iter()
             .map(|n| {

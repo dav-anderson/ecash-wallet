@@ -16,12 +16,12 @@ use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use air::names::secp256k1::SecretKey as DidSecretKey;
-use esp_mint::exchange::ExchangeRequest;
-use esp_mint::transfer::TransferRequest;
 use mint_types::Note;
 use secp256k1::{SecretKey, XOnlyPublicKey};
 use serde::{Deserialize, Serialize};
+use sp_wire::esp::exchange::ExchangeRequest;
+use sp_wire::esp::transfer::TransferRequest;
+use sp_wire::seal::SecretKey as DidSecretKey;
 
 use crate::blind::PendingOutput;
 use crate::error::WalletError;

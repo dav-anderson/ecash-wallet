@@ -376,7 +376,7 @@ impl Wallet {
                                 &secp256k1::Keypair::from_secret_key(SECP256K1, &n.spend_secret),
                             );
                         }
-                        let r = psp_mint::rotation::RolloverRequest {
+                        let r = sp_wire::psp::RolloverRequest {
                             input_keysets: chunk
                                 .iter()
                                 .map(|n| self.keyset_for(n, w))
@@ -395,7 +395,7 @@ impl Wallet {
                         let t = terms.ok_or_else(|| {
                             WalletError::Invalid("an ESP note without terms".into())
                         })?;
-                        let mut r = esp_mint::rotation::RolloverRequest {
+                        let mut r = sp_wire::esp::rollover::RolloverRequest {
                             service: t.service,
                             redeemable_after_day: t.redeemable_after_day,
                             input_keysets: chunk

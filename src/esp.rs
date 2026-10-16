@@ -6,7 +6,7 @@
 //! burns the PSP notes at the PSP and signs the outputs.
 //! [`Wallet::finish_exchange`] unblinds the reply into ESP notes.
 //!
-//! The mint's exchange is exact: the PSP notes, times 10^12, must equal the ESP
+//! The mint's exchange is exact: the PSP notes, times 10^11, must equal the ESP
 //! outputs' total, and the smallest exchange is 1 PSP. So the wallet always asks
 //! for the full value of the PSP notes it spends. The amount asked for becomes
 //! the service's ESP notes, and whatever the chosen PSP notes are worth beyond
@@ -19,7 +19,7 @@
 use mint_types::{Amount, MintInput, melt_sighash};
 use secp256k1::{Keypair, SECP256K1, XOnlyPublicKey};
 
-use esp_mint::exchange::{self, ExchangeRequest, ExchangeResponse, MAX_ITEMS};
+use esp_mint::exchange::{self, ExchangeRequest, ExchangeResponse};
 use esp_mint::units::ESP_PER_PSP;
 
 use crate::blind::PendingOutput;
@@ -29,6 +29,15 @@ use crate::store::{Kind, PendingExchange, StoredNote, StoredTerms, Wallet};
 /// How many search steps to spend looking for a tighter cover than the quick one.
 const SEARCH_BUDGET: u32 = 100_000;
 
+/// What `mark_spent_elsewhere` did with the request's notes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SpentReport {
+    /// Notes moved out of the balance because they were spent elsewhere.
+    pub marked_spent: usize,
+    /// The request's other notes, which are free to spend again.
+    pub freed: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct ExchangeBuild {
     /// The request hash, which names this exchange in the wallet and at the mint.
@@ -37,7 +46,7 @@ pub struct ExchangeBuild {
     /// PSP spent, which is the full value of the notes chosen.
     pub psp_spent: u64,
     /// ESP units that come back as change: the PSP spent beyond the amount asked
-    /// for, times 10^12. Zero when the notes added up exactly.
+    /// for, times 10^11. Zero when the notes added up exactly.
     pub change_esp: u128,
 }
 
@@ -91,7 +100,10 @@ fn pick_cover(amounts: &[u64], need: u64) -> Option<Vec<usize>> {
         let sum = set.iter().map(|&i| u128::from(amounts[i])).sum();
         consider(sum, set);
     }
-    if let Some(single) = (0..amounts.len()).rev().find(|&i| u128::from(amounts[i]) >= need) {
+    if let Some(single) = (0..amounts.len())
+        .rev()
+        .find(|&i| u128::from(amounts[i]) >= need)
+    {
         consider(u128::from(amounts[single]), vec![single]);
     }
     let (best_sum, best_set) = best?;
@@ -127,12 +139,30 @@ fn pick_cover(amounts: &[u64], need: u64) -> Option<Vec<usize>> {
             return;
         }
         current.push(i);
-        walk(amounts, suffix, need, i + 1, sum + u128::from(amounts[i]), current, best, budget);
+        walk(
+            amounts,
+            suffix,
+            need,
+            i + 1,
+            sum + u128::from(amounts[i]),
+            current,
+            best,
+            budget,
+        );
         current.pop();
         walk(amounts, suffix, need, i + 1, sum, current, best, budget);
     }
     let mut found = (best_sum, best_set);
-    walk(amounts, &suffix, need, 0, 0, &mut current, &mut found, &mut budget);
+    walk(
+        amounts,
+        &suffix,
+        need,
+        0,
+        0,
+        &mut current,
+        &mut found,
+        &mut budget,
+    );
     Some(found.1)
 }
 
@@ -140,8 +170,8 @@ impl Wallet {
     /// Build an exchange that gives `service` at least `psp_units` PSP of ESP.
     ///
     /// The smallest exchange is 1 PSP. `esp_amounts` splits the amount asked for
-    /// into notes, and must add up to `psp_units * 10^12`. Without it that part
-    /// is one note, which fits only up to 18,446,744 PSP.
+    /// into notes, and must add up to `psp_units * 10^11`. Without it that part
+    /// is one note, which fits only up to 184,467,440 PSP.
     ///
     /// The wallet spends the full value of the PSP notes it picks. Anything
     /// beyond `psp_units` comes back as extra ESP notes under the same terms (see
@@ -156,10 +186,11 @@ impl Wallet {
     ) -> Result<ExchangeBuild, WalletError> {
         if psp_units == 0 {
             return Err(WalletError::Invalid(
-                "the smallest exchange is 1 PSP (10^12 ESP)".into(),
+                "the smallest exchange is 1 PSP (10^11 ESP)".into(),
             ));
         }
         let target = u128::from(psp_units) * u128::from(ESP_PER_PSP);
+        let limit = self.esp_limits().exchange_max_items;
         let mut amounts: Vec<u64> = match esp_amounts {
             None => vec![u64::try_from(target).map_err(|_| {
                 WalletError::Invalid(format!(
@@ -168,10 +199,17 @@ impl Wallet {
                 ))
             })?],
             Some(list) => {
-                if list.is_empty() || list.len() > MAX_ITEMS {
-                    return Err(WalletError::Invalid(format!(
-                        "an exchange holds 1 to {MAX_ITEMS} ESP notes"
-                    )));
+                if list.is_empty() {
+                    return Err(WalletError::Invalid(
+                        "an exchange needs at least one ESP note".into(),
+                    ));
+                }
+                if let Some(max) = limit {
+                    if list.len() > max {
+                        return Err(WalletError::Invalid(format!(
+                            "the mint takes at most {max} ESP notes in one exchange (its exchange.max_items)"
+                        )));
+                    }
                 }
                 if list.contains(&0) {
                     return Err(WalletError::Invalid("an ESP note cannot be zero".into()));
@@ -216,10 +254,12 @@ impl Wallet {
             amounts.push(piece);
             left -= u128::from(piece);
         }
-        if chosen.len() > MAX_ITEMS || amounts.len() > MAX_ITEMS {
-            return Err(WalletError::Invalid(format!(
-                "that would take more than {MAX_ITEMS} PSP notes or ESP notes"
-            )));
+        if let Some(max) = limit {
+            if chosen.len() > max || amounts.len() > max {
+                return Err(WalletError::Invalid(format!(
+                    "that would take more than the {max} PSP notes or ESP notes the mint takes in one exchange (its exchange.max_items)"
+                )));
+            }
         }
 
         let outputs: Vec<PendingOutput> = amounts.iter().map(|&a| PendingOutput::new(a)).collect();
@@ -242,12 +282,19 @@ impl Wallet {
             input.spend_signature = SECP256K1.sign_schnorr(&sighash, &keypair);
         }
 
+        let psp_input_keysets = chosen
+            .iter()
+            .map(|n| self.psp_keyset_of(n))
+            .collect::<Result<Vec<_>, _>>()?;
         let request = ExchangeRequest {
             service,
+            psp_input_keysets,
             psp_inputs: inputs,
+            keyset: self.esp_output_keyset(),
             outputs: mint_outputs,
         };
-        let id = exchange::request_hash(&request).map_err(|e| WalletError::Invalid(e.to_string()))?;
+        let id =
+            exchange::request_hash(&request).map_err(|e| WalletError::Invalid(e.to_string()))?;
         let input_ids: Vec<String> = chosen.iter().map(StoredNote::id).collect();
 
         let pending = PendingExchange {
@@ -327,11 +374,170 @@ impl Wallet {
             d.pending_exchanges.retain(|p| p.id != id);
             Ok(())
         })?;
+        // The keyset that actually signed, as the reply names it.
+        self.record_keysets(&ids, &response.keyset)?;
         Ok(FinishResult {
             notes: ids,
             esp_units,
             change_esp: pending.change_esp,
             redeemable_after_day: response.redeemable_after_day,
+        })
+    }
+
+    /// The ESP mint refused the exchange because the PSP notes at `inputs` (their
+    /// positions in the request) were spent by a different request. Drop the
+    /// pending exchange, move those notes out of the wallet's notes into its
+    /// record of spent notes, so the balance no longer counts them, and free the
+    /// request's other notes.
+    ///
+    /// Nothing changes if `inputs` is empty or names a position the request does
+    /// not have, or if there is no such pending exchange.
+    pub fn mark_spent_elsewhere(
+        &mut self,
+        id: &str,
+        inputs: &[usize],
+    ) -> Result<SpentReport, WalletError> {
+        self.update(|d| {
+            let pending = d
+                .pending_exchanges
+                .iter()
+                .find(|p| p.id == id)
+                .ok_or_else(|| WalletError::Unknown(format!("no pending exchange {id}")))?;
+            let count = pending.request.psp_inputs.len();
+            if inputs.is_empty() || inputs.iter().any(|&i| i >= count) {
+                return Err(WalletError::Invalid(format!(
+                    "the mint named notes {inputs:?}, but the request has {count} notes"
+                )));
+            }
+            let spent_ids: Vec<String> = inputs
+                .iter()
+                .map(|&i| hex::encode(pending.request.psp_inputs[i].note.nonce.0.serialize()))
+                .collect();
+            d.pending_exchanges.retain(|p| p.id != id);
+            let mut report = SpentReport::default();
+            for mut note in std::mem::take(&mut d.notes) {
+                if note.reserved_by.as_deref() == Some(id) {
+                    note.reserved_by = None;
+                    if spent_ids.contains(&note.id()) {
+                        d.spent.push(note);
+                        report.marked_spent += 1;
+                        continue;
+                    }
+                    report.freed += 1;
+                }
+                d.notes.push(note);
+            }
+            Ok(report)
+        })
+    }
+
+    /// Release every note reserved by request `id`. Those in `spent_ids` are
+    /// spent, so they leave the balance for the spent record; the others are
+    /// free again. The caller removes the pending request itself.
+    pub(crate) fn retire_reserved(
+        d: &mut crate::store::WalletData,
+        id: &str,
+        spent_ids: &[String],
+    ) -> SpentReport {
+        let mut report = SpentReport::default();
+        for mut note in std::mem::take(&mut d.notes) {
+            if note.reserved_by.as_deref() == Some(id) {
+                note.reserved_by = None;
+                if spent_ids.contains(&note.id()) {
+                    d.spent.push(note);
+                    report.marked_spent += 1;
+                    continue;
+                }
+                report.freed += 1;
+            }
+            d.notes.push(note);
+        }
+        report
+    }
+
+    /// The held notes a pending request reserved, in the request's order.
+    pub(crate) fn reserved_notes(&self, ids: &[String]) -> Result<Vec<StoredNote>, WalletError> {
+        ids.iter()
+            .map(|nid| {
+                self.notes()
+                    .iter()
+                    .find(|n| &n.id() == nid)
+                    .cloned()
+                    .ok_or_else(|| WalletError::Corrupt(format!("reserved note {nid} is missing")))
+            })
+            .collect()
+    }
+
+    /// Point the notes reserved by `old` at `new`.
+    pub(crate) fn move_reservation(d: &mut crate::store::WalletData, old: &str, new: &str) {
+        for n in d.notes.iter_mut() {
+            if n.reserved_by.as_deref() == Some(old) {
+                n.reserved_by = Some(new.to_string());
+            }
+        }
+    }
+
+    /// After a `keyset_not_current` refusal (nothing was burned): rebuild the
+    /// pending exchange `id` with the same PSP notes and amounts, fresh blinded
+    /// outputs and the ESP mint's current keyset as last seen (read it again
+    /// first with `http::sync_esp_keysets`). The old pending exchange is
+    /// replaced by the new one, which has a new id.
+    pub fn reblind_exchange(&mut self, id: &str) -> Result<ExchangeBuild, WalletError> {
+        let pending = self
+            .pending_exchanges()
+            .iter()
+            .find(|p| p.id == id)
+            .cloned()
+            .ok_or_else(|| WalletError::Unknown(format!("no pending exchange {id}")))?;
+        let keyset = self.esp_output_keyset();
+        if keyset.is_empty() || keyset == pending.request.keyset {
+            return Err(WalletError::Refused(format!(
+                "the ESP mint's current keyset is still {} as far as the wallet knows; cannot re-blind",
+                pending.request.keyset
+            )));
+        }
+        let chosen = self.reserved_notes(&pending.input_ids)?;
+        let outputs: Vec<PendingOutput> = pending
+            .outputs
+            .iter()
+            .map(|o| PendingOutput::new(o.amount))
+            .collect();
+        let mint_outputs: Vec<_> = outputs.iter().map(PendingOutput::mint_output).collect();
+        let memo = exchange::memo(&pending.service, &mint_outputs);
+        let mut inputs = pending.request.psp_inputs.clone();
+        let sighash = melt_sighash(&inputs, memo.as_bytes());
+        for (input, held) in inputs.iter_mut().zip(&chosen) {
+            let keypair = Keypair::from_secret_key(SECP256K1, &held.spend_secret);
+            input.spend_signature = SECP256K1.sign_schnorr(&sighash, &keypair);
+        }
+        let request = ExchangeRequest {
+            service: pending.service,
+            psp_input_keysets: pending.request.psp_input_keysets.clone(),
+            psp_inputs: inputs,
+            keyset,
+            outputs: mint_outputs,
+        };
+        let new_id =
+            exchange::request_hash(&request).map_err(|e| WalletError::Invalid(e.to_string()))?;
+        let next = PendingExchange {
+            id: new_id.clone(),
+            service: pending.service,
+            input_ids: pending.input_ids.clone(),
+            outputs,
+            request: request.clone(),
+            change_esp: pending.change_esp,
+        };
+        self.update(|d| {
+            d.pending_exchanges.retain(|p| p.id != id);
+            Wallet::move_reservation(d, id, &new_id);
+            d.pending_exchanges.push(next);
+            Ok(())
+        })?;
+        Ok(ExchangeBuild {
+            id: new_id,
+            psp_spent: request.psp_inputs.iter().map(|i| i.amount.units).sum(),
+            request,
+            change_esp: pending.change_esp,
         })
     }
 
@@ -369,7 +575,14 @@ mod tests {
     }
 
     fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("ecash-wallet-esp-{}-{name}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ecash-wallet-esp-{}-{name}", {
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            format!(
+                "{}-{}",
+                std::process::id(),
+                N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            )
+        }));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -397,6 +610,10 @@ mod tests {
             })
             .collect();
         w.update(|d| {
+            // Every stored note records its keyset (the wallet never guesses).
+            for n in &notes {
+                d.keysets.insert(n.id(), "aa".repeat(8));
+            }
             d.notes.extend(notes);
             Ok(())
         })
@@ -408,11 +625,16 @@ mod tests {
     fn the_exchange_picks_exactly_the_psp_asked_for_largest_first() {
         let (mut w, dir) = wallet_with("pick", &[1, 4, 2, 8]);
         let built = w.build_exchange(7, service(), None).unwrap();
-        let mut sizes: Vec<u64> = built.request.psp_inputs.iter().map(|i| i.amount.units).collect();
+        let mut sizes: Vec<u64> = built
+            .request
+            .psp_inputs
+            .iter()
+            .map(|i| i.amount.units)
+            .collect();
         sizes.sort();
         assert_eq!(sizes, vec![1, 2, 4]);
         assert_eq!(built.request.outputs.len(), 1);
-        assert_eq!(built.request.outputs[0].amount.units, 7_000_000_000_000);
+        assert_eq!(built.request.outputs[0].amount.units, 700_000_000_000);
         // the chosen notes are reserved, the rest are free
         let b = w.balance();
         assert_eq!(b.reserved, 3);
@@ -423,7 +645,9 @@ mod tests {
     #[test]
     fn spend_signatures_cover_the_memo_for_exactly_these_outputs() {
         let (mut w, dir) = wallet_with("sigs", &[4, 1]);
-        let built = w.build_exchange(5, service(), Some(&[2_000_000_000_000, 3_000_000_000_000])).unwrap();
+        let built = w
+            .build_exchange(5, service(), Some(&[200_000_000_000, 300_000_000_000]))
+            .unwrap();
         let memo = exchange::memo(&built.request.service, &built.request.outputs);
         let sighash = melt_sighash(&built.request.psp_inputs, memo.as_bytes());
         for input in &built.request.psp_inputs {
@@ -441,12 +665,22 @@ mod tests {
     }
 
     fn output_amounts(built: &ExchangeBuild) -> Vec<u64> {
-        built.request.outputs.iter().map(|o| o.amount.units).collect()
+        built
+            .request
+            .outputs
+            .iter()
+            .map(|o| o.amount.units)
+            .collect()
     }
 
     /// The mint's rule, checked here on what the wallet builds.
     fn assert_exact(built: &ExchangeBuild) {
-        let psp: u128 = built.request.psp_inputs.iter().map(|i| u128::from(i.amount.units)).sum();
+        let psp: u128 = built
+            .request
+            .psp_inputs
+            .iter()
+            .map(|i| u128::from(i.amount.units))
+            .sum();
         let esp: u128 = output_amounts(built).iter().map(|&a| u128::from(a)).sum();
         assert_eq!(psp * u128::from(ESP_PER_PSP), esp);
         assert_eq!(u128::from(built.psp_spent), psp);
@@ -459,19 +693,27 @@ mod tests {
         let built = w.build_exchange(7, service(), None).unwrap();
         assert_exact(&built);
         assert_eq!(built.change_esp, 0);
-        assert_eq!(output_amounts(&built), vec![7_000_000_000_000]);
+        assert_eq!(output_amounts(&built), vec![700_000_000_000]);
         fs::remove_dir_all(&dir).unwrap();
 
         // 5 from 8 + 2 + 2: the single 8 is the tightest cover, 3 PSP comes back as ESP
         let (mut w, dir) = wallet_with("full-change", &[8, 2, 2]);
         let built = w.build_exchange(5, service(), None).unwrap();
         assert_exact(&built);
-        let spent: Vec<u64> = built.request.psp_inputs.iter().map(|i| i.amount.units).collect();
+        let spent: Vec<u64> = built
+            .request
+            .psp_inputs
+            .iter()
+            .map(|i| i.amount.units)
+            .collect();
         assert_eq!(spent, vec![8]);
         assert_eq!(built.psp_spent, 8);
-        assert_eq!(built.change_esp, 3_000_000_000_000);
-        assert_eq!(output_amounts(&built), vec![5_000_000_000_000, 3_000_000_000_000]);
-        assert_eq!(w.pending_exchanges()[0].change_esp, 3_000_000_000_000);
+        assert_eq!(built.change_esp, 300_000_000_000);
+        assert_eq!(
+            output_amounts(&built),
+            vec![500_000_000_000, 300_000_000_000]
+        );
+        assert_eq!(w.pending_exchanges()[0].change_esp, 300_000_000_000);
         fs::remove_dir_all(&dir).unwrap();
 
         // 5 from 4 + 4: both are spent, 3 comes back
@@ -479,16 +721,19 @@ mod tests {
         let built = w.build_exchange(5, service(), None).unwrap();
         assert_exact(&built);
         assert_eq!(built.psp_spent, 8);
-        assert_eq!(output_amounts(&built), vec![5_000_000_000_000, 3_000_000_000_000]);
+        assert_eq!(
+            output_amounts(&built),
+            vec![500_000_000_000, 300_000_000_000]
+        );
         // an asked-for split keeps its notes and the change is added after them
         w.cancel_exchange(&built.id).unwrap();
         let split = w
-            .build_exchange(5, service(), Some(&[2_000_000_000_000, 3_000_000_000_000]))
+            .build_exchange(5, service(), Some(&[200_000_000_000, 300_000_000_000]))
             .unwrap();
         assert_exact(&split);
         assert_eq!(
             output_amounts(&split),
-            vec![2_000_000_000_000, 3_000_000_000_000, 3_000_000_000_000]
+            vec![200_000_000_000, 300_000_000_000, 300_000_000_000]
         );
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -500,7 +745,8 @@ mod tests {
             v.sort_by(|a, b| b.cmp(a));
             v
         };
-        let total = |amounts: &[u64], picked: &[usize]| -> u64 { picked.iter().map(|&i| amounts[i]).sum() };
+        let total =
+            |amounts: &[u64], picked: &[usize]| -> u64 { picked.iter().map(|&i| amounts[i]).sum() };
         for (held, need, best) in [
             (&[8u64, 2, 2][..], 5u64, 8u64),
             (&[4, 4][..], 5, 8),
@@ -519,13 +765,20 @@ mod tests {
     }
 
     #[test]
-    fn an_exchange_with_not_enough_psp_or_below_the_minimum_is_refused_before_anything_is_reserved() {
+    fn an_exchange_with_not_enough_psp_or_below_the_minimum_is_refused_before_anything_is_reserved()
+    {
         let (mut w, dir) = wallet_with("exact", &[4, 4]);
         // 9 is more than is held
-        assert!(matches!(w.build_exchange(9, service(), None), Err(WalletError::NotEnough(_))));
+        assert!(matches!(
+            w.build_exchange(9, service(), None),
+            Err(WalletError::NotEnough(_))
+        ));
         // the smallest exchange is 1 PSP
         let err = w.build_exchange(0, service(), None).unwrap_err();
-        assert!(err.to_string().contains("smallest exchange is 1 PSP"), "{err}");
+        assert!(
+            err.to_string().contains("smallest exchange is 1 PSP"),
+            "{err}"
+        );
         assert_eq!(w.balance().reserved, 0);
         assert!(w.pending_exchanges().is_empty());
         fs::remove_dir_all(&dir).unwrap();
@@ -534,23 +787,38 @@ mod tests {
     #[test]
     fn the_asked_for_split_must_add_up_exactly() {
         let (mut w, dir) = wallet_with("split", &[2]);
-        assert!(w.build_exchange(2, service(), Some(&[1_000_000_000_000])).is_err());
-        assert!(w.build_exchange(2, service(), Some(&[1_000_000_000_000, 1_000_000_000_001])).is_err());
+        assert!(
+            w.build_exchange(2, service(), Some(&[100_000_000_000]))
+                .is_err()
+        );
+        assert!(
+            w.build_exchange(2, service(), Some(&[100_000_000_000, 100_000_000_001]))
+                .is_err()
+        );
         assert!(w.build_exchange(2, service(), Some(&[])).is_err());
-        assert!(w.build_exchange(2, service(), Some(&[0, 2_000_000_000_000])).is_err());
+        assert!(
+            w.build_exchange(2, service(), Some(&[0, 200_000_000_000]))
+                .is_err()
+        );
         assert!(w.pending_exchanges().is_empty());
-        assert!(w.build_exchange(2, service(), Some(&[1, 1_999_999_999_999])).is_ok());
+        assert!(
+            w.build_exchange(2, service(), Some(&[1, 199_999_999_999]))
+                .is_ok()
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
-    fn one_esp_note_holds_at_most_18_446_744_psp_and_a_split_gets_past_it() {
-        let (mut w, dir) = wallet_with("limit", &[1_048_576]);
-        // 18,446,745 PSP is 1.8446745e19 ESP, over u64::MAX, so not one note
-        assert!(esp_mint::units::MAX_PSP_PER_NOTE < 18_446_745);
-        assert!(w.build_exchange(1_048_576, service(), None).is_ok());
+    fn one_esp_note_holds_at_most_184_467_440_psp_and_a_split_gets_past_it() {
+        let (mut w, dir) = wallet_with("limit", &[16_777_216]);
+        // 184,467,441 PSP is 1.84467441e19 ESP, over u64::MAX, so not one note
+        assert!(esp_mint::units::MAX_PSP_PER_NOTE < 184_467_441);
+        assert!(w.build_exchange(16_777_216, service(), None).is_ok());
         let (mut big, dir2) = wallet_with("limit2", &[]);
-        assert!(matches!(big.build_exchange(18_446_745, service(), None), Err(WalletError::Invalid(_))));
+        assert!(matches!(
+            big.build_exchange(184_467_441, service(), None),
+            Err(WalletError::Invalid(_))
+        ));
         fs::remove_dir_all(&dir).unwrap();
         fs::remove_dir_all(&dir2).unwrap();
     }
@@ -559,12 +827,109 @@ mod tests {
     fn reserved_notes_are_not_used_twice_and_cancel_frees_them() {
         let (mut w, dir) = wallet_with("reserve", &[4]);
         let first = w.build_exchange(4, service(), None).unwrap();
-        assert!(matches!(w.build_exchange(4, service(), None), Err(WalletError::NotEnough(_))));
+        assert!(matches!(
+            w.build_exchange(4, service(), None),
+            Err(WalletError::NotEnough(_))
+        ));
         assert!(w.cancel_exchange("nope").is_err());
         w.cancel_exchange(&first.id).unwrap();
         assert_eq!(w.balance().reserved, 0);
         assert!(w.pending_exchanges().is_empty());
         assert!(w.build_exchange(4, service(), None).is_ok());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn position_of(built: &ExchangeBuild, units: u64) -> usize {
+        built
+            .request
+            .psp_inputs
+            .iter()
+            .position(|i| i.amount.units == units)
+            .unwrap()
+    }
+
+    #[test]
+    fn a_note_spent_elsewhere_leaves_the_balance_and_the_others_are_freed() {
+        let (mut w, dir) = wallet_with("elsewhere", &[4, 1, 2]);
+        let built = w.build_exchange(5, service(), None).unwrap();
+        assert_eq!(w.balance().psp, 7);
+        assert_eq!(w.balance().reserved, 2);
+
+        // the mint says the 4 was spent by a different request
+        let four = position_of(&built, 4);
+        let report = w.mark_spent_elsewhere(&built.id, &[four]).unwrap();
+        assert_eq!(
+            report,
+            SpentReport {
+                marked_spent: 1,
+                freed: 1
+            }
+        );
+
+        // the balance no longer counts it, and nothing is held back
+        let b = w.balance();
+        assert_eq!(b.psp, 3);
+        assert_eq!(b.reserved, 0);
+        assert_eq!(b.notes, 2);
+        assert_eq!(b.pending_exchanges, 0);
+        assert_eq!(b.spent_elsewhere, 1);
+        assert_eq!(w.spent_notes().len(), 1);
+        assert_eq!(w.spent_notes()[0].amount, 4);
+        assert!(w.spent_notes()[0].reserved_by.is_none());
+
+        // it cannot be picked for a later exchange
+        assert!(matches!(
+            w.build_exchange(4, service(), None),
+            Err(WalletError::NotEnough(_))
+        ));
+        assert!(w.build_exchange(3, service(), None).is_ok());
+
+        // and the record survives a reopen
+        let again = Wallet::open(w.path()).unwrap();
+        assert_eq!(again.spent_notes().len(), 1);
+        assert_eq!(again.balance().psp, 3);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn every_note_the_mint_names_is_marked_spent() {
+        let (mut w, dir) = wallet_with("all-elsewhere", &[4, 1]);
+        let built = w.build_exchange(5, service(), None).unwrap();
+        let report = w.mark_spent_elsewhere(&built.id, &[0, 1]).unwrap();
+        assert_eq!(
+            report,
+            SpentReport {
+                marked_spent: 2,
+                freed: 0
+            }
+        );
+        let b = w.balance();
+        assert_eq!((b.psp, b.notes, b.spent_elsewhere), (0, 0, 2));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_bad_answer_from_the_mint_changes_nothing() {
+        let (mut w, dir) = wallet_with("bad-elsewhere", &[4, 1]);
+        let built = w.build_exchange(5, service(), None).unwrap();
+        // no notes named, or a position the request does not have
+        assert!(matches!(
+            w.mark_spent_elsewhere(&built.id, &[]),
+            Err(WalletError::Invalid(_))
+        ));
+        assert!(matches!(
+            w.mark_spent_elsewhere(&built.id, &[0, 2]),
+            Err(WalletError::Invalid(_))
+        ));
+        assert!(matches!(
+            w.mark_spent_elsewhere("nope", &[0]),
+            Err(WalletError::Unknown(_))
+        ));
+        let b = w.balance();
+        assert_eq!(
+            (b.psp, b.reserved, b.pending_exchanges, b.spent_elsewhere),
+            (5, 2, 1, 0)
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -589,14 +954,19 @@ mod tests {
         let sk = secp256k1::SecretKey::new(&mut rand::rngs::OsRng);
         let pk = sk.public_key(SECP256K1);
         let good = ExchangeResponse {
+            keyset: "ab".repeat(8),
             service: service(),
             redeemable_after_day: 21_100,
             signatures: vec![pk],
             keys: vec![pk],
+            fee_per_byte: 0,
+            fee_esp: 0,
+            size_bytes: 0,
         };
         let mut wrong_service = good.clone();
         wrong_service.service = XOnlyPublicKey::from_slice(
-            &hex::decode("c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5").unwrap(),
+            &hex::decode("c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5")
+                .unwrap(),
         )
         .unwrap();
         assert!(w.finish_exchange(&built.id, &wrong_service).is_err());
@@ -608,5 +978,94 @@ mod tests {
         assert_eq!(w.balance().esp, 0);
         assert_eq!(w.pending_exchanges().len(), 1);
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_keyset_not_current_exchange_is_reblinded_for_the_current_set() {
+        let (mut w, dir) = wallet_with("reblind", &[4]);
+        w.note_esp_keysets("http://esp", &"01".repeat(8), None)
+            .unwrap();
+        let built = w.build_exchange(3, service(), None).unwrap();
+        assert!(
+            w.reblind_exchange(&built.id).is_err(),
+            "same keyset: nothing to do"
+        );
+        w.note_esp_keysets("http://esp", &"02".repeat(8), Some(&"01".repeat(8)))
+            .unwrap();
+        let again = w.reblind_exchange(&built.id).unwrap();
+        assert_eq!(again.request.keyset, "02".repeat(8));
+        assert_ne!(again.id, built.id);
+        assert_eq!(exchange::request_hash(&again.request).unwrap(), again.id);
+        assert_eq!(
+            again.request.psp_inputs.len(),
+            built.request.psp_inputs.len()
+        );
+        assert_ne!(again.request.outputs, built.request.outputs);
+        let amounts = |r: &ExchangeRequest| r.outputs.iter().map(|o| o.amount).collect::<Vec<_>>();
+        assert_eq!(amounts(&again.request), amounts(&built.request));
+        assert_eq!(
+            (again.psp_spent, again.change_esp),
+            (built.psp_spent, built.change_esp)
+        );
+        // Spend signatures cover the new memo.
+        let memo = exchange::memo(&service(), &again.request.outputs);
+        let h = melt_sighash(&again.request.psp_inputs, memo.as_bytes());
+        for (i, n) in again.request.psp_inputs.iter().zip(w.notes()) {
+            SECP256K1
+                .verify_schnorr(
+                    &i.spend_signature,
+                    &h,
+                    &n.note.nonce.0.x_only_public_key().0,
+                )
+                .unwrap();
+        }
+        assert_eq!(w.pending_exchanges().len(), 1);
+        assert!(
+            w.notes()
+                .iter()
+                .all(|n| n.reserved_by.as_deref() == Some(again.id.as_str()))
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn keyset_not_current_is_recognised_from_the_mints_body() {
+        use crate::error::is_keyset_not_current;
+        assert!(is_keyset_not_current(&WalletError::Refused(
+            r#"{"error":"re-blind","code":"keyset_not_current"}"#.into()
+        )));
+        assert!(!is_keyset_not_current(&WalletError::Refused(
+            r#"{"error":"x","code":"keyset_retired"}"#.into()
+        )));
+        assert!(!is_keyset_not_current(&WalletError::Refused(
+            "keyset_not_current".into()
+        )));
+        assert!(is_keyset_not_current(&WalletError::RedeemRefused {
+            code: "keyset_not_current".into(),
+            why: String::new(),
+            totals: None,
+            notes: Vec::new(),
+        }));
+    }
+
+    #[test]
+    fn the_exchange_note_limit_is_the_mints_not_the_wallets() {
+        let (mut w, dir) = wallet_with("limit", &[2]);
+        let amounts = [100_000_000_000u64; 2];
+        // Not read yet: the wallet checks nothing of its own, and builds.
+        assert_eq!(w.esp_limits().exchange_max_items, None);
+        assert!(w.build_exchange(2, service(), Some(&amounts)).is_ok());
+        let (mut w, dir2) = wallet_with("limit2", &[2]);
+        w.set_esp_limits(crate::store::EspLimits {
+            exchange_max_items: Some(1),
+            transfer_max_items: None,
+        });
+        let e = w
+            .build_exchange(2, service(), Some(&amounts))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("at most 1 ESP notes"), "{e}");
+        let _ = fs::remove_dir_all(dir);
+        let _ = fs::remove_dir_all(dir2);
     }
 }

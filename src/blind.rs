@@ -73,7 +73,11 @@ mod tests {
         let blind_signature = bdhke::sign_message(&sk, &out.blind_nonce.0);
         let note = out.unblind(&blind_signature, &pk);
         assert_eq!(note.nonce, out.nonce);
-        assert!(bdhke::verify_message(&sk, note.signature, &out.nonce.as_hash_preimage()));
+        assert!(bdhke::verify_message(
+            &sk,
+            note.signature,
+            &out.nonce.as_hash_preimage()
+        ));
     }
 
     #[test]
@@ -108,13 +112,21 @@ mod tests {
         // unblinded with another mint's public key
         let other = mint_key().public_key(SECP256K1);
         let bad_key = out.unblind(&blind_signature, &other);
-        assert!(!bdhke::verify_message(&sk, bad_key.signature, &out.nonce.as_hash_preimage()));
+        assert!(!bdhke::verify_message(
+            &sk,
+            bad_key.signature,
+            &out.nonce.as_hash_preimage()
+        ));
 
         // unblinded with another output's blinding factor
         let mut wrong = out.clone();
         wrong.blinding_key = PendingOutput::new(2).blinding_key;
         let bad_factor = wrong.unblind(&blind_signature, &pk);
-        assert!(!bdhke::verify_message(&sk, bad_factor.signature, &out.nonce.as_hash_preimage()));
+        assert!(!bdhke::verify_message(
+            &sk,
+            bad_factor.signature,
+            &out.nonce.as_hash_preimage()
+        ));
     }
 
     #[test]

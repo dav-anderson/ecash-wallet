@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 
 use air::names::secp256k1::SecretKey as DidSecretKey;
 use esp_mint::exchange::ExchangeRequest;
+use esp_mint::transfer::TransferRequest;
 use mint_types::Note;
 use secp256k1::{SecretKey, XOnlyPublicKey};
 use serde::{Deserialize, Serialize};
@@ -86,6 +87,43 @@ pub struct PendingExchange {
     pub change_esp: u128,
 }
 
+/// An ESP transfer that has been built and has not been finished. The wallet
+/// that holds it is the service's.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PendingTransfer {
+    /// The request hash, as the mint stores it.
+    pub id: String,
+    pub service: XOnlyPublicKey,
+    pub input_ids: Vec<String>,
+    pub outputs: Vec<PendingOutput>,
+    /// Kept so that a retry sends exactly the same request.
+    pub request: TransferRequest,
+}
+
+/// One ESP note given to a service, with its spend secret.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HandedNote {
+    pub amount: u64,
+    pub note: Note,
+    pub spend_secret: SecretKey,
+    /// The ESP keyset that signed it, so the receiver names it when it spends
+    /// the note. Empty in a hand-over made before keysets.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub keyset: String,
+}
+
+/// ESP notes an app has handed to a service. It carries each note's spend
+/// secret, so whoever holds it holds the notes until the service swaps them
+/// (see `transfer.rs`). The notes name the service, and only the service can ask
+/// the mint to move them. Delivery to the service is an AIR message, which is
+/// deferred: for now the command line writes this to a file.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Handover {
+    pub service: XOnlyPublicKey,
+    pub redeemable_after_day: u64,
+    pub notes: Vec<HandedNote>,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct WalletData {
     /// A stand-in reply DID for the command line, made on first use. An app
@@ -98,6 +136,71 @@ pub struct WalletData {
     pub pending_purchases: Vec<PendingPurchase>,
     #[serde(default)]
     pub pending_exchanges: Vec<PendingExchange>,
+    #[serde(default)]
+    pub pending_transfers: Vec<PendingTransfer>,
+    /// What this wallet has handed to services, kept as a record. The notes in
+    /// it are no longer in `notes`.
+    #[serde(default)]
+    pub handovers: Vec<Handover>,
+    /// PSP tokens this wallet exported and that are not settled yet, plus the
+    /// outcome of settled ones (see `send.rs`). The notes in them are no
+    /// longer in `notes`.
+    #[serde(default)]
+    pub sent: Vec<crate::send::SentToken>,
+    /// PSP notes the ESP mint reported spent by a different request. They are
+    /// no longer in `notes`, are not counted in the balance and cannot be spent.
+    /// Kept as a record.
+    #[serde(default)]
+    pub spent: Vec<StoredNote>,
+    /// ESP redemptions that have been built and are not over (see `redeem.rs`).
+    #[serde(default)]
+    pub pending_redemptions: Vec<crate::redeem::PendingRedemption>,
+    /// Ids of notes the ESP mint rejected for a bad proof. They stay in `notes`
+    /// and in the balance, but a redemption does not pick them.
+    #[serde(default)]
+    pub bad_proof: Vec<String>,
+    /// The keyset of each FSP note, by note id.
+    #[serde(default)]
+    pub fsp_keysets: BTreeMap<String, String>,
+    /// The FSP mints this wallet has used, by service (hex), as last seen.
+    #[serde(default)]
+    pub fsp_mints: BTreeMap<String, crate::fsp::FspMint>,
+    /// FSP requests sent or about to be sent and not settled.
+    #[serde(default)]
+    pub pending_fsp: Vec<crate::fsp::PendingFsp>,
+    /// FSP notes whose keyset the mint deleted. Not in any total.
+    #[serde(default)]
+    pub lost_fsp: Vec<StoredNote>,
+    /// The key-set epoch of each PSP and ESP note, by note id. A note with no
+    /// entry is treated as on the oldest live set (see `rotate.rs`).
+    #[serde(default)]
+    pub epochs: BTreeMap<String, u64>,
+    /// The keyset ID of each PSP and ESP note, by note id: the keyset that
+    /// signed it, from the keys it was unblinded with or the mint's reply.
+    /// Every request that spends a note names this keyset.
+    #[serde(default)]
+    pub keysets: BTreeMap<String, String>,
+    /// Each PSP and ESP mint's live keysets as last seen, by URL:
+    /// (current, previous). Refreshed on every connection.
+    #[serde(default)]
+    pub live_keysets: BTreeMap<String, (String, Option<String>)>,
+    /// The ESP mint's live keysets as last seen, by URL: (current, previous),
+    /// from `GET /keysets` or `/rotation`. Kept apart from `live_keysets` so
+    /// the PSP fallback there still sees one mint.
+    #[serde(default)]
+    pub esp_live_keysets: BTreeMap<String, (String, Option<String>)>,
+    /// The time each pending rollover may be sent, by
+    /// `<kind>|<mint url>|<new keyset id>`. Removed in the same write that
+    /// records the rolled-over notes, and when the old set retires. No
+    /// history is kept.
+    #[serde(default)]
+    pub swap_schedule: BTreeMap<String, u64>,
+    /// PSP and ESP rollovers sent or about to be sent and not settled.
+    #[serde(default)]
+    pub pending_rollovers: Vec<crate::rotate::PendingRollover>,
+    /// PSP and ESP notes whose key set the mint deleted. Not in any total.
+    #[serde(default)]
+    pub lost: Vec<StoredNote>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -112,11 +215,34 @@ pub struct Balance {
     pub reserved: usize,
     pub pending_purchases: usize,
     pub pending_exchanges: usize,
+    pub pending_transfers: usize,
+    /// Redemptions built and not over, including ones queued for payout.
+    pub pending_redemptions: usize,
+    /// Handovers this wallet has made.
+    pub handed_over: usize,
+    /// Notes marked spent because they were spent elsewhere. Not in any total.
+    pub spent_elsewhere: usize,
+    /// Notes flagged because the mint found their proof bad, and their value.
+    /// Still counted in `esp` above.
+    pub bad_proof: usize,
+    pub bad_proof_esp: u128,
+}
+
+/// What the ESP mint accepts in one exchange or transfer (`exchange.max_items`
+/// and `transfer.max_items`), as its `GET /fees` says. The wallet does not
+/// keep a number of its own: until the limits are read (`http::sync_esp_limits`)
+/// it checks nothing locally and the mint's own refusal decides. Not saved in
+/// the wallet file.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EspLimits {
+    pub exchange_max_items: Option<usize>,
+    pub transfer_max_items: Option<usize>,
 }
 
 pub struct Wallet {
     path: PathBuf,
     data: WalletData,
+    limits: EspLimits,
 }
 
 impl Wallet {
@@ -131,7 +257,22 @@ impl Wallet {
         Ok(Wallet {
             path: path.to_path_buf(),
             data,
+            limits: EspLimits::default(),
         })
+    }
+
+    /// The ESP mint's note limits, if they have been read.
+    pub fn esp_limits(&self) -> EspLimits {
+        self.limits
+    }
+
+    /// Set the ESP mint's note limits (see [`EspLimits`]).
+    pub fn set_esp_limits(&mut self, limits: EspLimits) {
+        self.limits = limits;
+    }
+
+    pub(crate) fn data(&self) -> &WalletData {
+        &self.data
     }
 
     pub fn path(&self) -> &Path {
@@ -148,6 +289,30 @@ impl Wallet {
 
     pub fn pending_exchanges(&self) -> &[PendingExchange] {
         &self.data.pending_exchanges
+    }
+
+    pub fn pending_transfers(&self) -> &[PendingTransfer] {
+        &self.data.pending_transfers
+    }
+
+    pub(crate) fn redemptions(&self) -> &[crate::redeem::PendingRedemption] {
+        &self.data.pending_redemptions
+    }
+
+    /// Notes marked spent because the mint said they were spent by a different
+    /// request. Not part of the balance.
+    pub fn spent_notes(&self) -> &[StoredNote] {
+        &self.data.spent
+    }
+
+    /// Ids of the notes flagged because the ESP mint rejected their proof.
+    pub fn bad_proof_notes(&self) -> &[String] {
+        &self.data.bad_proof
+    }
+
+    /// The handovers this wallet has made, oldest first.
+    pub fn handovers(&self) -> &[Handover] {
+        &self.data.handovers
     }
 
     /// Apply a change and save it. The change is made on a copy and only takes
@@ -201,6 +366,19 @@ impl Wallet {
         }
         b.pending_purchases = self.data.pending_purchases.len();
         b.pending_exchanges = self.data.pending_exchanges.len();
+        b.pending_transfers = self.data.pending_transfers.len();
+        b.pending_redemptions = self.data.pending_redemptions.len();
+        b.handed_over = self.data.handovers.len();
+        b.spent_elsewhere = self.data.spent.len();
+        for n in self
+            .data
+            .notes
+            .iter()
+            .filter(|n| self.data.bad_proof.contains(&n.id()))
+        {
+            b.bad_proof += 1;
+            b.bad_proof_esp += u128::from(n.amount);
+        }
         b
     }
 }
@@ -236,7 +414,11 @@ fn write_atomic(path: &Path, data: &WalletData) -> Result<(), WalletError> {
     // Make the rename itself durable. Not every platform allows opening a
     // directory, so a failure here is ignored.
     if let Some(dir) = path.parent() {
-        let dir = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };
+        let dir = if dir.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            dir
+        };
         if let Ok(d) = File::open(dir) {
             let _ = d.sync_all();
         }
@@ -251,7 +433,14 @@ mod tests {
     use secp256k1::SECP256K1;
 
     fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("ecash-wallet-{}-{name}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ecash-wallet-{}-{name}", {
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            format!(
+                "{}-{}",
+                std::process::id(),
+                N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            )
+        }));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -309,7 +498,10 @@ mod tests {
         let path = dir.join("wallet.json");
         let mut w = Wallet::open(&path).unwrap();
         w.update(|_| Ok(())).unwrap();
-        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         assert!(!dir.join("wallet.json.tmp").exists());
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -354,11 +546,15 @@ mod tests {
         let dir = scratch("balance");
         let mut w = Wallet::open(&dir.join("wallet.json")).unwrap();
         let service = XOnlyPublicKey::from_slice(
-            &hex::decode("79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798").unwrap(),
+            &hex::decode("79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+                .unwrap(),
         )
         .unwrap();
         let mut esp = some_note(Kind::Esp, 3_000_000_000_000);
-        esp.terms = Some(StoredTerms { service, redeemable_after_day: 21_100 });
+        esp.terms = Some(StoredTerms {
+            service,
+            redeemable_after_day: 21_100,
+        });
         let mut reserved = some_note(Kind::Psp, 2);
         reserved.reserved_by = Some("x".into());
         w.update(|d| {

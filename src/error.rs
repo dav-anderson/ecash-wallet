@@ -21,6 +21,24 @@ pub enum WalletError {
     /// The mint refused the request. Nothing was burned, so the pending request
     /// can be cancelled.
     Refused(String),
+    /// The mint refused an exchange because PSP notes in it were spent by a
+    /// different request, not by this exchange. `inputs` lists them by position
+    /// in the request. Nothing was issued. Those notes are spent, so the wallet
+    /// marks them spent (see `Wallet::mark_spent_elsewhere`) and frees the rest.
+    SpentElsewhere { why: String, inputs: Vec<usize> },
+    /// The ESP mint refused a redemption. Nothing was burned. `code` is the
+    /// mint's code (`refund_required`, `below_fee`, ...). For `refund_required`
+    /// and `outputs_over_limit`, `totals` is what the mint worked out, which the
+    /// wallet rebuilds the request from (`Wallet::rebuild_redemption`).
+    RedeemRefused {
+        code: String,
+        why: String,
+        totals: Option<Box<esp_mint::redeem::Totals>>,
+        /// What the mint made of each note, in the request's order. Sent with
+        /// `below_fee` (empty from a mint that does not send it), so the wallet
+        /// can retire the notes the mint says are spent.
+        notes: Vec<esp_mint::redeem::NoteResult>,
+    },
     /// The mint could not be reached, or answered with a fault. The outcome may
     /// be unknown, and retrying the same request is safe.
     Mint(String),
@@ -38,6 +56,12 @@ impl fmt::Display for WalletError {
             WalletError::Unknown(e) => write!(f, "{e}"),
             WalletError::Seal(e) => write!(f, "could not seal the payload: {e}"),
             WalletError::Refused(e) => write!(f, "the mint refused the request: {e}"),
+            WalletError::SpentElsewhere { why, .. } => {
+                write!(f, "the mint refused the request: {why}")
+            }
+            WalletError::RedeemRefused { code, why, .. } => {
+                write!(f, "the mint refused the redemption ({code}): {why}")
+            }
             WalletError::Mint(e) => write!(f, "{e}"),
             WalletError::NotBuilt(what) => write!(f, "not built yet: {what}"),
         }
@@ -55,5 +79,19 @@ impl From<io::Error> for WalletError {
 impl From<SealError> for WalletError {
     fn from(e: SealError) -> Self {
         WalletError::Seal(e)
+    }
+}
+
+/// Whether a mint refusal is `keyset_not_current`: the outputs named the
+/// mint's previous keyset, nothing was burned, and the request should be
+/// re-blinded for the current keyset and sent again.
+pub fn is_keyset_not_current(e: &WalletError) -> bool {
+    match e {
+        WalletError::RedeemRefused { code, .. } => code == "keyset_not_current",
+        WalletError::Refused(text) => serde_json::from_str::<serde_json::Value>(text)
+            .ok()
+            .and_then(|v| v.get("code").and_then(|c| c.as_str()).map(str::to_string))
+            .is_some_and(|c| c == "keyset_not_current"),
+        _ => false,
     }
 }

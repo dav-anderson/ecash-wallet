@@ -18,8 +18,9 @@ use crate::blind::PendingOutput;
 use crate::error::WalletError;
 use crate::store::{Kind, PendingPurchase, StoredNote, Wallet};
 
-/// The largest PSP note. The PSP's notes are powers of two from 1 up to this.
-pub const MAX_PSP_DENOMINATION: u64 = 1_048_576;
+/// The largest PSP note, 2^24 ($1,677,721.60 at 10 PSP to the dollar). The PSP's
+/// notes are powers of two from 1 up to this, 25 denominations.
+pub const MAX_PSP_DENOMINATION: u64 = 16_777_216;
 
 /// The most outputs in one purchase (the payload's count is one byte).
 pub const MAX_OUTPUTS: usize = 255;
@@ -53,7 +54,7 @@ pub fn check_denomination(amount: u64) -> Result<(), WalletError> {
 }
 
 impl Wallet {
-    /// Blind `outputs` (amounts in PSP, which are US dollars), encode the payload
+    /// Blind `outputs` (amounts in PSP, ten to the US dollar), encode the payload
     /// with `reply_did`, and encrypt it to the mint's DID public key with AIR's
     /// secp256k1 encryption. Returns the bytes for an OP_RETURN.
     ///
@@ -66,7 +67,9 @@ impl Wallet {
         mint_did_pubkey: &DidPublicKey,
     ) -> Result<PurchaseBuild, WalletError> {
         if outputs.is_empty() {
-            return Err(WalletError::Invalid("a purchase needs at least one output".into()));
+            return Err(WalletError::Invalid(
+                "a purchase needs at least one output".into(),
+            ));
         }
         if outputs.len() > MAX_OUTPUTS {
             return Err(WalletError::Invalid(format!(
@@ -77,7 +80,10 @@ impl Wallet {
             check_denomination(amount)?;
         }
         let pending: Vec<PendingOutput> = outputs.iter().map(|&a| PendingOutput::new(a)).collect();
+        // No keyset in the payload: the PSP signs a claim with its current
+        // keyset and prints that keyset's ID with the signatures.
         let plaintext = payload::encode(&Payload {
+            keyset: None,
             did: *reply_did,
             outputs: pending.iter().map(PendingOutput::mint_output).collect(),
         })
@@ -94,7 +100,10 @@ impl Wallet {
             d.pending_purchases.push(record);
             Ok(())
         })?;
-        Ok(PurchaseBuild { id, payload: sealed })
+        Ok(PurchaseBuild {
+            id,
+            payload: sealed,
+        })
     }
 
     /// The signatures that belong to this wallet's pending outputs, in order. The
@@ -158,6 +167,8 @@ impl Wallet {
                     terms: None,
                     reserved_by: None,
                 };
+                // The keyset is the one whose keys unblinded the note.
+                d.keysets.insert(note.id(), psp_mint::rotation::keyset_id(keys));
                 claimed.push(note.id());
                 claimed_units = claimed_units
                     .checked_add(output.amount)
@@ -188,6 +199,15 @@ impl Wallet {
     }
 }
 
+/// The keyset the PSP printed with its signatures (`keyset <16 hex>`), if
+/// any. Output from before keysets were printed has none.
+pub fn parse_keyset(text: &str) -> Option<String> {
+    text.lines().find_map(|l| {
+        let id = l.trim().strip_prefix("keyset ")?.trim();
+        (id.len() == 16 && id.bytes().all(|b| b.is_ascii_hexdigit())).then(|| id.to_lowercase())
+    })
+}
+
 /// Read the signatures the PSP prints. A line is
 /// `signature <blind nonce hex> <signature hex>`, and a bare pair
 /// `<blind nonce hex> <signature hex>` or `<blind nonce hex>:<signature hex>` is
@@ -215,8 +235,8 @@ pub fn parse_signatures(text: &str) -> Result<Vec<(BlindNonce, PublicKey)>, Wall
             continue;
         }
         let point = |text: &str| -> Result<PublicKey, WalletError> {
-            let bytes = hex::decode(text)
-                .map_err(|_| WalletError::Invalid(format!("not hex: {text}")))?;
+            let bytes =
+                hex::decode(text).map_err(|_| WalletError::Invalid(format!("not hex: {text}")))?;
             PublicKey::from_slice(&bytes)
                 .map_err(|_| WalletError::Invalid(format!("not a curve point: {text}")))
         };
@@ -234,8 +254,23 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
+    #[test]
+    fn the_printed_keyset_is_read_and_junk_is_not() {
+        let text = "payment x\n  keyset 0123456789ABCDEF\n  signature a b\n";
+        assert_eq!(parse_keyset(text).as_deref(), Some("0123456789abcdef"));
+        assert_eq!(parse_keyset("  keyset zz"), None);
+        assert_eq!(parse_keyset("signature only"), None);
+    }
+
     fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("ecash-wallet-psp-{}-{name}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ecash-wallet-psp-{}-{name}", {
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            format!(
+                "{}-{}",
+                std::process::id(),
+                N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            )
+        }));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -261,10 +296,13 @@ mod tests {
     fn build_then_encrypt_then_the_mint_decrypts_and_decodes() {
         let (mut w, dir) = wallet("roundtrip");
         let mint = DidSecretKey::new();
-        let built = w.build_psp_payload(&[4, 1], &DID, &mint.public_key()).unwrap();
+        let built = w
+            .build_psp_payload(&[4, 1], &DID, &mint.public_key())
+            .unwrap();
 
         // the mint's side: the scanner opens the data output, then decodes it
-        let (kept, dropped) = psp_mint::seal::open_payloads(&mint, vec![payment(built.payload.clone())]);
+        let (kept, dropped) =
+            psp_mint::seal::open_payloads(&mint, vec![payment(built.payload.clone())]);
         assert_eq!(dropped, 0);
         let decoded = payload::decode(kept[0].payload.as_deref().unwrap()).unwrap();
         assert_eq!(decoded.did, DID);
@@ -284,7 +322,9 @@ mod tests {
     fn the_payload_is_82_bytes_longer_than_plaintext_and_hides_the_did() {
         let (mut w, dir) = wallet("size");
         let mint = DidSecretKey::new();
-        let built = w.build_psp_payload(&[4, 1], &DID, &mint.public_key()).unwrap();
+        let built = w
+            .build_psp_payload(&[4, 1], &DID, &mint.public_key())
+            .unwrap();
         assert_eq!(built.payload.len(), 35 + 41 * 2 + 82);
         assert!(!built.payload.windows(33).any(|win| win == DID));
         fs::remove_dir_all(&dir).unwrap();
@@ -295,7 +335,9 @@ mod tests {
         let (mut w, dir) = wallet("other-key");
         let mint = DidSecretKey::new();
         let other = DidSecretKey::new();
-        let built = w.build_psp_payload(&[2], &DID, &other.public_key()).unwrap();
+        let built = w
+            .build_psp_payload(&[2], &DID, &other.public_key())
+            .unwrap();
         let (kept, dropped) = psp_mint::seal::open_payloads(&mint, vec![payment(built.payload)]);
         assert!(kept.is_empty());
         assert_eq!(dropped, 1);
@@ -332,13 +374,13 @@ mod tests {
         let (mut w, dir) = wallet("sizes");
         let mint = DidSecretKey::new();
         let key = mint.public_key();
-        for bad in [0u64, 3, 5, 6, 1_048_577, 2_097_152, u64::MAX] {
+        for bad in [0u64, 3, 5, 6, 16_777_217, 33_554_432, u64::MAX] {
             assert!(w.build_psp_payload(&[bad], &DID, &key).is_err(), "{bad}");
         }
         assert!(w.build_psp_payload(&[], &DID, &key).is_err());
         assert!(w.build_psp_payload(&vec![1; 256], &DID, &key).is_err());
         assert!(w.pending_purchases().is_empty());
-        for good in [1u64, 2, 4, 1024, 1_048_576] {
+        for good in [1u64, 2, 4, 1024, 1_048_576, 16_777_216] {
             assert!(w.build_psp_payload(&[good], &DID, &key).is_ok(), "{good}");
         }
         assert!(w.build_psp_payload(&vec![1; 255], &DID, &key).is_ok());
@@ -346,10 +388,7 @@ mod tests {
     }
 
     /// A PSP's keys, and what it does when it settles: sign each output.
-    fn sign_all(
-        w: &Wallet,
-        sks: &BTreeMap<Amount, SecretKey>,
-    ) -> Vec<(BlindNonce, PublicKey)> {
+    fn sign_all(w: &Wallet, sks: &BTreeMap<Amount, SecretKey>) -> Vec<(BlindNonce, PublicKey)> {
         w.pending_purchases()
             .iter()
             .flat_map(|p| &p.outputs)
@@ -363,9 +402,17 @@ mod tests {
     fn psp_keys() -> (BTreeMap<Amount, SecretKey>, BTreeMap<Amount, PublicKey>) {
         let sks: BTreeMap<Amount, SecretKey> = [1u64, 2, 4, 8]
             .iter()
-            .map(|&a| (Amount::from_units(a), SecretKey::new(&mut rand::rngs::OsRng)))
+            .map(|&a| {
+                (
+                    Amount::from_units(a),
+                    SecretKey::new(&mut rand::rngs::OsRng),
+                )
+            })
             .collect();
-        let pks = sks.iter().map(|(a, sk)| (*a, sk.public_key(SECP256K1))).collect();
+        let pks = sks
+            .iter()
+            .map(|(a, sk)| (*a, sk.public_key(SECP256K1)))
+            .collect();
         (sks, pks)
     }
 
@@ -373,7 +420,8 @@ mod tests {
     fn claimed_signatures_become_notes_the_psp_accepts_and_the_purchase_is_cleared() {
         let (mut w, dir) = wallet("claim");
         let mint = DidSecretKey::new();
-        w.build_psp_payload(&[4, 1], &DID, &mint.public_key()).unwrap();
+        w.build_psp_payload(&[4, 1], &DID, &mint.public_key())
+            .unwrap();
         let (sks, pks) = psp_keys();
         let sigs = sign_all(&w, &sks);
 
@@ -386,7 +434,11 @@ mod tests {
         for n in w.notes() {
             assert_eq!(n.kind, Kind::Psp);
             let sk = &sks[&Amount::from_units(n.amount)];
-            assert!(bdhke::verify_message(sk, n.note.signature, &n.note.nonce.as_hash_preimage()));
+            assert!(bdhke::verify_message(
+                sk,
+                n.note.signature,
+                &n.note.nonce.as_hash_preimage()
+            ));
         }
         // and the held spend key is the note's nonce key
         let again = Wallet::open(w.path()).unwrap();
@@ -398,7 +450,8 @@ mod tests {
     fn ours_keeps_only_signatures_for_pending_outputs() {
         let (mut w, dir) = wallet("ours");
         let mint = DidSecretKey::new();
-        w.build_psp_payload(&[4, 1], &DID, &mint.public_key()).unwrap();
+        w.build_psp_payload(&[4, 1], &DID, &mint.public_key())
+            .unwrap();
         let (sks, _) = psp_keys();
         let all = sign_all(&w, &sks);
         let stranger = (BlindNonce(all[0].1), all[0].1);
@@ -412,7 +465,8 @@ mod tests {
     fn a_partial_claim_leaves_the_rest_pending() {
         let (mut w, dir) = wallet("partial");
         let mint = DidSecretKey::new();
-        w.build_psp_payload(&[4, 1], &DID, &mint.public_key()).unwrap();
+        w.build_psp_payload(&[4, 1], &DID, &mint.public_key())
+            .unwrap();
         let (sks, pks) = psp_keys();
         let all = sign_all(&w, &sks);
         // the PSP signed only the 4
@@ -427,17 +481,24 @@ mod tests {
     fn a_signature_cannot_be_claimed_twice_and_a_bad_claim_changes_nothing() {
         let (mut w, dir) = wallet("twice");
         let mint = DidSecretKey::new();
-        w.build_psp_payload(&[4, 1], &DID, &mint.public_key()).unwrap();
+        w.build_psp_payload(&[4, 1], &DID, &mint.public_key())
+            .unwrap();
         let (sks, pks) = psp_keys();
         let all = sign_all(&w, &sks);
         w.claim_psp(&all[..1], &pks).unwrap();
         // the same pair again, and a stranger's
-        assert!(matches!(w.claim_psp(&all[..1], &pks), Err(WalletError::Unknown(_))));
+        assert!(matches!(
+            w.claim_psp(&all[..1], &pks),
+            Err(WalletError::Unknown(_))
+        ));
         let stranger = (
             BlindNonce(SecretKey::new(&mut rand::rngs::OsRng).public_key(SECP256K1)),
             all[1].1,
         );
-        assert!(matches!(w.claim_psp(&[stranger], &pks), Err(WalletError::Unknown(_))));
+        assert!(matches!(
+            w.claim_psp(&[stranger], &pks),
+            Err(WalletError::Unknown(_))
+        ));
         // a valid pair after an invalid one: nothing is claimed
         assert!(w.claim_psp(&[stranger, all[1]], &pks).is_err());
         assert_eq!(w.balance().psp, 4);
@@ -445,7 +506,10 @@ mod tests {
         // a missing key for an amount is an error and changes nothing
         let mut no_keys = pks.clone();
         no_keys.remove(&Amount::from_units(1));
-        assert!(matches!(w.claim_psp(&all[1..], &no_keys), Err(WalletError::Mint(_))));
+        assert!(matches!(
+            w.claim_psp(&all[1..], &no_keys),
+            Err(WalletError::Mint(_))
+        ));
         assert_eq!(w.pending_purchases()[0].outputs.len(), 1);
         assert!(w.claim_psp(&[], &pks).is_err());
         fs::remove_dir_all(&dir).unwrap();

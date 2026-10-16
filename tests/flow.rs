@@ -6,6 +6,8 @@
 //! straight into a `Received`) and the ESP mint reaches the PSP through a local
 //! stand-in for its HTTP client.
 
+use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -13,7 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use air::names::secp256k1::SecretKey as DidSecretKey;
 use ecash_wallet::psp::parse_signatures;
 use ecash_wallet::{Kind, Wallet, WalletError};
-use esp_mint::exchange::{self, ExchangeError, Psp, Rejection};
+use esp_mint::exchange::{self, Burn, ExchangeError, Psp, Rejection};
 use esp_mint::responses::Responses;
 use esp_mint::terms::Terms;
 use mint_core::MintLogic;
@@ -24,38 +26,87 @@ use psp_mint::settle::{self, Settlement};
 use secp256k1::{PublicKey, XOnlyPublicKey};
 
 const G_X: &str = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
-const ONE_PSP_ESP: u128 = 1_000_000_000_000;
+const ONE_PSP_ESP: u128 = 100_000_000_000;
 
-/// $100,000 per BTC in cents: 5,000 sats is exactly 5 PSP.
-const BTC_100K: u64 = 10_000_000;
+/// $10,000 per BTC in cents. A PSP is $0.10, so 1,000 sats is exactly 1 PSP and
+/// 5,000 sats is exactly 5 PSP.
+const BTC_10K: u64 = 1_000_000;
 
 fn service() -> XOnlyPublicKey {
     XOnlyPublicKey::from_slice(&hex::decode(G_X).unwrap()).unwrap()
 }
 
 fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("ecash-wallet-flow-{}-{name}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("ecash-wallet-flow-{}-{name}", {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        format!(
+            "{}-{}",
+            std::process::id(),
+            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        )
+    }));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
     dir
 }
 
 fn now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
 }
 
-/// The PSP mint in process, in place of the HTTP client.
-struct LocalPsp<'a>(&'a MintLogic);
+/// The PSP mint in process, in place of the HTTP client. It keeps the memo of
+/// each burn, as the real PSP does.
+struct LocalPsp<'a> {
+    logic: &'a MintLogic,
+    memos: RefCell<BTreeMap<String, String>>,
+}
+
+impl<'a> LocalPsp<'a> {
+    fn new(logic: &'a MintLogic) -> Self {
+        LocalPsp {
+            logic,
+            memos: RefCell::new(BTreeMap::new()),
+        }
+    }
+}
+
+fn nonce_key(nonce: &Nonce) -> String {
+    hex::encode(nonce.0.serialize())
+}
 
 impl Psp for LocalPsp<'_> {
     fn melt(&self, inputs: &[MintInput], memo: &str) -> Result<Amount, String> {
-        self.0.melt(inputs, memo.as_bytes()).map_err(|e| e.to_string())
+        for input in inputs {
+            if !self
+                .logic
+                .is_spent(input.note.nonce)
+                .map_err(|e| e.to_string())?
+            {
+                self.memos
+                    .borrow_mut()
+                    .insert(nonce_key(&input.note.nonce), memo.to_string());
+            }
+        }
+        self.logic
+            .melt(inputs, memo.as_bytes())
+            .map_err(|e| e.to_string())
     }
 
-    fn spent(&self, nonces: &[Nonce]) -> Result<Vec<bool>, String> {
+    fn burns(&self, nonces: &[Nonce]) -> Result<Vec<Burn>, String> {
         nonces
             .iter()
-            .map(|n| self.0.is_spent(*n).map_err(|e| e.to_string()))
+            .map(|n| {
+                let spent = self.logic.is_spent(*n).map_err(|e| e.to_string())?;
+                let memo = if spent {
+                    self.memos.borrow().get(&nonce_key(n)).cloned()
+                } else {
+                    None
+                };
+                Ok(Burn { spent, memo })
+            })
             .collect()
     }
 }
@@ -81,9 +132,11 @@ fn settle_payment(
     );
     let mut lines = Vec::new();
     for received in &opened {
-        let settlement =
-            settle::settle(logic, records, received, &mut || Ok(BTC_100K)).unwrap();
-        assert!(matches!(settlement, Settlement::Issued(_)), "{settlement:?}");
+        let settlement = settle::settle(logic, records, received, &mut || Ok(BTC_10K)).unwrap();
+        assert!(
+            matches!(settlement, Settlement::Issued(_)),
+            "{settlement:?}"
+        );
         lines.extend(psp_mint::service::describe(received, &settlement));
     }
     (ignored, lines)
@@ -111,8 +164,13 @@ fn buy_claim_and_exchange_end_to_end() {
     drop(wallet);
     let mut wallet = Wallet::open(&wallet_file).unwrap();
     assert_eq!(wallet.balance().pending_purchases, 1);
+    // The ESP mint's current keyset, which new ESP outputs name.
+    wallet
+        .note_esp_keysets("esp", &esp_mint::rotation::keyset_id(&master), None)
+        .unwrap();
 
-    let (ignored, lines) = settle_payment(&psp, &mut records, &mint_key, "aa", 5_000, build.payload);
+    let (ignored, lines) =
+        settle_payment(&psp, &mut records, &mint_key, "aa", 5_000, build.payload);
     assert_eq!(ignored, 0);
     let text = lines.join("\n");
     let signatures = parse_signatures(&text).unwrap();
@@ -150,8 +208,15 @@ fn buy_claim_and_exchange_end_to_end() {
     // a request that is off by one ESP unit is refused before anything is burned
     let mut off = built.request.clone();
     off.outputs[0].amount = Amount::from_units(off.outputs[0].amount.units + 1);
-    let refused = exchange::exchange(&esp_logic, &master, &LocalPsp(&psp), &mut responses, now(), &off)
-        .unwrap_err();
+    let refused = exchange::exchange_gens(
+        &esp_mint::rotation::Gens::only(&esp_logic, &master),
+        &LocalPsp::new(&psp),
+        &mut responses,
+        now(),
+        &off,
+        &exchange::ExchangeSettings::default(),
+    )
+    .unwrap_err();
     assert!(
         matches!(refused, ExchangeError::Rejected(Rejection::NotExact { .. })),
         "{refused}"
@@ -161,13 +226,13 @@ fn buy_claim_and_exchange_end_to_end() {
     }
     assert!(responses.is_empty());
 
-    let response = exchange::exchange(
-        &esp_logic,
-        &master,
-        &LocalPsp(&psp),
+    let response = exchange::exchange_gens(
+        &esp_mint::rotation::Gens::only(&esp_logic, &master),
+        &LocalPsp::new(&psp),
         &mut responses,
         now(),
         &built.request,
+        &exchange::ExchangeSettings::default(),
     )
     .unwrap();
     // the 4 is burned at the PSP and the 1 is not
@@ -176,13 +241,13 @@ fn buy_claim_and_exchange_end_to_end() {
     }
 
     // a lost reply: the same request gets the same answer, burning nothing more
-    let again = exchange::exchange(
-        &esp_logic,
-        &master,
-        &LocalPsp(&psp),
+    let again = exchange::exchange_gens(
+        &esp_mint::rotation::Gens::only(&esp_logic, &master),
+        &LocalPsp::new(&psp),
         &mut responses,
         now(),
         &built.request,
+        &exchange::ExchangeSettings::default(),
     )
     .unwrap();
     assert_eq!(response, again);
@@ -191,25 +256,31 @@ fn buy_claim_and_exchange_end_to_end() {
     assert_eq!(done.esp_units, 4 * ONE_PSP_ESP);
     assert_eq!(done.change_esp, ONE_PSP_ESP);
     let balance = wallet.balance();
-    assert_eq!((balance.psp, balance.esp, balance.notes), (1, 4 * ONE_PSP_ESP, 3));
+    assert_eq!(
+        (balance.psp, balance.esp, balance.notes),
+        (1, 4 * ONE_PSP_ESP, 3)
+    );
     assert_eq!(balance.pending_exchanges, 0);
 
     // the last PSP note is exactly 1 PSP, the smallest exchange: no change
     let last = wallet.build_exchange(1, service(), None).unwrap();
     assert_eq!((last.psp_spent, last.change_esp), (1, 0));
-    let response = exchange::exchange(
-        &esp_logic,
-        &master,
-        &LocalPsp(&psp),
+    let response = exchange::exchange_gens(
+        &esp_mint::rotation::Gens::only(&esp_logic, &master),
+        &LocalPsp::new(&psp),
         &mut responses,
         now(),
         &last.request,
+        &exchange::ExchangeSettings::default(),
     )
     .unwrap();
     let done = wallet.finish_exchange(&last.id, &response).unwrap();
     assert_eq!((done.esp_units, done.change_esp), (ONE_PSP_ESP, 0));
     let balance = wallet.balance();
-    assert_eq!((balance.psp, balance.esp, balance.notes), (0, 5 * ONE_PSP_ESP, 3));
+    assert_eq!(
+        (balance.psp, balance.esp, balance.notes),
+        (0, 5 * ONE_PSP_ESP, 3)
+    );
 
     // every ESP note, change included, verifies against the key the mint derives
     // for its terms

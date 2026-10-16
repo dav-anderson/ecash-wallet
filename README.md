@@ -23,16 +23,9 @@ FSP has unit tests and HTTP flow tests against a real esp-mint and fsp-mint in o
 
 ## Setup
 
-The wallet builds from tagged dependencies: mint-core at `v0.1.3` and `sp-wire` at `v0.1.0` (git tags), and, through `sp-wire`'s `seal` feature, the `air` crate at commit `6dd0117` (AIR has no tags). **It does not depend on the mint crates.** Every type it exchanges with the mints, the PSP payload and its encryption, the request hashes, the unit constants and the error codes come from `sp-wire` (see "Wire format and versions"). The mints (`psp-mint`, `esp-mint`, `fsp-mint`, each `v0.1.1`) are dev-dependencies only: the tests start real ones in the process, and nothing in the library or the command line links them.
+The wallet builds from tagged dependencies: mint-core at `v0.1.3` and `sp-wire` at `v0.2.0` (git tags), and, through `sp-wire`'s `seal` feature, the `air` crate at commit `8e281d5` (AIR 2.0.3; AIR has no tags). **It does not depend on the mint crates.** Every type it exchanges with the mints, the PSP payload and its encryption, the request hashes, the unit constants and the error codes come from `sp-wire` (see "Wire format and versions"). The mints (`psp-mint`, `esp-mint`, `fsp-mint`, each `v0.1.2`) are dev-dependencies only: the tests start real ones in the process, and nothing in the library or the command line links them.
 
-AIR's own manifest names `../substance` by path, which a build from a git checkout cannot find. Until that is changed upstream, build against local folders with a `[patch]` for `air` in `.cargo/config.toml` (git-ignored; the exact recipe, for every repo, is in the top-level README in `sandbox-mint`):
-
-```toml
-[patch."https://github.com/ramp-stack/air"]
-air = { path = "../air" }
-```
-
-`../air` needs `../substance` next to it. To test against unpushed local copies of `sp-wire`, the mints or mint-core, `source ~/sandbox-mint/scripts/local-git.sh` points git at the local folders and their local tags.
+AIR 2.0.3 has no path dependencies, so nothing needs patching to build it from git. To test against unpushed local copies of `sp-wire`, the mints or mint-core, `source ~/sandbox-mint/scripts/local-git.sh` points git at the local folders and their local tags.
 
 ```
 cd ~/ecash-wallet

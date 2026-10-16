@@ -319,13 +319,13 @@ mod tests {
     }
 
     #[test]
-    fn the_payload_is_82_bytes_longer_than_plaintext_and_hides_the_did() {
+    fn the_payload_is_80_bytes_longer_than_plaintext_and_hides_the_did() {
         let (mut w, dir) = wallet("size");
         let mint = DidSecretKey::new();
         let built = w
             .build_psp_payload(&[4, 1], &DID, &mint.public_key())
             .unwrap();
-        assert_eq!(built.payload.len(), 35 + 41 * 2 + 82);
+        assert_eq!(built.payload.len(), 35 + 41 * 2 + sp_wire::seal::OVERHEAD);
         assert!(!built.payload.windows(33).any(|win| win == DID));
         fs::remove_dir_all(&dir).unwrap();
     }

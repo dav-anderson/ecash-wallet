@@ -205,9 +205,10 @@ fn buy_claim_and_exchange_end_to_end() {
     assert_eq!((built.psp_spent, built.change_esp), (4, ONE_PSP_ESP));
     assert_eq!(wallet.balance().reserved, 1);
 
-    // a request that is off by one ESP unit is refused before anything is burned
+    // a request that asks for more than the PSP is worth (an output doubled,
+    // still a power of two) is refused before anything is burned
     let mut off = built.request.clone();
-    off.outputs[0].amount = Amount::from_units(off.outputs[0].amount.units + 1);
+    off.outputs[0].amount = Amount::from_units(off.outputs[0].amount.units * 2);
     let refused = exchange::exchange_gens(
         &esp_mint::rotation::Gens::only(&esp_logic, &master),
         &LocalPsp::new(&psp),
@@ -252,13 +253,29 @@ fn buy_claim_and_exchange_end_to_end() {
     .unwrap();
     assert_eq!(response, again);
 
+    // every output is a power of two: 3 PSP and 1 PSP of change are 10^11 x 4
+    // ESP units, as several notes
+    assert!(
+        built
+            .request
+            .outputs
+            .iter()
+            .all(|o| o.amount.units.is_power_of_two())
+    );
+    let first_notes = built.request.outputs.len();
+    assert!(first_notes > 2);
+    // 3 PSP is 3 x 10^11 ESP units, which has 15 bits set, so 15 notes; the
+    // 1 PSP of change is 10^11, also 15 bits, so 15 more: 30 ESP notes.
+    assert_eq!(first_notes, 30);
     let done = wallet.finish_exchange(&built.id, &response).unwrap();
     assert_eq!(done.esp_units, 4 * ONE_PSP_ESP);
     assert_eq!(done.change_esp, ONE_PSP_ESP);
     let balance = wallet.balance();
+    // `notes` counts every note the wallet holds: the 30 ESP notes and the 1 PSP
+    // note that was not spent.
     assert_eq!(
         (balance.psp, balance.esp, balance.notes),
-        (1, 4 * ONE_PSP_ESP, 3)
+        (1, 4 * ONE_PSP_ESP, first_notes + 1)
     );
     assert_eq!(balance.pending_exchanges, 0);
 
@@ -279,7 +296,8 @@ fn buy_claim_and_exchange_end_to_end() {
     let balance = wallet.balance();
     assert_eq!(
         (balance.psp, balance.esp, balance.notes),
-        (0, 5 * ONE_PSP_ESP, 3)
+        // no PSP note left: the 30 from before and the 15 of the last 1 PSP
+        (0, 5 * ONE_PSP_ESP, first_notes + last.request.outputs.len())
     );
 
     // every ESP note, change included, verifies against the key the mint derives
@@ -299,7 +317,8 @@ fn buy_claim_and_exchange_end_to_end() {
         ));
         checked += 1;
     }
-    assert_eq!(checked, 3);
+    // all of them: the 30 from the first exchange and the 15 from the last
+    assert_eq!(checked, first_notes + last.request.outputs.len());
 
     // the file on disk has the same balance
     let reopened = Wallet::open(&wallet_file).unwrap();

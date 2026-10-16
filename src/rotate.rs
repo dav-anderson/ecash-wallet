@@ -8,7 +8,8 @@
 //! `GET /rotation`.
 //!
 //! **Staggered.** Each rotation gets one random swap time per mint, drawn once
-//! in `[start of the current set, + min(0.5% of the period, 72 h)]` and kept in
+//! in `(start of the current set, + min(0.5% of the period, 72 h)]` (never at the
+//! start itself: a wallet that connects the second a set starts still waits) and kept in
 //! the wallet file (`swap_schedule`) until the swap is done, so all wallets do
 //! not swap in the same minute. The time is deleted in the same atomic write
 //! that records the rolled-over notes, and the whole entry is deleted when the
@@ -43,13 +44,17 @@ pub fn stagger_window(period_secs: u64) -> u64 {
     ((period_secs as u128 * STAGGER_SPREAD_PPM as u128 / 1_000_000) as u64).min(STAGGER_CAP_SECS)
 }
 
-/// A fresh random delay in the stagger window.
+/// A fresh random delay in the stagger window: from 1 second to the whole
+/// window, or 0 when the window is under a second. It is never 0 for a real
+/// window, so "staggered after the rotation" is always true: a swap time equal
+/// to the start of the set would let a wallet that connects at that second swap
+/// at once, with nothing staggered about it.
 pub fn random_delay(period_secs: u64) -> u64 {
     let w = stagger_window(period_secs);
     if w == 0 {
         0
     } else {
-        rand::thread_rng().gen_range(0..=w)
+        rand::thread_rng().gen_range(1..=w)
     }
 }
 
@@ -565,6 +570,18 @@ mod tests {
             assert!(random_delay(8760 * 3600) <= 8760 * 18);
         }
         assert_eq!(random_delay(100), 0);
+    }
+
+    #[test]
+    fn the_delay_is_never_zero_for_a_real_window() {
+        // A 1-hour period has an 18-second window. If 0 could be drawn, about
+        // one wallet in 19 would swap the second the set starts; 20,000 draws
+        // would show a 0 with a chance of 1 - (18/19)^20000, which is certain.
+        assert_eq!(stagger_window(3600), 18);
+        for _ in 0..20_000 {
+            let d = random_delay(3600);
+            assert!((1..=18).contains(&d), "{d}");
+        }
     }
 
     #[test]

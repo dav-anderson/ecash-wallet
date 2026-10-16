@@ -28,8 +28,11 @@ use secp256k1::{Keypair, SECP256K1, SecretKey, XOnlyPublicKey};
 use serde_json::{Value, json};
 use tokio::runtime::Runtime;
 
-const ONE: u64 = 1_000_000_000_000;
+/// A test amount, a power of two (about $1.10). Every ESP note is one.
+const ONE: u64 = 1 << 40;
 /// Days long past, so these notes are mature on the mint's clock.
+/// A note smaller than the fee of a request.
+const SMALL: u64 = 1 << 27;
 const PAST: u64 = 100;
 const PAST2: u64 = 200;
 /// A day far ahead: not mature on the mint's clock.
@@ -111,6 +114,7 @@ fn start(rt: &Runtime, dir: &PathBuf, max_bytes: usize) -> Mint {
         responses: Mutex::new(responses),
         queue_path: queue_path.clone(),
         queue_lock: Mutex::new(()),
+        in_flight: Default::default(),
         config: esp_mint::config::Handle::new({
             let mut config = esp_mint::config::Config::default();
             config.redeem_fee_per_byte = RATE as u64;
@@ -251,7 +255,7 @@ fn queued_then_declined_then_collected_with_the_fee_shown_and_retries_idempotent
     let mint = start(&rt, &dir, 1 << 20);
     let mut wallet = Wallet::open(&dir.join("wallet.json")).unwrap();
     ecash_wallet::http::sync_esp_keysets(&mut wallet, &mint.esp).unwrap();
-    let a = handed(&mint, 3 * ONE, PAST);
+    let a = handed(&mint, 4 * ONE, PAST);
     let b = handed(&mint, 2 * ONE, PAST2);
     let (na, nb) = (a.note, b.note);
     give(&mut wallet, PAST, vec![a]);
@@ -265,14 +269,23 @@ fn queued_then_declined_then_collected_with_the_fee_shown_and_retries_idempotent
         .unwrap();
     assert_eq!(built.len(), 1);
     let b0 = built[0].clone();
-    assert_eq!(b0.size_bytes, 119 + 2 * 186 + MEMO.len() as u64 + 2 * 81);
+    // one decline output for each power of two the rest is made of
+    let declines = sp_wire::esp::redeem::decode(&b0.body)
+        .unwrap()
+        .decline_outputs
+        .len();
+    assert!(declines >= 2);
+    assert_eq!(
+        b0.size_bytes,
+        119 + 2 * 186 + MEMO.len() as u64 + declines as u64 * 81
+    );
     assert_eq!(b0.fee_esp, RATE * u128::from(b0.size_bytes));
 
     let done = send(&mint, &mut wallet, b0.id.clone());
     assert_eq!(done.id, b0.id);
     assert_eq!(done.message, "payout queued");
     assert_eq!(done.fee_esp, b0.fee_esp);
-    assert_eq!(done.owed_esp, u128::from(5 * ONE) - b0.fee_esp);
+    assert_eq!(done.owed_esp, u128::from(6 * ONE) - b0.fee_esp);
     assert_eq!(done.entry, Some(EntryOutcome::Open));
     assert!(is_spent(&mint, &na) && is_spent(&mint, &nb));
     assert!(wallet.notes().is_empty());
@@ -304,7 +317,7 @@ fn queued_then_declined_then_collected_with_the_fee_shown_and_retries_idempotent
             reissued_esp,
         }) => {
             assert_eq!(reason.as_deref(), Some("uptime terms were not met"));
-            assert_eq!(reissued.len(), 2);
+            assert_eq!(reissued.len(), declines);
             assert_eq!(reissued_esp, done.owed_esp);
         }
         other => panic!("{other:?}"),
@@ -361,7 +374,7 @@ fn a_note_immature_at_the_mint_is_refunded_and_nothing_owed_fee_taken() {
     ecash_wallet::http::sync_esp_keysets(&mut wallet, &mint.esp).unwrap();
     // a small mature note that cannot pay the fee, and a large one the mint
     // will find immature
-    let small = handed(&mint, 100_000_000, PAST);
+    let small = handed(&mint, SMALL, PAST);
     let big = handed(&mint, ONE, FUTURE);
     let (ns, nb) = (small.note, big.note);
     give(&mut wallet, PAST, vec![small]);
@@ -393,12 +406,13 @@ fn a_note_immature_at_the_mint_is_refunded_and_nothing_owed_fee_taken() {
             .map(|n| n.2),
         Some(true)
     );
-    assert_eq!(done.refunded.len(), 1);
+    assert!(!done.refunded.is_empty());
+    assert!(done.refunded.len() > 1);
     assert!(is_spent(&mint, &ns) && is_spent(&mint, &nb));
     assert!(wallet.pending_redemptions().is_empty());
     assert_eq!(
         wallet.balance().esp,
-        u128::from(ONE) + 100_000_000 - done.fee_esp
+        u128::from(ONE) + u128::from(SMALL) - done.fee_esp
     );
     let n = &wallet.notes()[0];
     assert_eq!(n.terms.unwrap().redeemable_after_day, FUTURE);
@@ -509,7 +523,11 @@ fn a_below_fee_refusal_moves_the_notes_the_mint_calls_spent_to_the_spent_record(
 fn a_redemption_over_the_ceiling_is_split_and_each_part_is_queued() {
     let dir = scratch("split");
     let rt = Runtime::new().unwrap();
-    let ceiling = redeem::encoded_len(2, MEMO.len(), 2, 2);
+    // room for two notes of one day with the most outputs a day can need, but
+    // not three, and not notes of two days together: the notes go two of the
+    // first day, one, and two of the second
+    let most = ecash_wallet::redeem::MAX_OUTPUTS_PER_TERMS;
+    let ceiling = redeem::encoded_len(2, MEMO.len(), most, most);
     let mint = start(&rt, &dir, ceiling as usize);
     let mut wallet = Wallet::open(&dir.join("wallet.json")).unwrap();
     ecash_wallet::http::sync_esp_keysets(&mut wallet, &mint.esp).unwrap();

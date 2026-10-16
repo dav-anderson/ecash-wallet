@@ -37,7 +37,9 @@ ecash-wallet [--wallet FILE] [--regtest|--signet|--testnet] <command>
       hex). The smallest exchange is 1 PSP. The mint's exchange is exact, so the
       wallet spends whole PSP notes worth at least N and asks for all of their
       value: N PSP of ESP, plus any difference as extra ESP notes (change) under
-      the same terms.
+      the same terms. ESP notes are powers of two: the wallet splits the amount
+      (and the change) into the fewest of them. --amounts picks other sizes,
+      each a power of two, adding up to the same total.
   hand-over --service HEX (--esp UNITS | --psp N) [--day D] --out FILE
       Hand whole ESP notes bound to a service to that service, worth exactly
       UNITS ESP units (or N PSP). Notes cannot be split, so the wallet needs a
@@ -50,7 +52,9 @@ ecash-wallet [--wallet FILE] [--regtest|--signet|--testnet] <command>
       As the service (HEX is its 32 byte secret key): swap every free ESP note
       this wallet holds for that service and day for fresh notes only it
       controls, with the same service, the same day and the same total.
-      --amounts picks the new sizes. --resume sends a pending request again.
+      The new notes are powers of two, the fewest that make the total.
+      --amounts picks other sizes (each a power of two, same total).
+      --resume sends a pending request again.
   balance
       What the wallet holds and what is waiting.
   send-psp N FILE [--psp-url URL]

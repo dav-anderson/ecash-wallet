@@ -9,6 +9,7 @@
 //! - [`store`]: the note file, which holds each note with its spend key, amount
 //!   and terms, and the requests waiting for a reply.
 //! - [`psp`]: buying PSP (`build_psp_payload`, `claim_psp`).
+//! - [`split`]: ESP note sizes are powers of two; totals are split into them.
 //! - [`esp`]: exchanging PSP for ESP (`build_exchange`, `finish_exchange`).
 //! - [`transfer`]: handing ESP to the service it is named for
 //!   (`hand_over_esp`), receiving it (`receive_handover`), and the service's swap
@@ -31,6 +32,7 @@ pub mod psp;
 pub mod redeem;
 pub mod rotate;
 pub mod send;
+pub mod split;
 pub mod store;
 pub mod transfer;
 

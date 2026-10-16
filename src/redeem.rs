@@ -66,6 +66,10 @@ use crate::store::{Kind, StoredNote, StoredTerms, Wallet};
 /// mint's own rate is read from `GET /fees` and replaces it.
 const DEFAULT_FEE_PER_BYTE: u128 = 1_000_000;
 
+/// The most outputs one service and day can need in one list: a total below
+/// 2^64 splits into at most this many powers of two.
+pub const MAX_OUTPUTS_PER_TERMS: usize = 64;
+
 /// The request ceiling to assume (64 MiB) until `/fees` has been read. Also the
 /// mint's default, not wire format.
 const DEFAULT_MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
@@ -211,13 +215,13 @@ pub enum EntryOutcome {
     },
 }
 
-/// The amounts for one list of outputs: what is left of each service and day
-/// after `take` is taken from them, in pieces that fit a `u64`. `take` comes
-/// from the service and day with the most value first (on a tie, the one that
-/// comes first in the mint's order), then the next largest, and so on. The mint
-/// does not fix where the fee comes from: it only checks the total and each
-/// day's cap. The outputs stay in the mint's order.
-fn pieces(by_terms: &[(StoredTerms, u128)], take: u128) -> Vec<(StoredTerms, u64)> {
+/// What is left of each service and day after `take` is taken from them, as
+/// totals, in the mint's order, leaving out the ones with nothing left. `take`
+/// comes from the service and day with the most value first (on a tie, the one
+/// that comes first in the mint's order), then the next largest, and so on. The
+/// mint does not fix where the fee comes from: it only checks the total and each
+/// day's cap.
+fn remainders(by_terms: &[(StoredTerms, u128)], take: u128) -> Vec<(StoredTerms, u128)> {
     let mut order: Vec<usize> = (0..by_terms.len()).collect();
     order.sort_by(|&x, &y| by_terms[y].1.cmp(&by_terms[x].1).then(x.cmp(&y)));
     let mut taken = vec![0u128; by_terms.len()];
@@ -227,16 +231,73 @@ fn pieces(by_terms: &[(StoredTerms, u128)], take: u128) -> Vec<(StoredTerms, u64
         taken[i] = t;
         left_to_take -= t;
     }
-    let mut out = Vec::new();
-    for ((terms, total), taken) in by_terms.iter().zip(taken) {
-        let mut rest = total - taken;
-        while rest > 0 {
-            let piece = rest.min(u128::from(u64::MAX));
-            out.push((*terms, piece as u64));
-            rest -= piece;
-        }
+    by_terms
+        .iter()
+        .zip(taken)
+        .map(|((terms, total), taken)| (*terms, total - taken))
+        .filter(|(_, rest)| *rest > 0)
+        .collect()
+}
+
+/// The service and days whose total the fee changed: the ones in `rest` that
+/// hold less than they did in `before`.
+fn touched_by(before: &[(StoredTerms, u128)], rest: &[(StoredTerms, u128)]) -> Vec<StoredTerms> {
+    rest.iter()
+        .filter(|(terms, left)| before.iter().any(|(t, total)| t == terms && total != left))
+        .map(|(terms, _)| *terms)
+        .collect()
+}
+
+/// The outputs for these totals, exactly `count` of them, each a power of two
+/// (the mint refuses anything else): each service and day's total as the fewest
+/// powers of two, then one note halved at a time until there are `count`. The
+/// extra notes are cut from the largest note of the days the fee came out of
+/// (`touched`: their amounts were changed by the fee anyway), and only when
+/// none of those has a note left to halve, from the largest of the others. So
+/// a day the fee did not touch keeps the fewest notes its amount allows. The
+/// outputs stay in the mint's order. `None` when `count` is fewer than the fewest, or more
+/// than the totals can make.
+fn lay_out(
+    rest: &[(StoredTerms, u128)],
+    touched: &[StoredTerms],
+    count: usize,
+) -> Option<Vec<(StoredTerms, u64)>> {
+    let mut lists: Vec<(StoredTerms, Vec<u64>)> = Vec::with_capacity(rest.len());
+    for (terms, total) in rest {
+        lists.push((*terms, crate::split::split(*total).ok()?));
     }
-    out
+    let fewest: usize = lists.iter().map(|(_, notes)| notes.len()).sum();
+    if count < fewest {
+        return None;
+    }
+    for _ in fewest..count {
+        // The largest note of a touched day if any has one to halve; else the
+        // largest of all. The first one in the mint's order on a tie.
+        let largest = |only_touched: bool| {
+            let mut best: Option<(usize, usize, u64)> = None;
+            for (l, (terms, notes)) in lists.iter().enumerate() {
+                if only_touched && !touched.contains(terms) {
+                    continue;
+                }
+                for (i, &a) in notes.iter().enumerate() {
+                    if a > 1 && best.is_none_or(|(_, _, b)| a > b) {
+                        best = Some((l, i, a));
+                    }
+                }
+            }
+            best
+        };
+        let (l, i, a) = largest(true).or_else(|| largest(false))?;
+        let notes = &mut lists[l].1;
+        notes[i] = a / 2;
+        notes.insert(i + 1, a / 2);
+    }
+    Some(
+        lists
+            .into_iter()
+            .flat_map(|(terms, notes)| notes.into_iter().map(move |a| (terms, a)))
+            .collect(),
+    )
 }
 
 /// The outputs a request needs, worked out the way the mint checks them
@@ -260,55 +321,66 @@ pub fn allocate(
 ) -> Result<Allocation, WalletError> {
     let a: u128 = accepted.iter().map(|(_, v)| v).sum();
     let r: u128 = rejected.iter().map(|(_, v)| v).sum();
-    // The output counts change the size, which changes the fee, which can change
-    // the counts. Start from one output per service and day and settle on
-    // counts that reproduce themselves.
-    let mut counts = (pieces(accepted, 0).len(), 0usize);
-    let mut seen = Vec::new();
-    loop {
-        let size = redeem::encoded_len(inputs, memo_bytes, counts.0, counts.1);
-        let fee = fee_for(size, fee_per_byte);
-        if a + r < fee {
-            return Err(WalletError::NotEnough(format!(
-                "the notes are worth {} ESP units, less than the fee of {fee} ({size} bytes at {fee_per_byte} a byte). The mint would refuse: nothing is sent",
-                a + r
-            )));
-        }
-        let (decline, refund) = if a >= fee {
-            (pieces(accepted, fee), Vec::new())
-        } else {
-            (Vec::new(), pieces(rejected, fee - a))
-        };
-        let next = (decline.len(), refund.len());
-        if next == counts {
-            return Ok(Allocation {
-                decline,
-                refund,
-                size_bytes: size,
-                fee_esp: fee,
-                owed_esp: a.saturating_sub(fee),
-            });
-        }
-        if seen.contains(&next) && a > 0 {
-            let size = redeem::encoded_len(inputs, memo_bytes, next.0, next.1).max(size);
-            let fee = fee_for(size, fee_per_byte);
-            // The value is about the fee: with its decline output the fee takes
-            // everything, and without one the request is smaller and owes a
-            // little, which needs the output again. Either way it is not worth
-            // sending: with the output it would owe nothing.
-            return Err(WalletError::NotEnough(format!(
-                "{} note(s) worth {a} ESP units would all go to the fee of {fee} ESP units ({size} bytes at {fee_per_byte} a byte), so the mint would owe nothing. Nothing is sent",
-                inputs
-            )));
-        }
-        if seen.contains(&next) || seen.len() > 8 {
-            return Err(WalletError::Invalid(
-                "could not settle on a number of outputs for this redemption".into(),
-            ));
-        }
-        seen.push(counts);
-        counts = next;
+    let fee_of = |decline: usize, refund: usize| {
+        let size = redeem::encoded_len(inputs, memo_bytes, decline, refund);
+        (size, fee_for(size, fee_per_byte))
+    };
+    let (size, fee) = fee_of(0, 0);
+    if a + r < fee {
+        return Err(WalletError::NotEnough(format!(
+            "the notes are worth {} ESP units, less than the fee of {fee} ({size} bytes at {fee_per_byte} a byte). The mint would refuse: nothing is sent",
+            a + r
+        )));
     }
+    // Every output is a power of two, so how many outputs there are depends on
+    // the fee, and the fee depends on how many there are. Try the counts upward
+    // and take the first one that reproduces itself. (Fewer outputs than the
+    // fewest powers of two cannot be, and more can be made by halving.)
+    let limit = MAX_OUTPUTS_PER_TERMS * (accepted.len() + rejected.len()) + 8;
+    for count in 0..=limit {
+        let (size, fee) = fee_of(count, 0);
+        if a >= fee {
+            let rest = remainders(accepted, fee);
+            let touched = touched_by(accepted, &rest);
+            if let Some(decline) = lay_out(&rest, &touched, count) {
+                return Ok(Allocation {
+                    decline,
+                    refund: Vec::new(),
+                    size_bytes: size,
+                    fee_esp: fee,
+                    owed_esp: a - fee,
+                });
+            }
+        }
+        let (size, fee) = fee_of(0, count);
+        if a < fee && a + r >= fee {
+            let rest = remainders(rejected, fee - a);
+            let touched = touched_by(rejected, &rest);
+            if let Some(refund) = lay_out(&rest, &touched, count) {
+                return Ok(Allocation {
+                    decline: Vec::new(),
+                    refund,
+                    size_bytes: size,
+                    fee_esp: fee,
+                    owed_esp: 0,
+                });
+            }
+        }
+    }
+    if a > 0 {
+        let (size, fee) = fee_of(1, 0);
+        // The value is about the fee: with its decline outputs the fee takes
+        // everything, and without them the request is smaller and owes a
+        // little, which needs the outputs again. Either way it is not worth
+        // sending: with the outputs it would owe nothing.
+        return Err(WalletError::NotEnough(format!(
+            "{} note(s) worth {a} ESP units would all go to the fee of {fee} ESP units ({size} bytes at {fee_per_byte} a byte), so the mint would owe nothing. Nothing is sent",
+            inputs
+        )));
+    }
+    Err(WalletError::Invalid(
+        "could not settle on a number of outputs for this redemption".into(),
+    ))
 }
 
 /// Whether a list of outputs is within what the mint will sign: at most `cap`
@@ -342,6 +414,14 @@ pub fn mint_would_accept(
     let r: u128 = rejected.iter().map(|(_, v)| v).sum();
     let fee = alloc.fee_esp;
     if a + r < fee {
+        return false;
+    }
+    if alloc
+        .decline
+        .iter()
+        .chain(alloc.refund.iter())
+        .any(|(_, amount)| !amount.is_power_of_two())
+    {
         return false;
     }
     let shortfall = fee.saturating_sub(a);
@@ -501,8 +581,8 @@ fn sign_request(
 }
 
 /// Split notes, in order, into groups that fit the ceiling: each group's
-/// request, with one decline and one refund output per service and day (the
-/// most it can need), is at most `max_bytes`.
+/// request, with the most decline and the most refund outputs a service and day
+/// can need (`MAX_OUTPUTS_PER_TERMS` each), is at most `max_bytes`.
 fn split(
     notes: Vec<StoredNote>,
     memo_bytes: usize,
@@ -510,8 +590,8 @@ fn split(
 ) -> Result<Vec<Vec<StoredNote>>, WalletError> {
     let worst = |group: &[StoredNote]| -> u64 {
         let refs: Vec<&StoredNote> = group.iter().collect();
-        let terms = pieces(&by_terms(&refs), 0).len();
-        redeem::encoded_len(group.len(), memo_bytes, terms, terms)
+        let outputs = by_terms(&refs).len() * MAX_OUTPUTS_PER_TERMS;
+        redeem::encoded_len(group.len(), memo_bytes, outputs, outputs)
     };
     let mut groups: Vec<Vec<StoredNote>> = Vec::new();
     let mut current: Vec<StoredNote> = Vec::new();
@@ -1101,7 +1181,8 @@ mod tests {
     const PAST: u64 = 20_000;
     const PAST2: u64 = 20_500;
     const FUTURE: u64 = 21_000;
-    const ONE: u64 = 1_000_000_000_000;
+    /// A test amount, a power of two (about $1.10). Every ESP note is one.
+    const ONE: u64 = 1 << 40;
     const RATE: u128 = 1_000_000;
     const MEMO: &str = "btc:bc1qpayhere";
 
@@ -1187,19 +1268,36 @@ mod tests {
         )
     }
 
+    /// The total of the outputs for one day.
+    fn sum_for(list: &[(StoredTerms, u64)], day: u64) -> u128 {
+        list.iter()
+            .filter(|(t, _)| t.redeemable_after_day == day)
+            .map(|(_, v)| u128::from(*v))
+            .sum()
+    }
+
     #[test]
-    fn one_day_pays_the_fee_and_the_rest_comes_back_in_one_decline_output() {
-        let accepted = [(terms(PAST), u128::from(5 * ONE))];
+    fn one_day_pays_the_fee_and_the_rest_comes_back_as_powers_of_two() {
+        let accepted = [(terms(PAST), u128::from(6 * ONE))];
         let a = allocate(&accepted, &[], 2, MEMO.len(), RATE).unwrap();
-        assert_eq!(a.size_bytes, 119 + 2 * 186 + MEMO.len() as u64 + 81);
-        assert_eq!(a.fee_esp, fee_of(2, 1, 0));
+        // The fee depends on how many outputs there are, and the rest is split
+        // into powers of two, so the count is the one that reproduces itself.
+        let n = a.decline.len();
+        assert!(n > 1);
         assert_eq!(
-            a.decline,
-            vec![(terms(PAST), (u128::from(5 * ONE) - a.fee_esp) as u64)]
+            a.size_bytes,
+            119 + 2 * 186 + MEMO.len() as u64 + 81 * n as u64
         );
+        assert_eq!(a.fee_esp, fee_of(2, n, 0));
+        assert!(a.decline.iter().all(|(_, v)| v.is_power_of_two()));
+        assert_eq!(sum_for(&a.decline, PAST), u128::from(6 * ONE) - a.fee_esp);
         assert!(a.refund.is_empty());
-        assert_eq!(a.owed_esp, u128::from(5 * ONE) - a.fee_esp);
+        assert_eq!(a.owed_esp, u128::from(6 * ONE) - a.fee_esp);
         assert!(mint_would_accept(&a, &accepted, &[]));
+        // an amount that is not a power of two is not something the mint signs
+        let mut odd = a.clone();
+        odd.decline[0].1 += 1;
+        assert!(!mint_would_accept(&odd, &accepted, &[]));
     }
 
     #[test]
@@ -1207,35 +1305,125 @@ mod tests {
         let accepted = [(terms(PAST), 1_000), (terms(PAST2), u128::from(ONE))];
         let a = allocate(&accepted, &[], 2, MEMO.len(), RATE).unwrap();
         // The later day holds the most, so the fee comes out of it and the
-        // small early day keeps its 1000 units.
-        assert_eq!(a.fee_esp, fee_of(2, 2, 0));
+        // small early day keeps its 1000 units, as 512 + 256 + 128 + 64 + 32 + 8.
+        assert_eq!(a.fee_esp, fee_of(2, a.decline.len(), 0));
+        assert_eq!(sum_for(&a.decline, PAST), 1_000);
         assert_eq!(
-            a.decline,
-            vec![
-                (terms(PAST), 1_000),
-                (terms(PAST2), (u128::from(ONE) - a.fee_esp) as u64)
-            ]
+            a.decline
+                .iter()
+                .filter(|(t, _)| t.redeemable_after_day == PAST)
+                .map(|(_, v)| *v)
+                .collect::<Vec<_>>(),
+            vec![512, 256, 128, 64, 32, 8]
         );
+        assert_eq!(sum_for(&a.decline, PAST2), u128::from(ONE) - a.fee_esp);
         assert!(mint_would_accept(&a, &accepted, &[]));
-        // When the largest day cannot cover it all, the next largest pays the rest.
-        let f2 = fee_of(2, 2, 0);
-        let total = f2 + 15;
-        let accepted = [(terms(PAST), f2 / 2 + 5), (terms(PAST2), f2 / 2 + 10)];
-        let a = allocate(&accepted, &[], 2, MEMO.len(), RATE).unwrap();
-        // PAST2 is all taken; PAST pays the rest and keeps what is left.
-        assert_eq!(a.fee_esp, fee_of(2, 1, 0));
-        assert_eq!(a.decline, vec![(terms(PAST), (total - a.fee_esp) as u64)]);
-        assert!(mint_would_accept(&a, &accepted, &[]));
-        // Both big enough: one output each.
+        // Both big enough: each day keeps what the fee did not take, and the
+        // day the fee did not touch (the later one: on a tie the earlier pays)
+        // keeps the fewest notes its amount allows. ONE is a power of two, so
+        // that is one note, and the extra notes the count needs are cut from
+        // the day the fee did touch.
         let accepted = [
             (terms(PAST), u128::from(ONE)),
             (terms(PAST2), u128::from(ONE)),
         ];
         let a = allocate(&accepted, &[], 2, MEMO.len(), RATE).unwrap();
-        assert_eq!(a.decline.len(), 2);
-        assert_eq!(a.decline[1], (terms(PAST2), ONE));
-        assert_eq!(u128::from(a.decline[0].1), u128::from(ONE) - a.fee_esp);
+        assert_eq!(
+            a.decline
+                .iter()
+                .filter(|(t, _)| t.redeemable_after_day == PAST2)
+                .map(|(_, v)| *v)
+                .collect::<Vec<_>>(),
+            vec![ONE]
+        );
+        assert_eq!(sum_for(&a.decline, PAST2), u128::from(ONE));
+        assert_eq!(sum_for(&a.decline, PAST), u128::from(ONE) - a.fee_esp);
         assert!(mint_would_accept(&a, &accepted, &[]));
+    }
+
+    #[test]
+    fn the_fee_comes_out_of_the_largest_day_and_then_the_next() {
+        let by = [(terms(PAST), 10), (terms(PAST2), 15)];
+        // 20 comes out of PAST2 (15) and then PAST (5): only PAST has any left
+        assert_eq!(remainders(&by, 20), vec![(terms(PAST), 5)]);
+        assert_eq!(remainders(&by, 0), by.to_vec());
+        assert_eq!(remainders(&by, 25), vec![]);
+        // on a tie the earlier one in the mint's order pays first
+        let tie = [(terms(PAST), 10), (terms(PAST2), 10)];
+        assert_eq!(
+            remainders(&tie, 4),
+            vec![(terms(PAST), 6), (terms(PAST2), 10)]
+        );
+    }
+
+    #[test]
+    fn outputs_are_the_fewest_powers_of_two_and_a_count_halves_the_largest() {
+        let rest = [(terms(PAST), 13), (terms(PAST2), 6)];
+        let fewest = lay_out(&rest, &[], 5).unwrap();
+        assert_eq!(
+            fewest,
+            vec![
+                (terms(PAST), 8),
+                (terms(PAST), 4),
+                (terms(PAST), 1),
+                (terms(PAST2), 4),
+                (terms(PAST2), 2)
+            ]
+        );
+        // one more output: the largest note of all (the 8) is halved
+        let more = lay_out(&rest, &[], 6).unwrap();
+        assert_eq!(
+            more,
+            vec![
+                (terms(PAST), 4),
+                (terms(PAST), 4),
+                (terms(PAST), 4),
+                (terms(PAST), 1),
+                (terms(PAST2), 4),
+                (terms(PAST2), 2)
+            ]
+        );
+        assert_eq!(more.len(), 6);
+        assert_eq!(sum_for(&more, PAST), 13);
+        assert_eq!(sum_for(&more, PAST2), 6);
+        assert!(more.iter().all(|(_, v)| v.is_power_of_two()));
+        // fewer than the fewest, or more than the units, cannot be
+        assert!(lay_out(&rest, &[], 4).is_none());
+        assert!(lay_out(&rest, &[], 20).is_none());
+        assert_eq!(lay_out(&[], &[], 0), Some(vec![]));
+        assert!(lay_out(&[], &[], 1).is_none());
+    }
+
+    #[test]
+    fn extra_notes_are_cut_from_the_days_the_fee_touched_and_not_from_the_others() {
+        let rest = [(terms(PAST), 13), (terms(PAST2), 6)];
+        // PAST2 is the day the fee came out of, so it takes the extra note even
+        // though PAST holds the largest note (8)
+        let p = lay_out(&rest, &[terms(PAST2)], 6).unwrap();
+        assert_eq!(
+            p,
+            vec![
+                (terms(PAST), 8),
+                (terms(PAST), 4),
+                (terms(PAST), 1),
+                (terms(PAST2), 2),
+                (terms(PAST2), 2),
+                (terms(PAST2), 2)
+            ]
+        );
+        // a touched day with nothing left to halve gives way to the others
+        let rest = [(terms(PAST), 4), (terms(PAST2), 1)];
+        let p = lay_out(&rest, &[terms(PAST2)], 3).unwrap();
+        assert_eq!(sum_for(&p, PAST), 4);
+        assert_eq!(sum_for(&p, PAST2), 1);
+        assert_eq!(p.len(), 3);
+        // the days a fee touched are the ones that hold less than before
+        let before = [(terms(PAST), 10), (terms(PAST2), 15)];
+        assert_eq!(
+            touched_by(&before, &remainders(&before, 4)),
+            vec![terms(PAST2)]
+        );
+        assert_eq!(touched_by(&before, &remainders(&before, 0)), vec![]);
     }
 
     #[test]
@@ -1244,11 +1432,12 @@ mod tests {
         let rejected = [(terms(FUTURE), u128::from(ONE))];
         let a = allocate(&accepted, &rejected, 2, MEMO.len(), RATE).unwrap();
         assert!(a.decline.is_empty());
-        assert_eq!(a.fee_esp, fee_of(2, 0, 1));
+        assert_eq!(a.fee_esp, fee_of(2, 0, a.refund.len()));
         assert_eq!(
-            a.refund,
-            vec![(terms(FUTURE), (u128::from(ONE) + 1_000 - a.fee_esp) as u64)]
+            sum_for(&a.refund, FUTURE),
+            u128::from(ONE) + 1_000 - a.fee_esp
         );
+        assert!(a.refund.iter().all(|(_, v)| v.is_power_of_two()));
         assert_eq!(a.owed_esp, 0);
         assert!(mint_would_accept(&a, &accepted, &rejected));
         // Without the refund the mint would refuse (refund_required).
@@ -1257,7 +1446,7 @@ mod tests {
         assert!(!mint_would_accept(&missing, &accepted, &rejected));
         // Asking for more than is left is over the limit.
         let mut greedy = a.clone();
-        greedy.refund[0].1 += 1;
+        greedy.refund[0].1 *= 2;
         assert!(!mint_would_accept(&greedy, &accepted, &rejected));
     }
 
@@ -1270,15 +1459,18 @@ mod tests {
     #[test]
     fn a_total_past_u64_comes_back_in_pieces_that_fit() {
         let big = u128::from(u64::MAX) * 2 + 10;
-        let p = pieces(&[(terms(PAST), big)], 5);
-        assert_eq!(p.len(), 3);
+        let rest = remainders(&[(terms(PAST), big)], 5);
+        // 2^65 + 3: four notes of 2^63, then 2 and 1
+        let p = lay_out(&rest, &[], 6).unwrap();
+        assert_eq!(p.len(), 6);
         assert_eq!(p.iter().map(|(_, v)| u128::from(*v)).sum::<u128>(), big - 5);
+        assert!(lay_out(&rest, &[], 5).is_none());
     }
 
     #[test]
     fn the_request_is_the_mints_encoding_signed_by_the_service_and_its_notes_are_held() {
         let notes = vec![
-            esp_note(3 * ONE, service(), PAST),
+            esp_note(4 * ONE, service(), PAST),
             esp_note(2 * ONE, service(), PAST2),
             esp_note(ONE, service(), FUTURE),
             esp_note(
@@ -1296,9 +1488,14 @@ mod tests {
         // the two mature notes for this service, mixed days; not the future one
         // and not the other service's
         assert_eq!(b.notes, 2);
-        assert_eq!(b.esp_units, u128::from(5 * ONE));
+        assert_eq!(b.esp_units, u128::from(6 * ONE));
         assert_eq!(b.body.len() as u64, b.size_bytes);
-        assert_eq!(b.size_bytes, redeem::encoded_len(2, MEMO.len(), 2, 0));
+        let declined = redeem::decode(&b.body).unwrap().decline_outputs.len();
+        assert!(declined >= 2);
+        assert_eq!(
+            b.size_bytes,
+            redeem::encoded_len(2, MEMO.len(), declined, 0)
+        );
         assert_eq!(b.fee_esp, fee_for(b.size_bytes, RATE));
         assert_eq!(b.owed_esp, b.esp_units - b.fee_esp);
         let request = redeem::decode(&b.body).unwrap();
@@ -1379,10 +1576,14 @@ mod tests {
     #[test]
     fn a_redemption_over_the_ceiling_is_split_and_every_part_fits() {
         let notes: Vec<StoredNote> = (0..7)
-            .map(|i| esp_note(ONE + i, service(), if i % 2 == 0 { PAST } else { PAST2 }))
+            .map(|i| esp_note(ONE << i, service(), if i % 2 == 0 { PAST } else { PAST2 }))
             .collect();
         let (mut w, dir) = wallet_with("split", notes);
-        let ceiling = redeem::encoded_len(3, MEMO.len(), 2, 2);
+        // Room for three notes of one day with the most outputs a day can need,
+        // but not four, and not notes of two days together: the notes go three
+        // of one day, one, and three of the other.
+        let most = MAX_OUTPUTS_PER_TERMS;
+        let ceiling = redeem::encoded_len(3, MEMO.len(), most, most);
         let small = RedeemFees {
             max_request_bytes: ceiling,
             ..fees()
@@ -1503,7 +1704,7 @@ mod tests {
         // a repeated open reply changes nothing
         w.finish_redemption(&b.id, &open).unwrap();
         assert!(w.notes().is_empty());
-        // declined: the decline outputs are signed, one per day, minus the fee
+        // declined: the decline outputs are signed, a power of two each, minus the fee
         let mint = SecretKey::new(&mut rand::rngs::OsRng);
         let sigs: Vec<_> = p.decline_outputs.iter().map(|o| signed(&mint, o)).collect();
         let declined = reply(
@@ -1521,7 +1722,7 @@ mod tests {
                 reissued_esp,
             }) => {
                 assert_eq!(reason.as_deref(), Some("terms not met"));
-                assert_eq!(reissued.len(), 2);
+                assert_eq!(reissued.len(), p.decline_outputs.len());
                 assert_eq!(reissued_esp, b.owed_esp);
             }
             other => panic!("{other:?}"),
@@ -1535,6 +1736,7 @@ mod tests {
             .map(|n| n.terms.unwrap().redeemable_after_day)
             .collect();
         days.sort();
+        days.dedup();
         assert_eq!(days, vec![PAST, PAST2]);
         // the reissued note unblinds to one the mint's key signed
         let n = &w.notes()[0];
@@ -1733,7 +1935,8 @@ mod tests {
         };
         let rebuilt = w.rebuild_redemption(&b.id, &key(1), &totals).unwrap();
         assert_ne!(rebuilt.id, b.id);
-        assert_eq!((rebuilt.decline_outputs, rebuilt.refund_outputs), (0, 1));
+        assert_eq!(rebuilt.decline_outputs, 0);
+        assert!(rebuilt.refund_outputs >= 1);
         assert_eq!(rebuilt.owed_esp, 0);
         assert_eq!(w.pending_redemptions().len(), 1);
         assert_eq!(
@@ -1742,7 +1945,7 @@ mod tests {
         );
         let p = w.pending_redemptions()[0].clone();
         let mint = SecretKey::new(&mut rand::rngs::OsRng);
-        let refund = vec![signed(&mint, &p.refund_outputs[0])];
+        let refund: Vec<_> = p.refund_outputs.iter().map(|o| signed(&mint, o)).collect();
         totals.fee_esp = p.fee_esp;
         let r = RedeemResponse {
             notes: totals.notes.clone(),
@@ -1758,7 +1961,7 @@ mod tests {
         };
         let done = w.finish_redemption(&rebuilt.id, &r).unwrap();
         assert_eq!(done.message, "nothing owed, fee taken");
-        assert_eq!(done.refunded.len(), 1);
+        assert_eq!(done.refunded.len(), p.refund_outputs.len());
         assert!(done.entry.is_none());
         assert!(w.pending_redemptions().is_empty());
         assert_eq!(w.balance().esp, u128::from(ONE) - p.fee_esp);
@@ -1941,7 +2144,8 @@ mod tests {
             esp_note(1_000, service(), PAST2),
         ];
         let (mut w, dir) = wallet_with("skip", notes);
-        let ceiling = redeem::encoded_len(2, MEMO.len(), 2, 2);
+        let most = MAX_OUTPUTS_PER_TERMS;
+        let ceiling = redeem::encoded_len(2, MEMO.len(), most, most);
         let small = RedeemFees {
             max_request_bytes: ceiling,
             ..fees()
@@ -1961,10 +2165,21 @@ mod tests {
             1
         );
         // alone, the reason is the error
-        // a note worth exactly the fee: the mint would take it all and owe nothing
-        let exact = fee_of(1, 1, 0) as u64;
-        let (mut w2, dir2) = wallet_with("skip2", vec![esp_note(exact, service(), PAST)]);
-        match w2.build_redemption(&key(1), MEMO, &fees(), NOW) {
+        // A note worth exactly the fee: the mint would take it all and owe
+        // nothing. Notes are powers of two, so make the fee one: a memo of 207
+        // bytes makes a request of one note 512 bytes, and at 2^31 a byte its
+        // fee is 2^40, which is ONE.
+        let memo = "x".repeat(207);
+        let rated = RedeemFees {
+            fee_per_byte: 1 << 31,
+            ..fees()
+        };
+        assert_eq!(
+            fee_for(redeem::encoded_len(1, memo.len(), 0, 0), 1 << 31),
+            u128::from(ONE)
+        );
+        let (mut w2, dir2) = wallet_with("skip2", vec![esp_note(ONE, service(), PAST)]);
+        match w2.build_redemption(&key(1), &memo, &rated, NOW) {
             Err(WalletError::NotEnough(why)) => {
                 assert!(why.starts_with("not sent: 1 note(s) worth"), "{why}");
                 assert!(why.contains("the mint would owe nothing"), "{why}");

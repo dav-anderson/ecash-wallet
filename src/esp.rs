@@ -15,6 +15,12 @@
 //! any other ESP for that service. The wallet therefore picks the PSP notes with
 //! the smallest total that covers the amount, which is the amount itself
 //! whenever some set of its notes adds up to it.
+//!
+//! Every ESP note is a power of two (the mint refuses anything else, so that
+//! notes of one size look alike). The wallet splits the amount, and the change,
+//! into the fewest powers of two ([`crate::split`]): 1 PSP is 10^11 ESP units,
+//! which is 15 notes. `esp_amounts` may choose other sizes, but each must be a
+//! power of two.
 
 use mint_types::{Amount, MintInput, melt_sighash};
 use secp256k1::{Keypair, SECP256K1, XOnlyPublicKey};
@@ -170,8 +176,8 @@ impl Wallet {
     /// Build an exchange that gives `service` at least `psp_units` PSP of ESP.
     ///
     /// The smallest exchange is 1 PSP. `esp_amounts` splits the amount asked for
-    /// into notes, and must add up to `psp_units * 10^11`. Without it that part
-    /// is one note, which fits only up to 184,467,440 PSP.
+    /// into notes, each a power of two, and must add up to `psp_units * 10^11`.
+    /// Without it the wallet splits it into the fewest powers of two.
     ///
     /// The wallet spends the full value of the PSP notes it picks. Anything
     /// beyond `psp_units` comes back as extra ESP notes under the same terms (see
@@ -192,12 +198,7 @@ impl Wallet {
         let target = u128::from(psp_units) * u128::from(ESP_PER_PSP);
         let limit = self.esp_limits().exchange_max_items;
         let mut amounts: Vec<u64> = match esp_amounts {
-            None => vec![u64::try_from(target).map_err(|_| {
-                WalletError::Invalid(format!(
-                    "{psp_units} PSP is too much for one ESP note (the most is {}). Split it with --amounts",
-                    sp_wire::units::MAX_PSP_PER_NOTE
-                ))
-            })?],
+            None => crate::split::split(target)?,
             Some(list) => {
                 if list.is_empty() {
                     return Err(WalletError::Invalid(
@@ -213,6 +214,9 @@ impl Wallet {
                 }
                 if list.contains(&0) {
                     return Err(WalletError::Invalid("an ESP note cannot be zero".into()));
+                }
+                for &a in list {
+                    crate::split::check_denomination(a)?;
                 }
                 let sum: u128 = list.iter().map(|&a| u128::from(a)).sum();
                 if sum != target {
@@ -246,14 +250,9 @@ impl Wallet {
             .ok_or_else(|| WalletError::Invalid("amounts are too large".into()))?;
 
         // The rest of the chosen notes' value comes back as ESP under the same
-        // terms. Each piece fits one note, so a very large change is split.
+        // terms, split into powers of two like the rest.
         let change_esp = u128::from(psp_spent - psp_units) * u128::from(ESP_PER_PSP);
-        let mut left = change_esp;
-        while left > 0 {
-            let piece = u64::try_from(left).unwrap_or(u64::MAX);
-            amounts.push(piece);
-            left -= u128::from(piece);
-        }
+        amounts.extend(crate::split::split(change_esp)?);
         if let Some(max) = limit {
             if chosen.len() > max || amounts.len() > max {
                 return Err(WalletError::Invalid(format!(
@@ -560,8 +559,9 @@ mod tests {
             .collect();
         sizes.sort();
         assert_eq!(sizes, vec![1, 2, 4]);
-        assert_eq!(built.request.outputs.len(), 1);
-        assert_eq!(built.request.outputs[0].amount.units, 700_000_000_000);
+        // 7 PSP is 7 x 10^11 ESP units, as powers of two
+        assert_eq!(output_amounts(&built), pieces(&[700_000_000_000]));
+        assert!(output_amounts(&built).iter().all(|a| a.is_power_of_two()));
         // the chosen notes are reserved, the rest are free
         let b = w.balance();
         assert_eq!(b.reserved, 3);
@@ -573,7 +573,11 @@ mod tests {
     fn spend_signatures_cover_the_memo_for_exactly_these_outputs() {
         let (mut w, dir) = wallet_with("sigs", &[4, 1]);
         let built = w
-            .build_exchange(5, service(), Some(&[200_000_000_000, 300_000_000_000]))
+            .build_exchange(
+                5,
+                service(),
+                Some(&pieces(&[200_000_000_000, 300_000_000_000])),
+            )
             .unwrap();
         let memo = exchange::memo(&built.request.service, &built.request.outputs);
         let sighash = melt_sighash(&built.request.psp_inputs, memo.as_bytes());
@@ -589,6 +593,15 @@ mod tests {
         // and the id is the request hash the mint will use
         assert_eq!(built.id, exchange::request_hash(&built.request).unwrap());
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The notes that add up to each of these totals, split into powers of two,
+    /// one total after the other.
+    fn pieces(totals: &[u128]) -> Vec<u64> {
+        totals
+            .iter()
+            .flat_map(|&t| crate::split::split(t).unwrap())
+            .collect()
     }
 
     fn output_amounts(built: &ExchangeBuild) -> Vec<u64> {
@@ -620,7 +633,7 @@ mod tests {
         let built = w.build_exchange(7, service(), None).unwrap();
         assert_exact(&built);
         assert_eq!(built.change_esp, 0);
-        assert_eq!(output_amounts(&built), vec![700_000_000_000]);
+        assert_eq!(output_amounts(&built), pieces(&[700_000_000_000]));
         fs::remove_dir_all(&dir).unwrap();
 
         // 5 from 8 + 2 + 2: the single 8 is the tightest cover, 3 PSP comes back as ESP
@@ -638,7 +651,7 @@ mod tests {
         assert_eq!(built.change_esp, 300_000_000_000);
         assert_eq!(
             output_amounts(&built),
-            vec![500_000_000_000, 300_000_000_000]
+            pieces(&[500_000_000_000, 300_000_000_000])
         );
         assert_eq!(w.pending_exchanges()[0].change_esp, 300_000_000_000);
         fs::remove_dir_all(&dir).unwrap();
@@ -650,17 +663,16 @@ mod tests {
         assert_eq!(built.psp_spent, 8);
         assert_eq!(
             output_amounts(&built),
-            vec![500_000_000_000, 300_000_000_000]
+            pieces(&[500_000_000_000, 300_000_000_000])
         );
         // an asked-for split keeps its notes and the change is added after them
         w.cancel_exchange(&built.id).unwrap();
-        let split = w
-            .build_exchange(5, service(), Some(&[200_000_000_000, 300_000_000_000]))
-            .unwrap();
+        let asked = pieces(&[200_000_000_000, 300_000_000_000]);
+        let split = w.build_exchange(5, service(), Some(&asked)).unwrap();
         assert_exact(&split);
         assert_eq!(
             output_amounts(&split),
-            vec![200_000_000_000, 300_000_000_000, 300_000_000_000]
+            pieces(&[200_000_000_000, 300_000_000_000, 300_000_000_000])
         );
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -728,26 +740,41 @@ mod tests {
                 .is_err()
         );
         assert!(w.pending_exchanges().is_empty());
+        // a size that is not a power of two is refused, though the total is right
+        let e = w
+            .build_exchange(2, service(), Some(&[1, 199_999_999_999]))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("not an ESP note size"), "{e}");
+        assert!(w.pending_exchanges().is_empty());
+        // the same total as powers of two is built
         assert!(
-            w.build_exchange(2, service(), Some(&[1, 199_999_999_999]))
+            w.build_exchange(2, service(), Some(&pieces(&[200_000_000_000])))
                 .is_ok()
         );
         fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
-    fn one_esp_note_holds_at_most_184_467_440_psp_and_a_split_gets_past_it() {
-        let (mut w, dir) = wallet_with("limit", &[16_777_216]);
-        // 184,467,441 PSP is 1.84467441e19 ESP, over u64::MAX, so not one note
+    fn a_total_above_one_note_is_split_over_several_and_the_change_is_split_too() {
+        // 184,467,441 PSP is 1.84467441e19 ESP units, more than a u64 holds
         assert!(sp_wire::units::MAX_PSP_PER_NOTE < 184_467_441);
-        assert!(w.build_exchange(16_777_216, service(), None).is_ok());
-        let (mut big, dir2) = wallet_with("limit2", &[]);
-        assert!(matches!(
-            big.build_exchange(184_467_441, service(), None),
-            Err(WalletError::Invalid(_))
-        ));
+        let (mut w, dir) = wallet_with("big", &[268_435_456]);
+        let built = w.build_exchange(184_467_441, service(), None).unwrap();
+        assert_exact(&built);
+        let amounts = output_amounts(&built);
+        assert!(amounts.iter().all(|a| a.is_power_of_two()));
+        assert_eq!(amounts[0], 1 << 63);
+        // 2^28 PSP were spent, so the rest of them came back as change
+        assert_eq!(built.psp_spent, 268_435_456);
+        assert_eq!(
+            amounts,
+            pieces(&[
+                184_467_441u128 * 100_000_000_000,
+                (268_435_456u128 - 184_467_441) * 100_000_000_000
+            ])
+        );
         fs::remove_dir_all(&dir).unwrap();
-        fs::remove_dir_all(&dir2).unwrap();
     }
 
     #[test]
@@ -910,10 +937,11 @@ mod tests {
     #[test]
     fn the_exchange_note_limit_is_the_mints_not_the_wallets() {
         let (mut w, dir) = wallet_with("limit", &[2]);
-        let amounts = [100_000_000_000u64; 2];
+        let amounts = pieces(&[100_000_000_000, 100_000_000_000]);
         // Not read yet: the wallet checks nothing of its own, and builds.
         assert_eq!(w.esp_limits().exchange_max_items, None);
         assert!(w.build_exchange(2, service(), Some(&amounts)).is_ok());
+        assert!(amounts.len() > 1);
         let (mut w, dir2) = wallet_with("limit2", &[2]);
         w.set_esp_limits(crate::store::EspLimits {
             exchange_max_items: Some(1),

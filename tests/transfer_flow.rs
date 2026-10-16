@@ -209,7 +209,7 @@ fn exchange_hand_over_and_transfer_end_to_end() {
 
     // The app buys 5 PSP as a 4 and a 1 and exchanges them for ESP bound to the
     // service: 3 PSP asked for and 1 PSP of change from the 4, then the last 1.
-    // It ends up holding ESP notes of 3, 1 and 1 PSP.
+    // It ends up holding 5 PSP of ESP notes, each a power of two.
     let reply = app.reply_did().unwrap();
     let build = app
         .build_psp_payload(&[4, 1], &reply, &mint_key.public_key())
@@ -221,7 +221,10 @@ fn exchange_hand_over_and_transfer_end_to_end() {
     exchange_psp(&mut app, &psp, &esp, &master, &mut responses, 3);
     exchange_psp(&mut app, &psp, &esp, &master, &mut responses, 1);
     let b = app.balance();
-    assert_eq!((b.psp, b.esp, b.notes), (0, 5 * u128::from(ONE_PSP), 3));
+    // every ESP note is a power of two, so 1 PSP (10^11 units) is 15 notes
+    assert_eq!((b.psp, b.esp), (0, 5 * u128::from(ONE_PSP)));
+    assert!(b.notes > 3);
+    let held_notes = b.notes;
     let (issued0, redeemed0) = totals(&esp);
     assert_eq!((issued0, redeemed0), (5 * ONE_PSP, 0));
 
@@ -233,21 +236,21 @@ fn exchange_hand_over_and_transfer_end_to_end() {
     assert!(matches!(err, WalletError::NotEnough(_)), "{err}");
     assert_eq!(app.balance(), before);
 
-    // The app hands the service 3 PSP of ESP: the 3 PSP note.
+    // The app hands the service 3 PSP of ESP: an exact set of its notes.
     let handover = app
         .hand_over_esp(service(), 3 * u128::from(ONE_PSP), None)
         .unwrap();
     assert_eq!(handover.service, service());
-    assert_eq!(handover.notes.len(), 1);
+    let handed_count = handover.notes.len();
+    assert!(handed_count >= 1);
     let handed = handover.notes[0].note;
-    assert_eq!(
-        handover.notes[0].keyset, esp_keyset,
-        "the hand-over names the keyset"
-    );
+    for h in &handover.notes {
+        assert_eq!(h.keyset, esp_keyset, "the hand-over names the keyset");
+    }
     let b = app.balance();
     assert_eq!(
         (b.esp, b.notes, b.handed_over),
-        (2 * u128::from(ONE_PSP), 2, 1)
+        (2 * u128::from(ONE_PSP), held_notes - handed_count, 1)
     );
 
     // The service takes the notes in and swaps them at the ESP mint.
@@ -255,10 +258,10 @@ fn exchange_hand_over_and_transfer_end_to_end() {
     let mut svc = Wallet::open(&svc_file).unwrap();
     svc.note_esp_keysets("esp", &esp_keyset, None).unwrap();
     let (count, units) = svc.receive_handover(&handover).unwrap();
-    assert_eq!((count, units), (1, 3 * u128::from(ONE_PSP)));
+    assert_eq!((count, units), (handed_count, 3 * u128::from(ONE_PSP)));
     let built = svc.build_transfer(&service_secret(), None, None).unwrap();
     assert_eq!(built.esp_units, 3 * u128::from(ONE_PSP));
-    assert_eq!(svc.balance().reserved, 1);
+    assert_eq!(svc.balance().reserved, handed_count);
 
     let response = transfer::transfer(&esp, &master, &mut responses, &built.request).unwrap();
     // Nothing is created and nothing leaves circulation: the same amount is
@@ -267,8 +270,10 @@ fn exchange_hand_over_and_transfer_end_to_end() {
     assert_eq!(issued1 - issued0, 3 * ONE_PSP);
     assert_eq!(redeemed1 - redeemed0, 3 * ONE_PSP);
     assert_eq!(issued1 - redeemed1, issued0 - redeemed0);
-    // The old note is spent. The PSP is not involved at all.
-    assert!(esp.is_spent(handed.nonce).unwrap());
+    // The old notes are spent. The PSP is not involved at all.
+    for h in &handover.notes {
+        assert!(esp.is_spent(h.note.nonce).unwrap());
+    }
     // A lost reply: the same request gets the same answer and burns nothing more.
     let again = transfer::transfer(&esp, &master, &mut responses, &built.request).unwrap();
     assert_eq!(response, again);
@@ -277,9 +282,16 @@ fn exchange_hand_over_and_transfer_end_to_end() {
     let done = svc.finish_transfer(&built.id, &response).unwrap();
     assert_eq!(done.esp_units, 3 * u128::from(ONE_PSP));
     let b = svc.balance();
+    // The swap returns the fewest powers of two that make 3 PSP (3 x 10^11 has
+    // 15 bits set, so 15 notes), whatever number of notes the app had to hand
+    // over to make that amount.
+    let fewest = ecash_wallet::split::split(3 * u128::from(ONE_PSP))
+        .unwrap()
+        .len();
+    assert_eq!(fewest, 15);
     assert_eq!(
         (b.esp, b.notes, b.reserved, b.pending_transfers),
-        (3 * u128::from(ONE_PSP), 1, 0, 0)
+        (3 * u128::from(ONE_PSP), fewest, 0, 0)
     );
     let new_note = svc.notes()[0].clone();
     assert_eq!(new_note.kind, Kind::Esp);
@@ -336,14 +348,19 @@ fn exchange_hand_over_and_transfer_end_to_end() {
     assert!(matches!(err, WalletError::NotEnough(_)), "{err}");
 
     // The new note moves again, and can be split in the same swap.
+    let asked: Vec<u64> = [
+        ecash_wallet::split::split(u128::from(ONE_PSP)).unwrap(),
+        ecash_wallet::split::split(2 * u128::from(ONE_PSP)).unwrap(),
+    ]
+    .concat();
     let split = svc
-        .build_transfer(&service_secret(), None, Some(&[ONE_PSP, 2 * ONE_PSP]))
+        .build_transfer(&service_secret(), None, Some(&asked))
         .unwrap();
     let response = transfer::transfer(&esp, &master, &mut responses, &split.request).unwrap();
     let done = svc.finish_transfer(&split.id, &response).unwrap();
     assert_eq!(
         (done.esp_units, done.notes.len()),
-        (3 * u128::from(ONE_PSP), 2)
+        (3 * u128::from(ONE_PSP), asked.len())
     );
     assert!(esp.is_spent(new_note.note.nonce).unwrap());
     let (issued2, redeemed2) = totals(&esp);

@@ -19,7 +19,8 @@ use tokio::runtime::Runtime;
 
 const T: u64 = 1_800_000_000;
 const H: u64 = 3600;
-/// Past the stagger window of a 1-hour period (0.5% = 18 s).
+/// Past the stagger window of a 1-hour period (0.5% = 18 s, and a swap time is
+/// 1 to 18 s after the set starts).
 const LATER: u64 = 100;
 
 fn scratch(name: &str) -> PathBuf {
@@ -171,7 +172,10 @@ fn psp_rolls_over_after_its_staggered_time_and_the_time_is_then_forgotten() {
     assert_eq!((win.current_epoch, win.previous_epoch), (1, Some(0)));
     let start = win.current_starts.unwrap();
     let at = w.swap_time(Kind::Psp, &m.url, &win).unwrap();
-    assert!(at >= start && at <= start + 18, "0.5% of a 1-hour period");
+    // Strictly after the start: a delay of 0 would make a wallet that syncs the
+    // second the set starts swap at once, and this test would then see no
+    // "will be rolled over" step to wait through.
+    assert!(at > start && at <= start + 18, "0.5% of a 1-hour period");
     assert_eq!(
         w.swap_time(Kind::Psp, &m.url, &win).unwrap(),
         at,
@@ -329,7 +333,8 @@ fn service() -> XOnlyPublicKey {
 }
 
 /// A rotating ESP mint (1-hour periods from `T`) and three notes of its
-/// first set for `service()`: 5 and 3 on day 100, 2 on day 200.
+/// first set for `service()`: 4 and 4 on day 100, 2 on day 200 (ESP notes are
+/// powers of two).
 fn start_esp(rt: &Runtime, dir: &PathBuf) -> (Arc<EspState>, String, Vec<(u64, HandedNote)>) {
     let d = dir.join("esp");
     let (rotor, logic) = esp_mint::rotation::Rotor::open_at(&d, 1, 1, T).unwrap();
@@ -343,13 +348,14 @@ fn start_esp(rt: &Runtime, dir: &PathBuf) -> (Arc<EspState>, String, Vec<(u64, H
         ),
         queue_path: d.join("queue.json"),
         queue_lock: Mutex::new(()),
+        in_flight: Default::default(),
         config: esp_mint::config::Handle::new(esp_mint::config::Config::default()),
         rollovers: Some(Mutex::new(esp_mint::rotation::Rollovers::open(&d).unwrap())),
         rotor: Some(Mutex::new(rotor)),
     });
     let url = serve(rt, esp_mint::server::router(Arc::clone(&state)));
     let mut notes = Vec::new();
-    for (units, day) in [(5u64, 100u64), (3, 100), (2, 200)] {
+    for (units, day) in [(4u64, 100u64), (4, 100), (2, 200)] {
         let terms = Terms {
             service: service(),
             redeemable_after_day: day,
@@ -421,7 +427,7 @@ fn esp_rolls_over_keeping_its_service_and_day() {
     terms.sort();
     assert_eq!(
         terms,
-        vec![(2, 200), (3, 100), (5, 100)],
+        vec![(2, 200), (4, 100), (4, 100)],
         "same amounts, same days"
     );
     assert!(

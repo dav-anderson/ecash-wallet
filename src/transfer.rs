@@ -17,6 +17,9 @@
 //! The swap is exact, and ESP notes cannot be split by their holder, so an app
 //! can hand over only a set of whole notes whose total is exactly the amount. To
 //! make that easy, exchange in the sizes you will pay (`exchange --amounts`).
+//! Every ESP note is a power of two (the mint refuses anything else), so the
+//! new notes of a transfer are too: by default the same sizes as the old ones,
+//! and any other sizes given must be powers of two.
 //!
 //! Handing the notes to the service is an AIR message, which is deferred. Until
 //! then [`Handover`] is a value the command line writes to a file.
@@ -280,7 +283,8 @@ impl Wallet {
     /// one the notes have, or `day`) for fresh notes of the same total.
     ///
     /// By default there is one new note for each old one, with the same amount.
-    /// `esp_amounts` chooses other sizes, and must add up to the same total. Each
+    /// `esp_amounts` chooses other sizes, each a power of two, and must add up to
+    /// the same total. Each
     /// input is signed over the transfer digest with the note's own key, and the
     /// request is signed with the service's key. The old notes are reserved until
     /// the transfer is finished or cancelled.
@@ -310,6 +314,11 @@ impl Wallet {
             .collect();
         chosen.sort_by(|a, b| b.amount.cmp(&a.amount).then_with(|| a.id().cmp(&b.id())));
         let total: u128 = chosen.iter().map(|n| u128::from(n.amount)).sum();
+        // The mint refuses a note or an output that is not a power of two, before
+        // it burns anything, so say so here and send nothing.
+        for n in &chosen {
+            crate::split::check_denomination(n.amount)?;
+        }
 
         let amounts: Vec<u64> = match esp_amounts {
             None => chosen.iter().map(|n| n.amount).collect(),
@@ -319,6 +328,9 @@ impl Wallet {
                 }
                 if list.contains(&0) {
                     return Err(WalletError::Invalid("an ESP note cannot be zero".into()));
+                }
+                for &a in list {
+                    crate::split::check_denomination(a)?;
                 }
                 let sum: u128 = list.iter().map(|&a| u128::from(a)).sum();
                 if sum != total {
@@ -517,6 +529,8 @@ mod tests {
 
     use secp256k1::PublicKey;
 
+    /// A test amount, a power of two (about $1.10). Every ESP note is one.
+    const ONE: u64 = 1 << 40;
     const DAY: u64 = 21_106;
 
     fn key(n: u8) -> SecretKey {
@@ -627,18 +641,20 @@ mod tests {
         let (mut w, dir) = wallet_with(
             "hand",
             vec![
-                esp_note(3_000_000_000_000, service(), DAY),
-                esp_note(1_000_000_000_000, service(), DAY),
-                esp_note(1_000_000_000_000, service(), DAY),
+                esp_note(4 * ONE, service(), DAY),
+                esp_note(ONE, service(), DAY),
+                esp_note(ONE, service(), DAY),
             ],
         );
-        let handover = w.hand_over_esp(service(), 3_000_000_000_000, None).unwrap();
+        let handover = w
+            .hand_over_esp(service(), u128::from(4 * ONE), None)
+            .unwrap();
         assert_eq!(handover.service, service());
         assert_eq!(handover.redeemable_after_day, DAY);
         let handed: u128 = handover.notes.iter().map(|n| u128::from(n.amount)).sum();
-        assert_eq!(handed, 3_000_000_000_000);
+        assert_eq!(handed, u128::from(4 * ONE));
         let b = w.balance();
-        assert_eq!(b.esp, 2_000_000_000_000);
+        assert_eq!(b.esp, u128::from(2 * ONE));
         assert_eq!((b.notes, b.handed_over), (2, 1));
         assert_eq!(w.handovers(), &[handover.clone()]);
         // the record is on disk
@@ -652,12 +668,16 @@ mod tests {
         let (mut w, dir) = wallet_with(
             "inexact",
             vec![
-                esp_note(3_000_000_000_000, service(), DAY),
-                esp_note(1_000_000_000_000, service(), DAY),
+                esp_note(4 * ONE, service(), DAY),
+                esp_note(ONE, service(), DAY),
             ],
         );
         let before = w.balance();
-        for units in [1_500_000_000_000u128, 2_000_000_000_000, 5_000_000_000_000] {
+        for units in [
+            u128::from(ONE + ONE / 2),
+            u128::from(2 * ONE),
+            u128::from(6 * ONE),
+        ] {
             let err = w.hand_over_esp(service(), units, None).unwrap_err();
             assert!(matches!(err, WalletError::NotEnough(_)), "{err}");
         }
@@ -672,12 +692,9 @@ mod tests {
 
     #[test]
     fn only_notes_for_that_service_are_handed_over() {
-        let (mut w, dir) = wallet_with(
-            "service",
-            vec![esp_note(1_000_000_000_000, other_service(), DAY)],
-        );
+        let (mut w, dir) = wallet_with("service", vec![esp_note(ONE, other_service(), DAY)]);
         let err = w
-            .hand_over_esp(service(), 1_000_000_000_000, None)
+            .hand_over_esp(service(), u128::from(ONE), None)
             .unwrap_err();
         assert!(matches!(err, WalletError::NotEnough(_)), "{err}");
         assert_eq!(w.balance().notes, 1);
@@ -689,21 +706,21 @@ mod tests {
         let (mut w, dir) = wallet_with(
             "days",
             vec![
-                esp_note(1_000_000_000_000, service(), DAY),
-                esp_note(1_000_000_000_000, service(), DAY + 1),
+                esp_note(ONE, service(), DAY),
+                esp_note(ONE, service(), DAY + 1),
             ],
         );
         let err = w
-            .hand_over_esp(service(), 1_000_000_000_000, None)
+            .hand_over_esp(service(), u128::from(ONE), None)
             .unwrap_err();
         assert!(matches!(err, WalletError::Invalid(_)), "{err}");
         assert_eq!(w.balance().notes, 2);
         let handover = w
-            .hand_over_esp(service(), 1_000_000_000_000, Some(DAY + 1))
+            .hand_over_esp(service(), u128::from(ONE), Some(DAY + 1))
             .unwrap();
         assert_eq!(handover.redeemable_after_day, DAY + 1);
         assert!(
-            w.hand_over_esp(service(), 1_000_000_000_000, Some(DAY + 7))
+            w.hand_over_esp(service(), u128::from(ONE), Some(DAY + 7))
                 .is_err()
         );
         assert_eq!(w.balance().notes, 1);
@@ -712,10 +729,10 @@ mod tests {
 
     #[test]
     fn reserved_notes_are_not_handed_over() {
-        let mut held = esp_note(1_000_000_000_000, service(), DAY);
+        let mut held = esp_note(ONE, service(), DAY);
         held.reserved_by = Some("abc".into());
         let (mut w, dir) = wallet_with("reserved", vec![held]);
-        assert!(w.hand_over_esp(service(), 1_000_000_000_000, None).is_err());
+        assert!(w.hand_over_esp(service(), u128::from(ONE), None).is_err());
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -724,23 +741,23 @@ mod tests {
         let (mut app, app_dir) = wallet_with(
             "app",
             vec![
-                esp_note(2_000_000_000_000, service(), DAY),
-                esp_note(1_000_000_000_000, service(), DAY),
+                esp_note(2 * ONE, service(), DAY),
+                esp_note(ONE, service(), DAY),
             ],
         );
         let handover = app
-            .hand_over_esp(service(), 3_000_000_000_000, None)
+            .hand_over_esp(service(), 3 * u128::from(ONE), None)
             .unwrap();
         let svc_dir = scratch("svc");
         let mut svc = Wallet::open(&svc_dir.join("wallet.json")).unwrap();
         let (count, units) = svc.receive_handover(&handover).unwrap();
-        assert_eq!((count, units), (2, 3_000_000_000_000));
+        assert_eq!((count, units), (2, 3 * u128::from(ONE)));
         let b = svc.balance();
-        assert_eq!((b.esp, b.notes), (3_000_000_000_000, 2));
+        assert_eq!((b.esp, b.notes), (3 * u128::from(ONE), 2));
         assert_eq!(
             b.esp_by_terms
                 .get(&(hex::encode(service().serialize()), DAY)),
-            Some(&3_000_000_000_000)
+            Some(&(3 * u128::from(ONE)))
         );
         // the same handover again is refused, and changes nothing
         assert!(svc.receive_handover(&handover).is_err());
@@ -751,13 +768,8 @@ mod tests {
 
     #[test]
     fn a_handover_with_a_secret_that_does_not_match_is_refused() {
-        let (mut app, app_dir) = wallet_with(
-            "mismatch-app",
-            vec![esp_note(1_000_000_000_000, service(), DAY)],
-        );
-        let mut handover = app
-            .hand_over_esp(service(), 1_000_000_000_000, None)
-            .unwrap();
+        let (mut app, app_dir) = wallet_with("mismatch-app", vec![esp_note(ONE, service(), DAY)]);
+        let mut handover = app.hand_over_esp(service(), u128::from(ONE), None).unwrap();
         handover.notes[0].spend_secret = key(9);
         let svc_dir = scratch("mismatch-svc");
         let mut svc = Wallet::open(&svc_dir.join("wallet.json")).unwrap();
@@ -775,9 +787,9 @@ mod tests {
     #[test]
     fn a_transfer_refused_for_a_spent_note_retires_it_and_frees_the_others() {
         let notes = vec![
-            esp_note(3_000_000_000_000, service(), DAY),
-            esp_note(1_000_000_000_000, service(), DAY),
-            esp_note(2_000_000_000_000, service(), DAY),
+            esp_note(4 * ONE, service(), DAY),
+            esp_note(ONE, service(), DAY),
+            esp_note(2 * ONE, service(), DAY),
         ];
         let (mut w, dir) = wallet_with("spent-in-transfer", notes);
         let built = w.build_transfer(&key(1), None, None).unwrap();
@@ -805,13 +817,13 @@ mod tests {
         let (mut w, dir) = wallet_with(
             "build",
             vec![
-                esp_note(3_000_000_000_000, service(), DAY),
-                esp_note(1_000_000_000_000, service(), DAY),
-                esp_note(7_000_000_000_000, other_service(), DAY),
+                esp_note(4 * ONE, service(), DAY),
+                esp_note(ONE, service(), DAY),
+                esp_note(8 * ONE, other_service(), DAY),
             ],
         );
         let built = w.build_transfer(&key(1), None, None).unwrap();
-        assert_eq!(built.esp_units, 4_000_000_000_000);
+        assert_eq!(built.esp_units, 5 * u128::from(ONE));
         let request = &built.request;
         assert_eq!(request.service, service());
         assert_eq!(request.redeemable_after_day, DAY);
@@ -826,11 +838,11 @@ mod tests {
             .iter()
             .map(|o| u128::from(o.amount.units))
             .sum();
-        assert_eq!((ins, outs), (4_000_000_000_000, 4_000_000_000_000));
+        assert_eq!((ins, outs), (5 * u128::from(ONE), 5 * u128::from(ONE)));
         // one new note for each old one, the same size
         let mut sizes: Vec<u64> = request.outputs.iter().map(|o| o.amount.units).collect();
         sizes.sort();
-        assert_eq!(sizes, vec![1_000_000_000_000, 3_000_000_000_000]);
+        assert_eq!(sizes, vec![ONE, 4 * ONE]);
 
         let digest = request.digest();
         SECP256K1
@@ -857,10 +869,7 @@ mod tests {
 
     #[test]
     fn a_wallet_with_no_notes_for_the_key_builds_nothing() {
-        let (mut w, dir) = wallet_with(
-            "nokey",
-            vec![esp_note(1_000_000_000_000, other_service(), DAY)],
-        );
+        let (mut w, dir) = wallet_with("nokey", vec![esp_note(ONE, other_service(), DAY)]);
         let err = w.build_transfer(&key(1), None, None).unwrap_err();
         assert!(matches!(err, WalletError::NotEnough(_)), "{err}");
         assert_eq!(w.balance().pending_transfers, 0);
@@ -873,15 +882,17 @@ mod tests {
         let (mut w, dir) = wallet_with(
             "sizes",
             vec![
-                esp_note(3_000_000_000_000, service(), DAY),
-                esp_note(1_000_000_000_000, service(), DAY),
+                esp_note(4 * ONE, service(), DAY),
+                esp_note(ONE, service(), DAY),
             ],
         );
         for bad in [
-            vec![4_000_000_000_001u64],
-            vec![3_999_999_999_999],
-            vec![0, 4_000_000_000_000],
+            vec![5 * ONE + 1],
+            vec![5 * ONE - 1],
+            vec![0, 5 * ONE],
             vec![],
+            // the right total, but 3 ONE is not a power of two
+            vec![3 * ONE, 2 * ONE],
         ] {
             assert!(
                 w.build_transfer(&key(1), None, Some(&bad)).is_err(),
@@ -890,10 +901,23 @@ mod tests {
         }
         assert_eq!(w.balance().reserved, 0);
         let built = w
-            .build_transfer(&key(1), None, Some(&[2_000_000_000_000, 2_000_000_000_000]))
+            .build_transfer(&key(1), None, Some(&[4 * ONE, ONE]))
             .unwrap();
         assert_eq!(built.request.outputs.len(), 2);
         assert_eq!(built.request.inputs.len(), 2);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_note_that_is_not_a_power_of_two_is_not_swapped() {
+        let (mut w, dir) = wallet_with("odd", vec![esp_note(ONE + 5, service(), DAY)]);
+        let e = w
+            .build_transfer(&key(1), None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("not an ESP note size"), "{e}");
+        assert_eq!(w.balance().reserved, 0);
+        assert!(w.pending_transfers().is_empty());
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -902,20 +926,20 @@ mod tests {
         let (mut w, dir) = wallet_with(
             "finish",
             vec![
-                esp_note(3_000_000_000_000, service(), DAY),
-                esp_note(1_000_000_000_000, service(), DAY),
+                esp_note(4 * ONE, service(), DAY),
+                esp_note(ONE, service(), DAY),
             ],
         );
         let old_ids: Vec<String> = w.notes().iter().map(StoredNote::id).collect();
         let built = w.build_transfer(&key(1), None, None).unwrap();
         let done = w.finish_transfer(&built.id, &reply(&built)).unwrap();
-        assert_eq!(done.esp_units, 4_000_000_000_000);
+        assert_eq!(done.esp_units, 5 * u128::from(ONE));
         assert_eq!(done.redeemable_after_day, DAY);
         assert_eq!(done.notes.len(), 2);
         let b = w.balance();
         assert_eq!(
             (b.esp, b.notes, b.reserved, b.pending_transfers),
-            (4_000_000_000_000, 2, 0, 0)
+            (5 * u128::from(ONE), 2, 0, 0)
         );
         for note in w.notes() {
             assert!(!old_ids.contains(&note.id()));
@@ -936,10 +960,7 @@ mod tests {
 
     #[test]
     fn a_reply_that_does_not_fit_the_request_changes_nothing() {
-        let (mut w, dir) = wallet_with(
-            "badreply",
-            vec![esp_note(1_000_000_000_000, service(), DAY)],
-        );
+        let (mut w, dir) = wallet_with("badreply", vec![esp_note(ONE, service(), DAY)]);
         let built = w.build_transfer(&key(1), None, None).unwrap();
         let before = w.balance();
 
@@ -964,7 +985,7 @@ mod tests {
 
     #[test]
     fn a_cancelled_transfer_frees_its_notes() {
-        let (mut w, dir) = wallet_with("cancel", vec![esp_note(1_000_000_000_000, service(), DAY)]);
+        let (mut w, dir) = wallet_with("cancel", vec![esp_note(ONE, service(), DAY)]);
         let built = w.build_transfer(&key(1), None, None).unwrap();
         assert_eq!(w.balance().reserved, 1);
         w.cancel_transfer(&built.id).unwrap();
@@ -978,7 +999,7 @@ mod tests {
 
     #[test]
     fn a_pending_transfer_is_resent_exactly_after_a_reopen() {
-        let (mut w, dir) = wallet_with("resume", vec![esp_note(1_000_000_000_000, service(), DAY)]);
+        let (mut w, dir) = wallet_with("resume", vec![esp_note(ONE, service(), DAY)]);
         let built = w.build_transfer(&key(1), None, None).unwrap();
         drop(w);
         let again = Wallet::open(&dir.join("wallet.json")).unwrap();

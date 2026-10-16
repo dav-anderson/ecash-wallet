@@ -24,9 +24,11 @@ ecash-wallet [--wallet FILE] [--regtest|--signet|--testnet] <command>
   The network defaults to mainnet. Before talking to a mint the wallet asks
   its GET /health which network it is on and refuses if it is another.
 
-  buy-psp --mint-key HEX [--reply-did HEX] AMOUNT...
+  buy-psp --mint-key HEX [--reply-did HEX] [--psp-url URL] AMOUNT...
       Make the encrypted payload for a PSP purchase and print it as hex, for
-      the OP_RETURN. AMOUNT is each note's size in PSP (a power of two).
+      the OP_RETURN. AMOUNT is each note's size in PSP (a power of two). The
+      payload names the PSP's current keyset, read from --psp-url (or as last
+      seen), so the mint signs with it while it is live.
   claim-psp [--psp-url URL] [--file FILE|-] [BLIND_NONCE:SIGNATURE...]
       Turn the PSP's signatures into notes. Paste the PSP's output into a file,
       or pass pairs. With neither, reads standard input.
@@ -228,6 +230,12 @@ fn buy_psp(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
     let mint_key = args
         .flag("--mint-key")?
         .ok_or_else(|| WalletError::Invalid("--mint-key HEX is required".into()))?;
+    if let Some(base) = args.flag("--psp-url")? {
+        http::verify_mint(&base, network())?;
+        let w = http::fetch_window(&base)?;
+        wallet.note_live_keysets(&base, &w)?;
+        http::sync_psp_limits(wallet, &base)?;
+    }
     let reply = match args.flag("--reply-did")? {
         Some(text) => parse_did(&text)?,
         None => wallet.reply_did()?,
@@ -350,19 +358,7 @@ fn exchange(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
         }
     };
     eprintln!("exchange {} (spends {} PSP)", built.id, built.psp_spent);
-    let mut built = built;
-    let mut sent = http::send_exchange(&base, &built.request);
-    if let Err(e) = &sent {
-        if ecash_wallet::error::is_keyset_not_current(e) {
-            // Nothing was burned: read the current keyset, re-blind, send once more.
-            eprintln!("the ESP mint rotated: re-blinding the outputs for its current keyset");
-            http::sync_esp_keysets(wallet, &base)?;
-            built = wallet.reblind_exchange(&built.id)?;
-            eprintln!("exchange {} (re-blinded)", built.id);
-            sent = http::send_exchange(&base, &built.request);
-        }
-    }
-    match sent {
+    match http::send_exchange(&base, &built.request) {
         Ok(response) => {
             let done = wallet.finish_exchange(&built.id, &response)?;
             println!(
@@ -572,8 +568,7 @@ fn receive(wallet: &mut Wallet, args: Args) -> Result<(), WalletError> {
 fn transfer(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
     let base = mint_url(args.flag("--esp-url")?, "ECASH_ESP_URL", DEFAULT_ESP_URL)?;
     let resume = args.flag("--resume")?;
-    // The service key signs a new transfer, and a re-blinded one after a
-    // keyset_not_current refusal (optional with --resume).
+    // The service key signs a new transfer (not needed with --resume).
     let key = args
         .flag("--service-key")?
         .map(|k| secret_key(&k))
@@ -624,19 +619,7 @@ fn transfer(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
         built.esp_units,
         built.request.inputs.len()
     );
-    let mut built = built;
-    let mut sent = http::send_transfer(&base, &built.request);
-    if let (Err(e), Some(key)) = (&sent, key.as_ref()) {
-        if ecash_wallet::error::is_keyset_not_current(e) {
-            // Nothing was burned: read the current keyset, re-blind, send once more.
-            eprintln!("the ESP mint rotated: re-blinding the outputs for its current keyset");
-            http::sync_esp_keysets(wallet, &base)?;
-            built = wallet.reblind_transfer(&built.id, key)?;
-            eprintln!("transfer {} (re-blinded)", built.id);
-            sent = http::send_transfer(&base, &built.request);
-        }
-    }
-    match sent {
+    match http::send_transfer(&base, &built.request) {
         Ok(response) => {
             let done = wallet.finish_transfer(&built.id, &response)?;
             println!(
@@ -752,7 +735,6 @@ fn send_redemption(
     key: Option<&SecretKey>,
     mut id: String,
 ) -> Result<(), WalletError> {
-    let mut reblinded = false;
     for _ in 0..5 {
         let pending = wallet
             .pending_redemptions()
@@ -790,18 +772,6 @@ fn send_redemption(
                     built.refund_outputs
                 );
                 id = built.id;
-            }
-            Err(WalletError::RedeemRefused { code, why, .. })
-                if code == "keyset_not_current" && key.is_some() && !reblinded =>
-            {
-                // Nothing was burned: read the current keyset, re-blind once.
-                eprintln!(
-                    "the ESP mint rotated ({why}): re-blinding the outputs for its current keyset"
-                );
-                http::sync_esp_keysets(wallet, base)?;
-                let key = key.unwrap_or_else(|| unreachable!());
-                id = wallet.reblind_redemption(&id, key)?.id;
-                reblinded = true;
             }
             Err(e @ WalletError::RedeemRefused { .. }) => {
                 if pending.state == RedemptionState::Sent {

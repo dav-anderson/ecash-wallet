@@ -7,12 +7,12 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use mint_server::api::KeysResponse;
 use mint_types::Amount;
 use secp256k1::PublicKey;
 use sp_wire::esp::exchange::{ExchangeRequest, ExchangeResponse};
 use sp_wire::esp::redeem::{RedeemResponse, Totals};
 use sp_wire::esp::transfer::{TransferRequest, TransferResponse};
+use sp_wire::keys::{CheckStateRequest, CheckStateResponse, KeysResponse};
 
 use crate::Wallet;
 use crate::error::WalletError;
@@ -191,6 +191,14 @@ pub fn fetch_psp_keys(base: &str) -> Result<BTreeMap<Amount, PublicKey>, WalletE
         .json()
         .map_err(|e| WalletError::Mint(format!("{url}: {e}")))?;
     Ok(keys.keys)
+}
+
+/// Read the PSP's largest note size from `GET /keys` (the highest amount it has a
+/// key for) and give it to the wallet, so no cap is written into the wallet.
+pub fn sync_psp_limits(wallet: &mut Wallet, base: &str) -> Result<(), WalletError> {
+    let keys = fetch_psp_keys(base)?;
+    wallet.set_psp_max_denomination(keys.keys().map(|a| a.units).max());
+    Ok(())
 }
 
 /// Send an exchange to the ESP mint (`POST /exchange`).
@@ -883,16 +891,12 @@ pub fn fetch_window(base: &str) -> Result<crate::rotate::Window, WalletError> {
     })
 }
 
-/// Send one stored rollover and settle it.
+/// Send one stored rollover and settle it. A refusal that burned nothing
+/// cancels it and frees its notes; the next sync builds a new one from a fresh
+/// read of the mint's window. The outputs name the keyset the wallet last saw,
+/// and a mint signs with any live keyset, so a rotation after the rollover was
+/// built does not refuse it.
 fn send_rollover(wallet: &mut Wallet, id: &str) -> Result<String, WalletError> {
-    send_rollover_retry(wallet, id, true)
-}
-
-/// Send a stored rollover. A `keyset_not_current` refusal (the mint rotated
-/// after the rollover was built; nothing was burned) cancels it, reads the
-/// window again and rebuilds the same notes' rollover for the current keyset
-/// with fresh blinded outputs, sent once more when `retry`.
-fn send_rollover_retry(wallet: &mut Wallet, id: &str, retry: bool) -> Result<String, WalletError> {
     let p = wallet
         .pending_rollovers()
         .iter()
@@ -925,31 +929,6 @@ fn send_rollover_retry(wallet: &mut Wallet, id: &str, retry: bool) -> Result<Str
                 "rolled over {} note(s) to the current key set",
                 p.inputs.len()
             ))
-        }
-        Err(e @ WalletError::Refused(_))
-            if retry && crate::error::is_keyset_not_current(&e) && p.kind != Kind::Fsp =>
-        {
-            wallet.cancel_rollover(id)?;
-            let w = fetch_window(&p.url)?;
-            match p.kind {
-                Kind::Psp => wallet.note_live_keysets(&p.url, &w)?,
-                _ => wallet.note_esp_keysets(&p.url, &w.current_id, w.previous_id.as_deref())?,
-            }
-            let notes: Vec<_> = wallet
-                .prepare_rollover(p.kind, &p.url, &w)?
-                .into_iter()
-                .filter(|n| p.inputs.contains(&n.id()))
-                .collect();
-            let mut log = vec![format!(
-                "the mint rotated: re-blinding {} note(s) for its current keyset",
-                notes.len()
-            )];
-            if !notes.is_empty() {
-                for next in wallet.build_rollovers(p.kind, &p.url, &w, notes)? {
-                    log.push(send_rollover_retry(wallet, &next, false)?);
-                }
-            }
-            Ok(log.join("; "))
         }
         Err(WalletError::SpentElsewhere { why, inputs }) => {
             // Some notes are spent. They leave the balance; the rest are free.
@@ -1039,47 +1018,33 @@ pub fn rotation_sync(
 /// note spent: nothing was kept.
 pub fn receive_psp(wallet: &mut Wallet, token: &str) -> Result<crate::send::Received, WalletError> {
     let t = crate::send::Token::decode(token)?;
-    // The swap's outputs name the mint's current keyset, read fresh.
+    // The swap's outputs name the mint's current keyset, read fresh; the mint
+    // signs with any live keyset, so one rotation in between does not refuse it.
     if let Ok(w) = fetch_window(&t.mint) {
         wallet.note_live_keysets(&t.mint, &w)?;
     }
-    let mut id = wallet.begin_receive(&t)?;
-    let mut retried = false;
-    loop {
-        let p = wallet
-            .pending_rollovers()
-            .iter()
-            .find(|p| p.id == id)
-            .cloned()
-            .expect("just stored");
-        return match fsp_post::<_, sp_wire::psp::RolloverResponse>(&p.url, "rollover", &p.body) {
-            Ok(r) => {
-                let sigs: Vec<_> = r.outcomes.into_iter().map(|o| o.0).collect();
-                wallet.finish_rollover(&id, r.epoch, &r.keyset, &sigs, &r.keys)?;
-                Ok(crate::send::Received::Final { amount: t.total() })
-            }
-            Err(e @ WalletError::Refused(_))
-                if !retried && crate::error::is_keyset_not_current(&e) =>
-            {
-                // The mint rotated after the swap was built (nothing was burned):
-                // read its current keyset, re-blind, swap once more.
-                wallet.cancel_rollover(&id)?;
-                let w = fetch_window(&t.mint)?;
-                wallet.note_live_keysets(&t.mint, &w)?;
-                id = wallet.begin_receive(&t)?;
-                retried = true;
-                continue;
-            }
-            // A note of the token was spent already (a copy of it was received
-            // first). Nothing was burned and nothing here was ever the
-            // receiver's, so the stored swap is dropped and the token is
-            // rejected like any other refusal.
-            Err(WalletError::Refused(why)) | Err(WalletError::SpentElsewhere { why, .. }) => {
-                wallet.cancel_rollover(&id)?;
-                Ok(crate::send::Received::Rejected { why })
-            }
-            Err(e) => Err(e),
-        };
+    let id = wallet.begin_receive(&t)?;
+    let p = wallet
+        .pending_rollovers()
+        .iter()
+        .find(|p| p.id == id)
+        .cloned()
+        .expect("just stored");
+    match fsp_post::<_, sp_wire::psp::RolloverResponse>(&p.url, "rollover", &p.body) {
+        Ok(r) => {
+            let sigs: Vec<_> = r.outcomes.into_iter().map(|o| o.0).collect();
+            wallet.finish_rollover(&id, r.epoch, &r.keyset, &sigs, &r.keys)?;
+            Ok(crate::send::Received::Final { amount: t.total() })
+        }
+        // A note of the token was spent already (a copy of it was received
+        // first). Nothing was burned and nothing here was ever the
+        // receiver's, so the stored swap is dropped and the token is
+        // rejected like any other refusal.
+        Err(WalletError::Refused(why)) | Err(WalletError::SpentElsewhere { why, .. }) => {
+            wallet.cancel_rollover(&id)?;
+            Ok(crate::send::Received::Rejected { why })
+        }
+        Err(e) => Err(e),
     }
 }
 
@@ -1110,10 +1075,10 @@ pub fn check_sent(
     if t.notes.is_empty() {
         return Ok(t.state);
     }
-    let req = mint_server::api::CheckStateRequest {
+    let req = CheckStateRequest {
         nonces: t.notes.iter().map(|n| n.note.nonce).collect(),
     };
-    let r: mint_server::api::CheckStateResponse = fsp_post(&t.mint, "check-state", &req)?;
+    let r: CheckStateResponse = fsp_post(&t.mint, "check-state", &req)?;
     wallet.settle_sent(token_id, &r.spent)
 }
 

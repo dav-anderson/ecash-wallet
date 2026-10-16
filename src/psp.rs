@@ -18,10 +18,6 @@ use crate::blind::PendingOutput;
 use crate::error::WalletError;
 use crate::store::{Kind, PendingPurchase, StoredNote, Wallet};
 
-/// The largest PSP note, 2^24 ($1,677,721.60 at 10 PSP to the dollar). The PSP's
-/// notes are powers of two from 1 up to this, 25 denominations.
-pub const MAX_PSP_DENOMINATION: u64 = 16_777_216;
-
 /// The most outputs in one purchase (the payload's count is one byte).
 pub const MAX_OUTPUTS: usize = 255;
 
@@ -43,11 +39,18 @@ pub struct ClaimResult {
     pub still_pending: usize,
 }
 
-/// Check that `amount` is a PSP denomination.
-pub fn check_denomination(amount: u64) -> Result<(), WalletError> {
-    if amount == 0 || !amount.is_power_of_two() || amount > MAX_PSP_DENOMINATION {
+/// Check that `amount` is a PSP denomination: a power of two, and not above the
+/// PSP's largest note (`top`, read from its `GET /keys`) when that is known.
+/// With `top` unknown the PSP decides how large a note may be.
+pub fn check_denomination(amount: u64, top: Option<u64>) -> Result<(), WalletError> {
+    if amount == 0 || !amount.is_power_of_two() {
         return Err(WalletError::Invalid(format!(
-            "{amount} is not a PSP note size: use a power of two from 1 to {MAX_PSP_DENOMINATION}"
+            "{amount} is not a PSP note size: use a power of two"
+        )));
+    }
+    if let Some(top) = top.filter(|&top| amount > top) {
+        return Err(WalletError::Invalid(format!(
+            "{amount} is above the PSP's largest note, {top} (its mint.max_denomination_units)"
         )));
     }
     Ok(())
@@ -76,14 +79,17 @@ impl Wallet {
                 "a purchase holds at most {MAX_OUTPUTS} outputs"
             )));
         }
+        let top = self.psp_max_denomination();
         for &amount in outputs {
-            check_denomination(amount)?;
+            check_denomination(amount, top)?;
         }
         let pending: Vec<PendingOutput> = outputs.iter().map(|&a| PendingOutput::new(a)).collect();
-        // No keyset in the payload: the PSP signs a claim with its current
-        // keyset and prints that keyset's ID with the signatures.
+        // The payload names the PSP's current keyset as last seen, like every
+        // other request, and the PSP signs with it while it is live (else with
+        // its current one). The settlement prints the keyset that signed, and
+        // the claim is unblinded with that set's keys.
         let plaintext = payload::encode(&Payload {
-            keyset: None,
+            keyset: self.psp_output_keyset(),
             did: *reply_did,
             outputs: pending.iter().map(PendingOutput::mint_output).collect(),
         })
@@ -319,6 +325,29 @@ mod tests {
     }
 
     #[test]
+    fn a_purchase_names_the_psp_keyset_the_wallet_last_saw() {
+        let (mut w, dir) = wallet("names-keyset");
+        let mint = DidSecretKey::new();
+        let keyset_of = |w: &mut Wallet| {
+            let built = w.build_psp_payload(&[1], &DID, &mint.public_key()).unwrap();
+            let (kept, _) = psp_mint::seal::open_payloads(&mint, vec![payment(built.payload)]);
+            payload::decode(kept[0].payload.as_deref().unwrap())
+                .unwrap()
+                .keyset
+        };
+        assert_eq!(keyset_of(&mut w), None, "none seen yet");
+        let named = "ab".repeat(8);
+        w.update(|d| {
+            d.live_keysets
+                .insert("http://psp".to_string(), (named.clone(), None));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(keyset_of(&mut w), Some(named));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn the_payload_is_80_bytes_longer_than_plaintext_and_hides_the_did() {
         let (mut w, dir) = wallet("size");
         let mint = DidSecretKey::new();
@@ -374,16 +403,36 @@ mod tests {
         let (mut w, dir) = wallet("sizes");
         let mint = DidSecretKey::new();
         let key = mint.public_key();
-        for bad in [0u64, 3, 5, 6, 16_777_217, 33_554_432, u64::MAX] {
+        for bad in [0u64, 3, 5, 6, 16_777_217, u64::MAX] {
             assert!(w.build_psp_payload(&[bad], &DID, &key).is_err(), "{bad}");
         }
         assert!(w.build_psp_payload(&[], &DID, &key).is_err());
         assert!(w.build_psp_payload(&vec![1; 256], &DID, &key).is_err());
         assert!(w.pending_purchases().is_empty());
-        for good in [1u64, 2, 4, 1024, 1_048_576, 16_777_216] {
+        for good in [1u64, 2, 4, 1024, 1_048_576, 16_777_216, 33_554_432] {
             assert!(w.build_psp_payload(&[good], &DID, &key).is_ok(), "{good}");
         }
         assert!(w.build_psp_payload(&vec![1; 255], &DID, &key).is_ok());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_largest_note_is_the_one_the_psp_says() {
+        let (mut w, dir) = wallet("top");
+        let mint = DidSecretKey::new();
+        let key = mint.public_key();
+        // unknown: only the power of two is checked here, the PSP decides the top
+        assert_eq!(w.psp_max_denomination(), None);
+        assert!(w.build_psp_payload(&[1 << 26], &DID, &key).is_ok());
+        // a PSP whose largest note is 1024
+        w.set_psp_max_denomination(Some(1024));
+        assert!(w.build_psp_payload(&[1024], &DID, &key).is_ok());
+        let e = w.build_psp_payload(&[2048], &DID, &key).unwrap_err();
+        assert!(e.to_string().contains("largest note, 1024"), "{e}");
+        // a PSP that was configured for bigger notes
+        w.set_psp_max_denomination(Some(1 << 27));
+        assert!(w.build_psp_payload(&[1 << 27], &DID, &key).is_ok());
+        assert!(w.build_psp_payload(&[1 << 28], &DID, &key).is_err());
         fs::remove_dir_all(&dir).unwrap();
     }
 

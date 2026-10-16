@@ -153,6 +153,17 @@ impl Wallet {
         }
     }
 
+    /// The keyset a PSP purchase names: the PSP mint's current keyset as last
+    /// seen, or none if the wallet has not read one (the mint then signs with
+    /// its current keyset, and the settlement names it).
+    pub fn psp_output_keyset(&self) -> Option<String> {
+        let live: Vec<_> = self.data().live_keysets.values().collect();
+        match live.as_slice() {
+            [(current, _)] => Some(current.clone()),
+            _ => None,
+        }
+    }
+
     /// Remember the ESP mint's live keysets.
     pub fn note_esp_keysets(
         &mut self,

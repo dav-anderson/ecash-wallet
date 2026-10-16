@@ -531,9 +531,9 @@ fn purchases_around_a_psp_rotation_are_claimed_with_the_keys_of_the_set_that_sig
 }
 
 #[test]
-fn outputs_for_the_previous_esp_set_are_refused_keyset_not_current_and_the_wallet_reblinds() {
+fn a_transfer_built_before_the_esp_mint_rotated_is_signed_by_the_set_it_names() {
     let rt = Runtime::new().unwrap();
-    let dir = scratch("esp-reblind");
+    let dir = scratch("esp-stale");
     let (state, url, notes) = start_esp(&rt, &dir);
     let mut w = Wallet::open(&dir.join("w.json")).unwrap();
     w.receive_handover(&Handover {
@@ -548,38 +548,22 @@ fn outputs_for_the_previous_esp_set_are_refused_keyset_not_current_and_the_walle
     .unwrap();
     http::sync_esp_keysets(&mut w, &url).unwrap();
     let old = w.esp_output_keyset();
-    // The mint rotates; the wallet's cached keyset is now the previous one.
+    // The mint rotates; the wallet's cached keyset is now the previous one,
+    // which the mint still signs with.
     let clock = Arc::clone(&state.rotor.as_ref().unwrap().lock().unwrap().clock);
     clock.store(T + H + LATER, Ordering::SeqCst);
     let built = w
         .build_transfer(&service_kp().secret_key(), Some(100), None)
         .unwrap();
     assert_eq!(built.request.keyset, old, "built from the stale cache");
-    let e = http::send_transfer(&url, &built.request).unwrap_err();
-    assert!(
-        ecash_wallet::error::is_keyset_not_current(&e),
-        "refused keyset_not_current: {e}"
-    );
-    assert!(e.to_string().contains("Re-blind"), "{e}");
-    // Re-blind for the current set (inputs stay previous-set notes) and resend.
-    http::sync_esp_keysets(&mut w, &url).unwrap();
-    let again = w
-        .reblind_transfer(&built.id, &service_kp().secret_key())
-        .unwrap();
-    assert_ne!(again.id, built.id);
-    assert_ne!(again.request.keyset, old);
-    assert_eq!(again.request.input_keysets, built.request.input_keysets);
-    assert_ne!(
-        again.request.outputs, built.request.outputs,
-        "fresh blinded outputs"
-    );
-    assert_eq!(w.pending_transfers().len(), 1);
-    let reply = http::send_transfer(&url, &again.request).unwrap();
-    let done = w.finish_transfer(&again.id, &reply).unwrap();
-    assert_eq!(done.esp_units, 8, "nothing was burned by the refusal");
+    // The wallet kept the keyset with the pending transfer, and sends it as it is.
+    let reply = http::send_transfer(&url, &built.request).unwrap();
+    assert_eq!(reply.keyset, old, "signed by the set the request named");
+    let done = w.finish_transfer(&built.id, &reply).unwrap();
+    assert_eq!(done.esp_units, 8);
     for id in &done.notes {
         let n = w.notes().iter().find(|n| &n.id() == id).unwrap();
-        assert_eq!(w.esp_keyset_of(n).unwrap(), again.request.keyset);
+        assert_eq!(w.esp_keyset_of(n).unwrap(), old);
     }
 }
 

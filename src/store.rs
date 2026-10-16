@@ -243,6 +243,8 @@ pub struct Wallet {
     path: PathBuf,
     data: WalletData,
     limits: EspLimits,
+    /// The PSP's largest note size, once read from its `GET /keys`. Not saved.
+    psp_top: Option<u64>,
 }
 
 impl Wallet {
@@ -258,6 +260,7 @@ impl Wallet {
             path: path.to_path_buf(),
             data,
             limits: EspLimits::default(),
+            psp_top: None,
         })
     }
 
@@ -269,6 +272,19 @@ impl Wallet {
     /// Set the ESP mint's note limits (see [`EspLimits`]).
     pub fn set_esp_limits(&mut self, limits: EspLimits) {
         self.limits = limits;
+    }
+
+    /// The PSP's largest note size, if it has been read (see
+    /// `http::sync_psp_limits`). The wallet keeps no number of its own: until
+    /// it is read, a purchase is checked only for being a power of two and the
+    /// PSP decides the top.
+    pub fn psp_max_denomination(&self) -> Option<u64> {
+        self.psp_top
+    }
+
+    /// Set the PSP's largest note size.
+    pub fn set_psp_max_denomination(&mut self, top: Option<u64>) {
+        self.psp_top = top;
     }
 
     pub(crate) fn data(&self) -> &WalletData {

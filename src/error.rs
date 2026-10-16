@@ -93,17 +93,3 @@ impl From<SealError> for WalletError {
         WalletError::Seal(e)
     }
 }
-
-/// Whether a mint refusal is `keyset_not_current`: the outputs named the
-/// mint's previous keyset, nothing was burned, and the request should be
-/// re-blinded for the current keyset and sent again.
-pub fn is_keyset_not_current(e: &WalletError) -> bool {
-    match e {
-        WalletError::RedeemRefused { code, .. } => code == "keyset_not_current",
-        WalletError::Refused(text) => serde_json::from_str::<serde_json::Value>(text)
-            .ok()
-            .and_then(|v| v.get("code").and_then(|c| c.as_str()).map(str::to_string))
-            .is_some_and(|c| c == "keyset_not_current"),
-        _ => false,
-    }
-}

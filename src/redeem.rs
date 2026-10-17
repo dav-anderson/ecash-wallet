@@ -62,9 +62,9 @@ use crate::error::WalletError;
 use crate::store::{Kind, StoredNote, StoredTerms, Wallet};
 
 /// The fee rate to assume (ESP units per encoded byte) until `/fees` has been
-/// read. It is the mint's placeholder default, not part of the wire format: the
-/// mint's own rate is read from `GET /fees` and replaces it.
-const DEFAULT_FEE_PER_BYTE: u128 = 1_000_000;
+/// read. It is the mint's default (0, like every fee), not part of the wire
+/// format: the mint's own rate is read from `GET /fees` and replaces it.
+const DEFAULT_FEE_PER_BYTE: u128 = 0;
 
 /// The most outputs one service and day can need in one list: a total below
 /// 2^64 splits into at most this many powers of two.
@@ -824,8 +824,7 @@ impl Wallet {
         let accepted = from_totals(&totals.accepted_by_terms);
         let rejected = from_totals(&totals.rejected_by_terms);
         let freed = |d: &mut crate::store::WalletData| {
-            d.notes
-                .retain(|n| if spent.contains(&n.id()) { false } else { true });
+            d.notes.retain(|n| !spent.contains(&n.id()));
         };
         let spent_notes: Vec<StoredNote> = self
             .notes()
@@ -1210,6 +1209,12 @@ mod tests {
             fee_per_byte: RATE,
             ..RedeemFees::default()
         }
+    }
+
+    #[test]
+    fn until_fees_is_read_the_assumed_fee_is_the_mints_default_of_zero() {
+        assert_eq!(RedeemFees::default().fee_per_byte, 0);
+        assert_eq!(fee_for(1000, RedeemFees::default().fee_per_byte), 0);
     }
 
     fn scratch(name: &str) -> PathBuf {

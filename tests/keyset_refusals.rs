@@ -1,8 +1,8 @@
-//! A hand-over or a token holding a note that names no keyset is refused
-//! cleanly, and the wallet stores nothing from it (no guessing).
+//! A hand-over holding a note that names no keyset is refused cleanly, and the
+//! wallet stores nothing from it (no guessing). (A handoff cannot hold one: its
+//! format requires a key set for every note.)
 
 use ecash_wallet::Wallet;
-use ecash_wallet::send::{Token, TokenNote};
 use ecash_wallet::store::{HandedNote, Handover};
 use mint_types::{Nonce, Note};
 use rand::rngs::OsRng;
@@ -67,32 +67,4 @@ fn a_handover_with_a_note_without_a_keyset_is_refused_and_nothing_is_stored() {
     assert_eq!(file(&w), before, "the wallet file is unchanged");
     let reopened = Wallet::open(&dir.join("w.json")).unwrap();
     assert!(reopened.notes().is_empty());
-}
-
-#[test]
-fn a_token_with_a_note_without_a_keyset_is_refused_and_nothing_is_stored() {
-    let dir = scratch("token");
-    let mut w = Wallet::open(&dir.join("w.json")).unwrap();
-    let before = file(&w);
-    let token_note = |keyset: &str| {
-        let (n, sk) = note();
-        TokenNote {
-            amount: 2,
-            note: n,
-            spend_secret: sk,
-            keyset: keyset.into(),
-        }
-    };
-    let t = Token {
-        mint: "http://127.0.0.1:9".into(),
-        notes: vec![token_note(&"cd".repeat(8)), token_note("")],
-    };
-    // Through the encoded form too: an empty keyset is left out of the token.
-    let t = Token::decode(&t.encode()).unwrap();
-    assert!(t.notes[1].keyset.is_empty());
-    let e = w.begin_receive(&t).unwrap_err().to_string();
-    assert!(e.contains("names no keyset"), "{e}");
-    assert!(w.pending_rollovers().is_empty(), "no swap is stored");
-    assert!(w.notes().is_empty());
-    assert_eq!(file(&w), before, "the wallet file is unchanged");
 }

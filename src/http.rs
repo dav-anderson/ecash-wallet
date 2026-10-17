@@ -896,13 +896,37 @@ pub fn fetch_window(base: &str) -> Result<crate::rotate::Window, WalletError> {
 /// read of the mint's window. The outputs name the keyset the wallet last saw,
 /// and a mint signs with any live keyset, so a rotation after the rollover was
 /// built does not refuse it.
+///
+/// A stored swap of notes received in a handoff (`handoff|...`) is different in
+/// one way: its notes are in the wallet's balance and can be spent, so it is
+/// first made to fit what the wallet still holds
+/// ([`Wallet::live_swap`]), and a note the mint says is spent is dropped from
+/// the balance instead of being freed (it was never this wallet's to free).
 fn send_rollover(wallet: &mut Wallet, id: &str) -> Result<String, WalletError> {
+    let mut id = id.to_string();
+    let first = wallet
+        .pending_rollovers()
+        .iter()
+        .find(|p| p.id == id)
+        .map(|p| p.schedule.starts_with(crate::handoff::SWAP_TAG));
+    if first == Some(true) {
+        match wallet.live_swap(&id)? {
+            Some(live) => id = live,
+            None => {
+                return Ok(
+                    "the notes of a stored swap were spent before it was sent, so there is nothing left to swap"
+                        .into(),
+                );
+            }
+        }
+    }
     let p = wallet
         .pending_rollovers()
         .iter()
         .find(|p| p.id == id)
         .cloned()
         .ok_or_else(|| WalletError::Invalid(format!("no rollover {id}")))?;
+    let received = p.schedule.starts_with(crate::handoff::SWAP_TAG);
     let reply: Result<serde_json::Value, WalletError> = fsp_post(&p.url, "rollover", &p.body);
     match reply {
         Ok(v) => {
@@ -923,25 +947,73 @@ fn send_rollover(wallet: &mut Wallet, id: &str) -> Result<String, WalletError> {
                     (r.epoch, r.keyset, r.signatures, r.keys)
                 }
             };
-            wallet.finish_rollover(id, epoch, &keyset, &sigs, &keys)?;
-            wallet.after_swap(&p.schedule, true)?;
+            wallet.finish_rollover(&id, epoch, &keyset, &sigs, &keys)?;
+            if received {
+                let units: u128 = p.outputs.iter().map(|o| u128::from(o.amount)).sum();
+                return Ok(format!(
+                    "swapped {units} PSP received in a handoff at the mint, for notes only this wallet knows: final"
+                ));
+            }
+            if p.schedule.starts_with(crate::handoff::RECLAIM_TAG) {
+                let units: u128 = p.outputs.iter().map(|o| u128::from(o.amount)).sum();
+                return Ok(format!(
+                    "reclaimed {units} PSP: the notes were swapped back at the mint for notes only this wallet knows"
+                ));
+            }
             Ok(format!(
                 "rolled over {} note(s) to the current key set",
                 p.inputs.len()
             ))
         }
+        Err(WalletError::SpentElsewhere { why, inputs }) if received => {
+            // The mint refused the whole swap and burned nothing. The notes it
+            // names are spent: somebody reached the mint first (the sender
+            // reclaimed, or a copy was received first). They leave the balance;
+            // the rest are swapped now.
+            let (dropped, rest) = wallet.swap_found_spent(&id, &inputs)?;
+            if dropped == 0 {
+                return Ok(format!(
+                    "the mint refused the swap of received notes: {why}. The notes stay as they are"
+                ));
+            }
+            let mut text = format!(
+                "the mint says {dropped} note(s) received in a handoff were spent already ({why}), so they are not counted any more: whoever reached the mint first has them. Tell the sender"
+            );
+            if let Some(rest) = rest {
+                text.push_str(&format!(". The rest: {}", send_rollover(wallet, &rest)?));
+            }
+            Ok(text)
+        }
+        Err(WalletError::Refused(why)) if received => {
+            // Refused for another reason (say its key set is retired): nothing
+            // was burned and the notes stay in the balance as they are.
+            wallet.cancel_rollover(&id)?;
+            Ok(format!(
+                "the mint refused the swap of received notes, which stay in the balance as they are: {why}"
+            ))
+        }
+        Err(WalletError::SpentElsewhere { why, .. } | WalletError::Refused(why))
+            if p.schedule.starts_with(crate::legacy::RECEIVE_TAG) =>
+        {
+            // A swap that `receive-psp` (wallet 0.4.0) stored: nothing here was
+            // ever this wallet's, so a refusal ends it.
+            wallet.cancel_rollover(&id)?;
+            Ok(format!(
+                "the mint refused the swap of received notes, so none of them was kept: {why}. Tell the sender"
+            ))
+        }
         Err(WalletError::SpentElsewhere { why, inputs }) => {
             // Some notes are spent. They leave the balance; the rest are free.
-            let report = wallet.mark_spent_in_rollover(id, &inputs)?;
-            wallet.after_swap(&p.schedule, false)?;
+            // (If this was a reclaim, the handoff goes back to pending in the
+            // same write, and the next `handoff check` reads the mint's record.)
+            let report = wallet.mark_spent_in_rollover(&id, &inputs)?;
             Ok(format!(
                 "rollover refused ({why}): {} note(s) marked spent, {} freed",
                 report.marked_spent, report.freed
             ))
         }
         Err(WalletError::Refused(why)) => {
-            wallet.cancel_rollover(id)?;
-            wallet.after_swap(&p.schedule, false)?;
+            wallet.cancel_rollover(&id)?;
             Ok(format!("rollover refused, notes freed: {why}"))
         }
         Err(e) => Err(e),
@@ -1010,59 +1082,17 @@ pub fn rotation_sync(
     Ok(log)
 }
 
-// ---- PSP handed from wallet to wallet (see `send.rs`) ------------------------
+// ---- PSP handed from wallet to wallet (see `handoff.rs`) ---------------------
 
-/// Import a PSP token and swap it at its mint at once. The swap is stored
-/// before it is sent, so after a crash calling this again with the same token
-/// (or the next startup sync) finishes it. `Rejected` means the mint found a
-/// note spent: nothing was kept.
-pub fn receive_psp(wallet: &mut Wallet, token: &str) -> Result<crate::send::Received, WalletError> {
-    let t = crate::send::Token::decode(token)?;
-    // The swap's outputs name the mint's current keyset, read fresh; the mint
-    // signs with any live keyset, so one rotation in between does not refuse it.
-    if let Ok(w) = fetch_window(&t.mint) {
-        wallet.note_live_keysets(&t.mint, &w)?;
-    }
-    let id = wallet.begin_receive(&t)?;
-    settle_receive_swap(wallet, &id, t.total())
-}
-
-/// Send a stored swap of received notes (a PSP token's, or a handoff's) and
-/// settle it. A note of it spent already (a copy was received first) is a
-/// refusal: nothing was burned and nothing here was ever the receiver's, so the
-/// stored swap is dropped and the receive is rejected like any other refusal.
-/// Anything else leaves the swap stored, to be sent again.
-fn settle_receive_swap(
-    wallet: &mut Wallet,
-    id: &str,
-    amount: u128,
-) -> Result<crate::send::Received, WalletError> {
-    let p = wallet
-        .pending_rollovers()
-        .iter()
-        .find(|p| p.id == id)
-        .cloned()
-        .ok_or_else(|| WalletError::Unknown(format!("no stored swap {id}")))?;
-    match fsp_post::<_, sp_wire::psp::RolloverResponse>(&p.url, "rollover", &p.body) {
-        Ok(r) => {
-            let sigs: Vec<_> = r.outcomes.into_iter().map(|o| o.0).collect();
-            wallet.finish_rollover(id, r.epoch, &r.keyset, &sigs, &r.keys)?;
-            Ok(crate::send::Received::Final { amount })
-        }
-        Err(WalletError::Refused(why)) | Err(WalletError::SpentElsewhere { why, .. }) => {
-            wallet.cancel_rollover(id)?;
-            Ok(crate::send::Received::Rejected { why })
-        }
-        Err(e) => Err(e),
-    }
-}
-
-/// Finish an import made with a swap (`Wallet::import_handoff(.., swap = true)`):
-/// send the stored PSP swaps, and swap the imported FSP notes at their
-/// services' fsp-mints (a normal swap that pays 0). Returns lines for the log.
-/// A mint that cannot be reached leaves its swap stored (PSP) or the notes
-/// imported and unswapped (FSP), which is allowed: the next run sends the stored
-/// swap again, and the notes are good meanwhile.
+/// Finish the import of a PSP handoff: send the stored PSP swap now. (An FSP
+/// handoff has nothing to send: it is never swapped.) Returns lines for the log.
+/// A mint that cannot be reached leaves the swap stored and the notes
+/// **unswapped**: they are already in the balance and can be spent
+/// ([`crate::store::Balance::unswapped_psp`] says how much is still waiting), and
+/// the swap is sent again on every later connection to the mint
+/// ([`rotation_sync`], which the command line runs at startup). The swap is what
+/// makes the notes the receiver's alone: until it goes through, the sender can
+/// still reclaim them.
 pub fn complete_import(wallet: &mut Wallet, imported: &crate::handoff::Imported) -> Vec<String> {
     let mut log = Vec::new();
     for id in &imported.psp_swaps {
@@ -1072,110 +1102,95 @@ pub fn complete_import(wallet: &mut Wallet, imported: &crate::handoff::Imported)
             .find(|p| &p.id == id)
             .map(|p| p.outputs.iter().map(|o| u128::from(o.amount)).sum())
             .unwrap_or(0);
-        match settle_receive_swap(wallet, id, amount) {
-            Ok(crate::send::Received::Final { amount }) => {
-                log.push(format!("swapped {amount} PSP at the mint: final"))
-            }
-            Ok(crate::send::Received::Rejected { why }) => log.push(format!(
-                "the mint refused the PSP swap, so none of it was kept: {why}. Tell the sender"
-            )),
+        match send_rollover(wallet, id) {
+            Ok(text) => log.push(text),
             Err(e) => log.push(format!(
-                "the PSP swap was not finished and is kept to be sent again on the next run: {e}"
+                "the mint could not be reached, so {amount} PSP stays unswapped: it is in your balance and can be spent, and the swap is sent again on the next connection to the mint: {e}"
             )),
-        }
-    }
-    for (service, ids) in &imported.fsp_swaps {
-        let known = wallet
-            .fsp_mints()
-            .get(&hex::encode(service.serialize()))
-            .map(|m| m.url.clone());
-        let named = imported
-            .fsp_mints
-            .iter()
-            .find(|(s, _)| s == service)
-            .map(|(_, u)| u.clone());
-        let Some(url) = known.or(named) else {
-            log.push("no FSP mint is known for an imported service, so it was not swapped".into());
-            continue;
-        };
-        match wallet.build_fsp_swap_of(*service, ids) {
-            Ok(rid) => match settle_fsp(wallet, &url, &rid) {
-                Ok(text) => log.push(format!("FSP swap {rid}: {text}")),
-                Err(e) => log.push(format!(
-                    "the FSP swap was not finished and is kept to be sent again on the next run: {e}"
-                )),
-            },
-            Err(e) => log.push(format!("the FSP notes were not swapped: {e}")),
         }
     }
     log
 }
 
-/// Ask the mint where a token this wallet sent stands, and record it.
-pub fn check_sent(
+/// Ask the mint where a PSP handoff this wallet made stands, and record it.
+/// The mint's record decides: none of the notes spent means it is still the
+/// sender's to reclaim, all spent means the receiver has it (the handoff is
+/// done), some spent means the rest can still be reclaimed. If a reclaim is
+/// stored it is sent first (again, after a crash or a lost reply).
+pub fn check_handoff(
     wallet: &mut Wallet,
-    token_id: &str,
-) -> Result<crate::send::SentState, WalletError> {
-    use crate::send::SentState;
-    let t = wallet
-        .sent_tokens()
+    id: &str,
+) -> Result<crate::handoff::Standing, WalletError> {
+    use crate::handoff::{HandoffState, Standing};
+    let h = wallet
+        .handoffs_out()
         .iter()
-        .find(|t| t.id == token_id)
+        .find(|h| h.id == id)
         .cloned()
-        .ok_or_else(|| WalletError::Invalid(format!("no sent token {token_id}")))?;
-    if let SentState::Reclaiming { rollover } = &t.state {
-        send_rollover(wallet, rollover)?;
-        let now = wallet
-            .sent_tokens()
-            .iter()
-            .find(|t| t.id == token_id)
-            .expect("kept");
-        if now.state == SentState::Reclaimed {
-            return Ok(SentState::Reclaimed);
+        .ok_or_else(|| WalletError::Unknown(format!("no handoff {id}")))?;
+    if h.state != HandoffState::Pending {
+        return wallet.handoff_standing(id);
+    }
+    if let Some(rollover) = &h.reclaim {
+        if wallet.pending_rollovers().iter().any(|p| &p.id == rollover) {
+            send_rollover(wallet, rollover)?;
         }
-        return check_sent(wallet, token_id);
+        let now = wallet.handoff_standing(id)?;
+        if now == Standing::Reclaimed {
+            return Ok(now);
+        }
     }
-    if t.notes.is_empty() {
-        return Ok(t.state);
+    let h = wallet
+        .handoffs_out()
+        .iter()
+        .find(|h| h.id == id)
+        .cloned()
+        .ok_or_else(|| WalletError::Unknown(format!("no handoff {id}")))?;
+    if h.state != HandoffState::Pending || h.notes.is_empty() {
+        return wallet.handoff_standing(id);
     }
+    // Errors for an FSP handoff and a record without a mint, before any call.
+    wallet.handoff_standing(id)?;
     let req = CheckStateRequest {
-        nonces: t.notes.iter().map(|n| n.note.nonce).collect(),
+        nonces: h.notes.iter().map(|n| n.note.nonce).collect(),
     };
-    let r: CheckStateResponse = fsp_post(&t.mint, "check-state", &req)?;
-    wallet.settle_sent(token_id, &r.spent)
+    let r: CheckStateResponse = fsp_post(&h.mint, "check-state", &req)?;
+    wallet.settle_handoff(id, &r.spent)
 }
 
-/// Take back what is left of a sent token that was never swapped: the notes
-/// are swapped at the mint for new ones only this wallet knows. If the
-/// receiver swapped first, the token is recorded as received instead.
-pub fn reclaim_sent(
-    wallet: &mut Wallet,
-    token_id: &str,
-) -> Result<crate::send::SentState, WalletError> {
-    use crate::send::SentState;
-    match check_sent(wallet, token_id)? {
-        s @ (SentState::Received | SentState::Reclaimed) => return Ok(s),
-        SentState::Conflict { .. }
-            if wallet
-                .sent_tokens()
-                .iter()
-                .any(|t| t.id == token_id && t.notes.is_empty()) =>
-        {
-            return check_sent(wallet, token_id);
-        }
-        _ => {}
+/// What a reclaim did: where the handoff stands afterwards, and what the mint
+/// said about the swap back, if one was sent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Reclaim {
+    pub standing: crate::handoff::Standing,
+    pub log: Vec<String>,
+}
+
+/// Take back what is left of a PSP handoff the receiver has not swapped: the
+/// notes are swapped at the mint for new ones only this wallet knows. The mint
+/// takes whichever swap reaches it first. If the receiver swapped first, the
+/// handoff is recorded as done and nothing comes back; the standing says so.
+pub fn reclaim_handoff(wallet: &mut Wallet, id: &str) -> Result<Reclaim, WalletError> {
+    use crate::handoff::Standing;
+    let mut log = Vec::new();
+    if let s @ (Standing::Received | Standing::Reclaimed) = check_handoff(wallet, id)? {
+        return Ok(Reclaim { standing: s, log });
     }
-    if let Some(url) = wallet
-        .sent_tokens()
+    let h = wallet
+        .handoffs_out()
         .iter()
-        .find(|t| t.id == token_id)
-        .map(|t| t.mint.clone())
-    {
-        if let Ok(w) = fetch_window(&url) {
-            wallet.note_live_keysets(&url, &w)?;
+        .find(|h| h.id == id)
+        .cloned()
+        .ok_or_else(|| WalletError::Unknown(format!("no handoff {id}")))?;
+    if h.reclaim.is_none() {
+        // The swap names the mint's current key set, read fresh; the mint signs
+        // with any live key set, so one rotation in between does not refuse it.
+        if let Ok(w) = fetch_window(&h.mint) {
+            wallet.note_live_keysets(&h.mint, &w)?;
         }
     }
-    let id = wallet.begin_reclaim(token_id)?;
-    send_rollover(wallet, &id)?;
-    check_sent(wallet, token_id)
+    let rollover = wallet.begin_reclaim(id)?;
+    log.push(send_rollover(wallet, &rollover)?);
+    let standing = check_handoff(wallet, id)?;
+    Ok(Reclaim { standing, log })
 }

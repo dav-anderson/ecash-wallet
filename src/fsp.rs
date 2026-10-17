@@ -847,10 +847,10 @@ mod tests {
         let w = Wallet::open(&path).unwrap();
         assert_eq!(known.fsp_service(), Some(s));
         assert!(
-            w.select_handoff(0, &[(s, 8)]).is_err(),
+            w.select_fsp_handoff(&[(s, 8)]).is_err(),
             "only 4 is the service's"
         );
-        assert_eq!(w.select_handoff(0, &[(s, 4)]).unwrap().fsp.len(), 1);
+        assert_eq!(w.select_fsp_handoff(&[(s, 4)]).unwrap().len(), 1);
     }
 
     #[test]

@@ -28,8 +28,7 @@
 //! wallet says so rather than choosing one. The command line uses it as the
 //! default `--service` of the `fsp` commands.
 //!
-//! The planned behaviour is in `sandbox-mint/DESIGN.md`, "AIR storage
-//! requirements".
+//! The planned behaviour is in the mints' DESIGN.md files ("Storage policy").
 
 use std::collections::BTreeMap;
 use std::fs;

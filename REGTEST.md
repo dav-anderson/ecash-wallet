@@ -85,8 +85,10 @@ Expected: `scanning wallet psp-regtest every 10 s` and `psp-mint api listening o
 
 ```
 cd ~/esp-mint
-ESP_NETWORK=regtest cargo run -- serve
+ESP_NETWORK=regtest ESP_REDEEM_FEE_PER_BYTE=1000000 cargo run -- serve
 ```
+
+Every fee in esp-mint defaults to 0. This walkthrough sets the redemption fee to 10^6 ESP units a byte (`ESP_REDEEM_FEE_PER_BYTE`) so that the redemption steps below show a fee being taken; the figures in them depend on it. Start the mint the same way each time it is restarted.
 
 Expected:
 
@@ -272,7 +274,7 @@ In T3, stop the ESP mint with Ctrl-C and start it again:
 
 ```
 cd ~/esp-mint
-ESP_NETWORK=regtest cargo run -- serve
+ESP_NETWORK=regtest ESP_REDEEM_FEE_PER_BYTE=1000000 cargo run -- serve
 ```
 
 Expected: the same two lines as in step 4. In T1, `curl -s http://127.0.0.1:3100/audit` still returns `{"issued":500000000000,"outstanding":500000000000,"redeemed":0}`.
@@ -414,7 +416,7 @@ The app wallet is the default one, `~/.ecash-wallet/regtest/wallet.json`. The se
 curl -s http://127.0.0.1:3100/fees | python3 -m json.tool
 ```
 
-Expected: `exchange` with `fee_per_byte "0"`, `maturity_days 365`, `max_items 1000`, `max_request_bytes 1048576`, `min_psp 1` and size `48 + 146 per input + 41 per output`; `transfer` with fee `"0"`, ceiling 1048576 and size `120 + 146 + 41`; `redeem` with `fee_per_byte "1000000"`, `max_memo_bytes 256`, `max_request_bytes 67108864` and size `119 + 186 per input + 81 per output + the memo`. These are the mint's settings (esp-mint README, "Settings and fees"). The wallet reads this before it builds a redemption.
+Expected: `exchange` with `fee_per_byte "0"`, `maturity_days 365`, `max_items 1000`, `max_request_bytes 1048576`, `min_psp 1` and size `48 + 146 per input + 41 per output`; `transfer` with fee `"0"`, ceiling 1048576 and size `120 + 146 + 41`; `redeem` with `fee_per_byte "1000000"` (set by `ESP_REDEEM_FEE_PER_BYTE` in step 4; the default is `"0"`), `max_memo_bytes 256`, `max_request_bytes 67108864` and size `119 + 186 per input + 81 per output + the memo`. These are the mint's settings (esp-mint README, "Settings and fees"). The wallet reads this before it builds a redemption.
 
 ### 22. Make new notes mature the day they are issued (T1)
 
@@ -753,7 +755,7 @@ In T3 (the PSP mint must be running, because the ESP mint checks its network at 
 
 ```
 cd ~/esp-mint
-ESP_NETWORK=regtest ESP_ROTATION_ACTIVATION_HOURS=1 ESP_ROTATION_PERIOD_HOURS=1 cargo run -- serve
+ESP_NETWORK=regtest ESP_REDEEM_FEE_PER_BYTE=1000000 ESP_ROTATION_ACTIVATION_HOURS=1 ESP_ROTATION_PERIOD_HOURS=1 cargo run -- serve
 ```
 
 Expected: `key rotation: keyset <new> (epoch 1) is now current; 507d6862e19bf815 (epoch 0) is previous`, then `previous keyset 507d6862e19bf815 (epoch 0), retires at <time>`. In T1, `curl -s http://127.0.0.1:3100/rotation | python3 -m json.tool` shows the current and previous sets with their start and end times, and `/keysets` shows both ids. The audit is unchanged.

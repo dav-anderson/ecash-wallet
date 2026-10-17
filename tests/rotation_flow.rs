@@ -1,7 +1,7 @@
 //! The wallet's automatic, staggered rollover of PSP and ESP against real
 //! psp-mint and esp-mint servers that rotate their keys (fixed clocks).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
@@ -52,7 +52,7 @@ struct PspMint {
     rot: psp_mint::server::SharedRotating,
 }
 
-fn start_psp(rt: &Runtime, dir: &PathBuf) -> PspMint {
+fn start_psp(rt: &Runtime, dir: &Path) -> PspMint {
     let d = dir.join("psp");
     let (rotor, logic) =
         psp_mint::rotation::Rotor::open_at(&d, Amount::from_units(1024), 1, 1, T).unwrap();
@@ -130,7 +130,7 @@ thread_local! {
         Default::default();
 }
 
-fn wallet_with(dir: &PathBuf, name: &str, notes: Vec<StoredNote>) -> Wallet {
+fn wallet_with(dir: &Path, name: &str, notes: Vec<StoredNote>) -> Wallet {
     let path = dir.join(format!("{name}.json"));
     let keysets = SIGNED_BY.with(|m| {
         let m = m.borrow();
@@ -335,7 +335,7 @@ fn service() -> XOnlyPublicKey {
 /// A rotating ESP mint (1-hour periods from `T`) and three notes of its
 /// first set for `service()`: 4 and 4 on day 100, 2 on day 200 (ESP notes are
 /// powers of two).
-fn start_esp(rt: &Runtime, dir: &PathBuf) -> (Arc<EspState>, String, Vec<(u64, HandedNote)>) {
+fn start_esp(rt: &Runtime, dir: &Path) -> (Arc<EspState>, String, Vec<(u64, HandedNote)>) {
     let d = dir.join("esp");
     let (rotor, logic) = esp_mint::rotation::Rotor::open_at(&d, 1, 1, T).unwrap();
     let master = rotor.current.master.clone();
@@ -442,7 +442,7 @@ fn esp_rolls_over_keeping_its_service_and_day() {
 /// and return the text it prints.
 fn settle_now(
     m: &PspMint,
-    dir: &PathBuf,
+    dir: &Path,
     key: &sp_wire::seal::SecretKey,
     txid: &str,
     payload: Vec<u8>,

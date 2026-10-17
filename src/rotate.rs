@@ -273,12 +273,21 @@ impl Wallet {
         let Some(_) = w.previous_epoch else {
             return Ok(vec![]);
         };
+        // Notes a stored swap of received notes (a handoff's) will swap are not
+        // rolled over as well: one request or the other would be refused.
+        let swapping: std::collections::BTreeSet<&String> = self
+            .pending_rollovers()
+            .iter()
+            .filter(|p| p.schedule.starts_with(crate::handoff::SWAP_TAG))
+            .flat_map(|p| p.inputs.iter())
+            .collect();
         let old: Vec<StoredNote> = self
             .notes()
             .iter()
             .filter(|n| {
                 n.kind == kind
                     && n.reserved_by.is_none()
+                    && !swapping.contains(&n.id())
                     // A recorded keyset decides (a note signed by the current
                     // set after the rotation needs no rollover); else the epoch.
                     // Only a note with a recorded keyset is rolled over (no
@@ -510,6 +519,8 @@ impl Wallet {
             if !d.pending_rollovers.iter().any(|q| q.schedule == p.schedule) {
                 d.swap_schedule.remove(&p.schedule);
             }
+            // A swap back of a handed-off note ended the handoff, in this write.
+            crate::handoff::settle_reclaim(d, &p.schedule, true);
             Ok(())
         })
     }
@@ -530,6 +541,7 @@ impl Wallet {
                 .find(|p| p.id == id)
                 .ok_or_else(|| WalletError::Unknown(format!("no pending rollover {id}")))?;
             let count = pending.inputs.len();
+            let schedule = pending.schedule.clone();
             if inputs.is_empty() || inputs.iter().any(|&i| i >= count) {
                 return Err(WalletError::Invalid(format!(
                     "the mint named notes {inputs:?}, but the rollover has {count} notes"
@@ -538,6 +550,7 @@ impl Wallet {
             let spent_ids: Vec<String> =
                 inputs.iter().map(|&i| pending.inputs[i].clone()).collect();
             d.pending_rollovers.retain(|q| q.id != id);
+            crate::handoff::settle_reclaim(d, &schedule, false);
             Ok(Wallet::retire_reserved(d, id, &spent_ids))
         })
     }
@@ -545,6 +558,15 @@ impl Wallet {
     /// The mint refused the rollover: free its notes.
     pub fn cancel_rollover(&mut self, id: &str) -> Result<(), WalletError> {
         self.update(|d| {
+            let schedule = d
+                .pending_rollovers
+                .iter()
+                .find(|q| q.id == id)
+                .map(|q| q.schedule.clone());
+            if let Some(schedule) = schedule {
+                // A reclaim the mint refused leaves the handoff pending again.
+                crate::handoff::settle_reclaim(d, &schedule, false);
+            }
             for n in d
                 .notes
                 .iter_mut()

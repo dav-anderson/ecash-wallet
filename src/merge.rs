@@ -16,7 +16,7 @@
 //!   wallet keeps ledgers (`departed` and `returned`, see [`WalletData`]) that
 //!   `update` maintains, and the merge takes the larger count from each copy.
 //!   A note also counts as spent if either copy lists it as spent elsewhere,
-//!   lost, handed over, sent in a token or held in a pending handoff. A note
+//!   lost, handed over or held in a pending handoff. A note
 //!   that came back (a cancelled handoff) has `returned` equal to `departed`
 //!   and is not spent.
 //! - **Requests are united by id**, once each. A request that has ended in
@@ -39,7 +39,6 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::error::WalletError;
 use crate::handoff::{HandoffState, OutgoingHandoff};
-use crate::send::{SentState, SentToken};
 use crate::store::{StoredNote, Wallet, WalletData, has_departed};
 
 /// What a merge did.
@@ -105,15 +104,6 @@ fn union_list<T: Clone>(
     out
 }
 
-fn sent_rank(t: &SentToken) -> u8 {
-    match t.state {
-        SentState::Pending => 0,
-        SentState::Reclaiming { .. } => 1,
-        SentState::Conflict { .. } => 2,
-        SentState::Received | SentState::Reclaimed => 3,
-    }
-}
-
 fn pending_request_ids(d: &WalletData, handoffs: &[OutgoingHandoff]) -> BTreeSet<String> {
     let mut ids = BTreeSet::new();
     ids.extend(d.pending_purchases.iter().map(|p| p.id.clone()));
@@ -132,7 +122,7 @@ fn pending_request_ids(d: &WalletData, handoffs: &[OutgoingHandoff]) -> BTreeSet
 }
 
 /// Note ids a copy records as no longer in its active notes, other than through
-/// the ledgers: spent elsewhere, lost, handed over, sent in a token.
+/// the ledgers: spent elsewhere, lost, handed over.
 fn listed_gone(d: &WalletData) -> BTreeSet<String> {
     let mut ids = BTreeSet::new();
     ids.extend(d.spent.iter().map(StoredNote::id));
@@ -145,14 +135,17 @@ fn listed_gone(d: &WalletData) -> BTreeSet<String> {
                 .map(|n| hex::encode(n.note.nonce.0.serialize())),
         );
     }
-    for t in &d.sent {
-        ids.extend(t.notes.iter().map(StoredNote::id));
-    }
     ids
 }
 
 /// Make one wallet of `local` and `stored`. Neither is changed.
 pub fn merge(local: &WalletData, stored: &WalletData) -> (WalletData, MergeReport) {
+    // Records of the removed `send-psp` (`sent`) are PSP handoff records first,
+    // in both copies, so that the rules below see them.
+    let (mut migrated_local, mut migrated_stored) = (local.clone(), stored.clone());
+    migrated_local.migrate_legacy();
+    migrated_stored.migrate_legacy();
+    let (local, stored) = (&migrated_local, &migrated_stored);
     let mut m = local.clone();
 
     // The ledgers first: everything else is decided by them.
@@ -176,7 +169,10 @@ pub fn merge(local: &WalletData, stored: &WalletData) -> (WalletData, MergeRepor
             .chain(&stored.handoffs_out)
             .filter(|h| h.id == id)
             .collect();
-        if let Some(done) = copies.iter().find(|h| h.state == HandoffState::Done) {
+        if let Some(done) = copies
+            .iter()
+            .find(|h| matches!(h.state, HandoffState::Done | HandoffState::Reclaimed))
+        {
             handoffs.push((*done).clone());
         } else if !m.finished.contains(&id) {
             handoffs.push(copies[0].clone());
@@ -281,20 +277,6 @@ pub fn merge(local: &WalletData, stored: &WalletData) -> (WalletData, MergeRepor
         }
     }
     m.handovers = handovers;
-    let mut sent = union_list(
-        &local.sent,
-        &stored.sent,
-        |t| t.id.clone(),
-        &BTreeSet::new(),
-    );
-    for t in &mut sent {
-        if let Some(other) = stored.sent.iter().find(|o| o.id == t.id) {
-            if sent_rank(other) > sent_rank(t) {
-                *t = other.clone();
-            }
-        }
-    }
-    m.sent = sent;
     m.spent = union_list(
         &local.spent,
         &stored.spent,
@@ -323,9 +305,6 @@ pub fn merge(local: &WalletData, stored: &WalletData) -> (WalletData, MergeRepor
     keep.extend(m.lost_fsp.iter().map(StoredNote::id));
     for h in &m.handoffs_out {
         keep.extend(h.notes.iter().map(StoredNote::id));
-    }
-    for t in &m.sent {
-        keep.extend(t.notes.iter().map(StoredNote::id));
     }
     let only = |map: BTreeMap<String, String>| -> BTreeMap<String, String> {
         map.into_iter().filter(|(k, _)| keep.contains(k)).collect()
@@ -403,7 +382,7 @@ mod tests {
     use crate::store::{Kind, PendingPurchase};
     use secp256k1::{SECP256K1, SecretKey};
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("ecash-wallet-merge-{}-{name}", {
@@ -468,7 +447,7 @@ mod tests {
 
     /// Two copies of one wallet that began alike: `local` and `stored`. Both
     /// held `a`, `b`, `c`.
-    fn diverged(dir: &PathBuf) -> (Wallet, Wallet, [StoredNote; 3]) {
+    fn diverged(dir: &Path) -> (Wallet, Wallet, [StoredNote; 3]) {
         let mut base = Wallet::open(&dir.join("base.json")).unwrap();
         let notes = [note(4), note(2), note(1)];
         for n in &notes {
@@ -684,11 +663,12 @@ mod tests {
         let (mut local, stored, [a, _b, _c]) = diverged(&dir);
         // an FSP-free handoff of one PSP note: the stored copy still holds it
         let aid = a.id();
-        let sel = crate::handoff::HandoffSelection {
-            psp: vec![aid.clone()],
-            fsp: vec![],
-        };
-        let out = local.export_handoff(&sel, "http://m", None).unwrap();
+        let to = sp_wire::seal::SecretKey::from_array([7u8; 32])
+            .unwrap()
+            .public_key();
+        let out = local
+            .export_psp_handoff(std::slice::from_ref(&aid), "http://m", &to)
+            .unwrap();
         local.merge_from(&stored.snapshot()).unwrap();
         assert!(
             !ids(&local).contains(&aid),
@@ -707,11 +687,12 @@ mod tests {
         );
 
         // done: gone for good, in both directions
-        let sel = crate::handoff::HandoffSelection {
-            psp: vec![aid.clone()],
-            fsp: vec![],
-        };
-        let out = local.export_handoff(&sel, "http://m", None).unwrap();
+        let to = sp_wire::seal::SecretKey::from_array([7u8; 32])
+            .unwrap()
+            .public_key();
+        let out = local
+            .export_psp_handoff(std::slice::from_ref(&aid), "http://m", &to)
+            .unwrap();
         local.finish_handoff(&out.id).unwrap();
         local.merge_from(&stored.snapshot()).unwrap();
         assert!(!ids(&local).contains(&aid));
@@ -722,11 +703,11 @@ mod tests {
     fn handoff_records_unite_by_id_and_done_wins() {
         let dir = scratch("records");
         let (mut local, mut stored, _) = diverged(&dir);
-        let sel = crate::handoff::HandoffSelection {
-            psp: vec![local.notes()[0].id()],
-            fsp: vec![],
-        };
-        let out = local.export_handoff(&sel, "http://m", None).unwrap();
+        let to = sp_wire::seal::SecretKey::from_array([7u8; 32])
+            .unwrap()
+            .public_key();
+        let first = local.notes()[0].id();
+        let out = local.export_psp_handoff(&[first], "http://m", &to).unwrap();
         // the stored copy learns of it as pending, then local finishes it
         stored.merge_from(&local.snapshot()).unwrap();
         assert_eq!(stored.handoffs_out()[0].state, HandoffState::Pending);

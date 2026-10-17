@@ -7,7 +7,7 @@
 //! These are plain tests with their own runtime, because they use the blocking
 //! HTTP client.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use axum::Router;
@@ -103,7 +103,7 @@ struct Mint {
     queue_path: PathBuf,
 }
 
-fn start(rt: &Runtime, dir: &PathBuf, max_bytes: usize) -> Mint {
+fn start(rt: &Runtime, dir: &Path, max_bytes: usize) -> Mint {
     let (logic, master) = esp_mint::mint::open(&dir.join("esp")).unwrap();
     let responses = Responses::open(&dir.join("esp").join("responses.json")).unwrap();
     let queue_path = dir.join("esp").join("queue.json");
@@ -115,11 +115,10 @@ fn start(rt: &Runtime, dir: &PathBuf, max_bytes: usize) -> Mint {
         queue_path: queue_path.clone(),
         queue_lock: Mutex::new(()),
         in_flight: Default::default(),
-        config: esp_mint::config::Handle::new({
-            let mut config = esp_mint::config::Config::default();
-            config.redeem_fee_per_byte = RATE as u64;
-            config.redeem_max_request_bytes = max_bytes;
-            config
+        config: esp_mint::config::Handle::new(esp_mint::config::Config {
+            redeem_fee_per_byte: RATE as u64,
+            redeem_max_request_bytes: max_bytes,
+            ..esp_mint::config::Config::default()
         }),
         rotor: None,
         rollovers: None,

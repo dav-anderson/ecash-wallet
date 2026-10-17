@@ -158,11 +158,12 @@ pub struct WalletData {
     /// it are no longer in `notes`.
     #[serde(default)]
     pub handovers: Vec<Handover>,
-    /// PSP tokens this wallet exported and that are not settled yet, plus the
-    /// outcome of settled ones (see `send.rs`). The notes in them are no
-    /// longer in `notes`.
-    #[serde(default)]
-    pub sent: Vec<crate::send::SentToken>,
+    /// PSP tokens that `send-psp` exported (wallet 0.4.0 and earlier). Read
+    /// only, to be migrated: [`WalletData::migrate_legacy`] turns each into a
+    /// PSP handoff record when the file is opened, and nothing writes here any
+    /// more (see `legacy.rs`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sent: Vec<crate::legacy::SentToken>,
     /// PSP notes the ESP mint reported spent by a different request. They are
     /// no longer in `notes`, are not counted in the balance and cannot be spent.
     /// Kept as a record.
@@ -247,6 +248,21 @@ pub struct WalletData {
     pub handoffs_in: Vec<crate::handoff::IncomingHandoff>,
 }
 
+impl WalletData {
+    /// Turn the records `send-psp` left in `sent` into PSP handoff records, so
+    /// that `handoff check` and `handoff reclaim` work on them (see
+    /// `legacy.rs` for the mapping). A record whose id is already a handoff is
+    /// dropped as a duplicate. Does nothing when `sent` is empty.
+    pub fn migrate_legacy(&mut self) {
+        for t in std::mem::take(&mut self.sent) {
+            if self.handoffs_out.iter().any(|h| h.id == t.id) {
+                continue;
+            }
+            self.handoffs_out.push(t.into_handoff());
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Balance {
     pub psp: u128,
@@ -258,6 +274,10 @@ pub struct Balance {
     /// ESP units by service (hex) and redeemable-after day.
     pub esp_by_terms: BTreeMap<(String, u64), u128>,
     pub notes: usize,
+    /// Of `psp` above, the units received in a PSP handoff that the mint has
+    /// not swapped yet. They are counted in `psp` and can be spent; the swap is
+    /// sent again on every connection to the mint.
+    pub unswapped_psp: u128,
     /// Notes held back for a pending request.
     pub reserved: usize,
     pub pending_purchases: usize,
@@ -297,12 +317,15 @@ pub struct Wallet {
 impl Wallet {
     /// Open the wallet at `path`. A missing file is an empty wallet.
     pub fn open(path: &Path) -> Result<Self, WalletError> {
-        let data = match fs::read(path) {
+        let mut data: WalletData = match fs::read(path) {
             Ok(bytes) => serde_json::from_slice(&bytes)
                 .map_err(|e| WalletError::Corrupt(format!("{}: {e}", path.display())))?,
             Err(e) if e.kind() == io::ErrorKind::NotFound => WalletData::default(),
             Err(e) => return Err(e.into()),
         };
+        // Records of the removed `send-psp` become PSP handoff records. This is
+        // in memory; the file is rewritten without them at the next save.
+        data.migrate_legacy();
         Ok(Wallet {
             path: path.to_path_buf(),
             data,
@@ -456,6 +479,7 @@ impl Wallet {
                 }
             }
         }
+        b.unswapped_psp = self.unswapped_psp();
         b.pending_purchases = self.data.pending_purchases.len();
         b.pending_exchanges = self.data.pending_exchanges.len();
         b.pending_transfers = self.data.pending_transfers.len();

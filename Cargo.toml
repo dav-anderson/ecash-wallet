@@ -1,6 +1,6 @@
 [package]
 name = "ecash-wallet"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -36,8 +36,8 @@ mint-core = { git = "https://github.com/dav-anderson/mint-core.git", tag = "v0.1
 # The tests run real mints in the process. They are dev-dependencies only: the
 # library and the command line link none of them.
 psp-mint = { git = "https://github.com/dav-anderson/psp-mint.git", tag = "v0.3.0" }
-esp-mint = { git = "https://github.com/dav-anderson/esp-mint.git", tag = "v0.4.0" }
-fsp-mint = { git = "https://github.com/dav-anderson/fsp-mint.git", tag = "v0.3.0" }
+esp-mint = { git = "https://github.com/dav-anderson/esp-mint.git", tag = "v0.5.0" }
+fsp-mint = { git = "https://github.com/dav-anderson/fsp-mint.git", tag = "v0.4.0" }
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "net"] }
 
@@ -52,10 +52,6 @@ path = "src/lib.rs"
 [[bin]]
 name = "ecash-wallet"
 path = "src/main.rs"
-required-features = ["http"]
-
-[[test]]
-name = "send_flow"
 required-features = ["http"]
 
 [[test]]

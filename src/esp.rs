@@ -758,7 +758,7 @@ mod tests {
     #[test]
     fn a_total_above_one_note_is_split_over_several_and_the_change_is_split_too() {
         // 184,467,441 PSP is 1.84467441e19 ESP units, more than a u64 holds
-        assert!(sp_wire::units::MAX_PSP_PER_NOTE < 184_467_441);
+        const { assert!(sp_wire::units::MAX_PSP_PER_NOTE < 184_467_441) };
         let (mut w, dir) = wallet_with("big", &[268_435_456]);
         let built = w.build_exchange(184_467_441, service(), None).unwrap();
         assert_exact(&built);

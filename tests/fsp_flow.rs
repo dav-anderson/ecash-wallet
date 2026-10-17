@@ -2,7 +2,7 @@
 //! this process: issue, pay, and the automatic rollover across key rotation,
 //! with crashes, an offline wallet and a failed swap.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -79,7 +79,7 @@ struct Mints {
 
 /// Both mints. The FSP mint first issued at `NOW`; rotation activates 120
 /// hours later, every 240 hours.
-fn start(rt: &Runtime, dir: &PathBuf) -> Mints {
+fn start(rt: &Runtime, dir: &Path) -> Mints {
     let (logic, master) = esp_mint::mint::open(&dir.join("esp")).unwrap();
     let responses = Responses::open(&dir.join("esp").join("responses.json")).unwrap();
     let esp = Arc::new(EspState {
@@ -121,7 +121,7 @@ fn start(rt: &Runtime, dir: &PathBuf) -> Mints {
 }
 
 /// A wallet holding `units` ESP notes for the service (one note each).
-fn wallet_with_esp(dir: &PathBuf, mints: &Mints, units: &[u64]) -> Wallet {
+fn wallet_with_esp(dir: &Path, mints: &Mints, units: &[u64]) -> Wallet {
     let day = Terms::new_at(service(), NOW).redeemable_after_day;
     let terms = Terms {
         service: service(),

@@ -23,7 +23,8 @@ const DEFAULT_ESP_URL: &str = "http://127.0.0.1:3100";
 const USAGE: &str = "\
 ecash-wallet [--wallet FILE] [--config FILE] [--regtest|--signet|--testnet] <command>
 
-  The network defaults to mainnet. Before talking to a mint the wallet asks
+  The network defaults to mainnet (--mainnet may be given; at most one network
+  flag). Before talking to a mint the wallet asks
   its GET /health which network it is on and refuses if it is another.
 
   buy-psp --mint-key HEX [--reply-did HEX] [--psp-url URL] AMOUNT...
@@ -59,40 +60,51 @@ ecash-wallet [--wallet FILE] [--config FILE] [--regtest|--signet|--testnet] <com
       --resume sends a pending request again.
   balance
       What the wallet holds and what is waiting.
-  send-psp N FILE [--psp-url URL]
-      Hand N PSP to another wallet (a developer to its app's user): free PSP
-      notes adding up to exactly N are written as a token to FILE (private:
-      it is a bearer token) and kept here as pending-sent.
-  receive-psp FILE
-      Take a PSP token: its notes are swapped at once at its mint for notes
-      only this wallet knows. Final when the swap goes through; refused, and
-      nothing kept, if the mint finds any note spent.
-  sent [--check ID | --reclaim ID]
-      Tokens this wallet sent and where they stand. --check asks the mint;
-      --reclaim takes back a token that was never swapped.
-  handoff export [--psp N] [--fsp SERVICE:UNITS]... [--psp-url URL]
-                 [--did-key-file FILE] [--out FILE]
-      Hand PSP and FSP notes (and, with --did-key-file, a DID secret key) to
-      another wallet without the AIR: a string, or a file with --out, that the
-      other wallet reads with `handoff import`. N and UNITS must be sums of
-      notes this wallet holds. The notes leave this wallet, kept as a pending
-      handoff. THE STRING HOLDS BEARER SECRETS: anyone who sees it can spend
-      the notes. Pass it on in person or on a channel you trust. To show it as a
-      QR code, pipe the output to `qrencode -t ANSIUTF8` (about 20 notes fit
-      one code; see DESIGN.md).
-  handoff import STRING|FILE|- [--swap] [--from NAME] [--did-key-out FILE]
-      Take a handoff in. It is checked against the key sets this wallet has
-      seen, and refused if damaged, of another version, or imported before.
-      --swap swaps the notes at their mints for fresh ones only this wallet
-      knows (PSP with a rollover, FSP with a swap that pays 0), which makes the
-      handoff final; without it the notes are used as they are. A DID key in
-      the handoff is written to --did-key-out (required then), never printed.
+  handoff export-psp --to DID --psp N [--psp-url URL] [--out FILE]
+      A PSP handoff, developer to user (after an in-app purchase): free PSP
+      notes adding up to exactly N, sealed to the recipient's DID public key
+      (DID, 66 hex characters), so only the holder of the matching secret key
+      can open it. It carries PSP only, never a DID key. The notes leave this
+      wallet, kept as a pending handoff until you reclaim, cancel or finish it.
+      The string starts SPHP1:. This replaces the old send-psp token.
+  handoff export-fsp --fsp SERVICE:UNITS... --did-key-file FILE [--out FILE]
+      An FSP handoff, to your own new device: a little FSP (enough to pay to
+      fetch your wallet from the AIR) and the DID secret key from FILE (64 hex
+      characters). NOT ENCRYPTED: it holds the key it would be encrypted to.
+      Anyone who sees it can spend the notes and act as your DID. Move it in
+      person or by QR code, never over a network. The string starts SPHF1:.
+      To show either as a QR code, pipe the output to `qrencode -t ANSIUTF8`
+      (about 20 notes fit one code; see DESIGN.md).
+  handoff import STRING|FILE|- [--did-key-file FILE] [--did-key-out FILE]
+                 [--from NAME]
+      Take a handoff in; the kind is read from its start. It is checked against
+      the key sets this wallet has seen, and refused if damaged, of another
+      version, or imported before. The old SPH1: handoff is refused.
+      A PSP handoff (SPHP1:) needs --did-key-file, the secret key of the DID it
+      was sealed to. The notes count in the balance at once and are swapped at
+      the PSP mint for fresh notes only this wallet knows, now and at every
+      start while the mint is out of reach (`balance` shows how much is still
+      unswapped). Until the swap goes through the sender can still reclaim.
+      An FSP handoff (SPHF1:) is never swapped. Its DID key is written to
+      --did-key-out (required), never printed. Fetch your wallet from the AIR
+      afterwards and run `merge FILE` on it.
   handoff list
       The handoffs made and taken in.
+  handoff check ID
+      Ask the PSP mint where a PSP handoff you made stands, from its record of
+      which notes are spent: none (still yours to reclaim), all (the receiver
+      has it: the handoff is done), or some (the rest can be reclaimed). Old
+      send-psp tokens in a wallet file are PSP handoffs now and work here too.
+  handoff reclaim ID
+      Swap what is left of a PSP handoff back to this wallet at the mint, while
+      the receiver has not swapped. The mint takes whichever swap reaches it
+      first: if the receiver was first the handoff is recorded as done and
+      nothing comes back. Run it again after a crash or a lost reply.
   handoff cancel ID | handoff done ID
-      cancel puts a pending handoff's notes back (local only: if the other
-      wallet already imported it without --swap, the first to spend wins);
-      done drops the notes it kept once you know it was claimed.
+      cancel puts a pending handoff's notes back without asking the mint (local
+      only: if the other wallet already has the notes, the first to swap or
+      spend wins; prefer reclaim for a PSP handoff); done drops the notes it
+      kept once you know it was claimed.
   merge FILE
       Merge a copy of this wallet retrieved from storage (a wallet file) into
       this one: notes united, anything spent in either copy stays spent,
@@ -129,6 +141,9 @@ ecash-wallet [--wallet FILE] [--config FILE] [--regtest|--signet|--testnet] <com
       keysets with their start and retire times, and the next rotation.
   esp-schedule [--by YYYY-MM-DD]
       When this wallet's ESP is redeemable: now, by DATE, and by month.
+  migrate
+      Move a wallet file from before the networks had their own folders,
+      ~/.ecash-wallet/wallet.json, into regtest/.
 
   Without --service, the fsp commands use the storage service: the primary of
   storage.wallet. Fees for storage are paid to it, not to whichever service
@@ -159,13 +174,6 @@ impl Args {
         let value = self.0.remove(at + 1);
         self.0.remove(at);
         Ok(Some(value))
-    }
-
-    /// Take a flag that has no value, such as `--swap`.
-    fn switch(&mut self, name: &str) -> bool {
-        let before = self.0.len();
-        self.0.retain(|a| a != name);
-        self.0.len() != before
     }
 
     fn rest(self) -> Vec<String> {
@@ -540,61 +548,6 @@ fn hand_over(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
     println!(
         "wrote {out}. It holds the notes' spend secrets: give it to the service, and keep it private"
     );
-    Ok(())
-}
-
-fn send_psp(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
-    let flag = args.flag("--psp-url")?;
-    let rest = args.rest();
-    let [n, path] = rest.as_slice() else {
-        return Err(WalletError::Invalid("send-psp takes N and FILE".into()));
-    };
-    let n = number(n, "N")?;
-    let base = mint_url(flag, "ECASH_PSP_URL", DEFAULT_PSP_URL)?;
-    if std::path::Path::new(path).exists() {
-        return Err(WalletError::Invalid(format!(
-            "{path} exists; not overwritten"
-        )));
-    }
-    let token = wallet.export_psp_amount(&base, n as u128)?;
-    write_private(std::path::Path::new(path), &token)?;
-    let id = ecash_wallet::send::Token::decode(&token)?.id();
-    println!(
-        "sent {n} PSP as token {id}, written to {path}. Pending until the receiver swaps it (check with `sent --check {id}`)"
-    );
-    Ok(())
-}
-
-fn receive_psp(wallet: &mut Wallet, args: Args) -> Result<(), WalletError> {
-    let rest = args.rest();
-    let [path] = rest.as_slice() else {
-        return Err(WalletError::Invalid("receive-psp takes one file".into()));
-    };
-    let token = std::fs::read_to_string(path)?;
-    match http::receive_psp(wallet, &token)? {
-        ecash_wallet::send::Received::Final { amount } => {
-            println!("received {amount} PSP (swapped at the mint: final)");
-            Ok(())
-        }
-        ecash_wallet::send::Received::Rejected { why } => Err(WalletError::Invalid(format!(
-            "receive refused, nothing kept: {why}. Tell the sender"
-        ))),
-    }
-}
-
-fn sent(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
-    let check = args.flag("--check")?;
-    let reclaim = args.flag("--reclaim")?;
-    args.done()?;
-    if let Some(id) = check {
-        println!("{id}: {:?}", http::check_sent(wallet, &id)?);
-    }
-    if let Some(id) = reclaim {
-        println!("{id}: {:?}", http::reclaim_sent(wallet, &id)?);
-    }
-    for t in wallet.sent_tokens() {
-        println!("{} {} PSP {:?}", t.id, t.amount, t.state);
-    }
     Ok(())
 }
 
@@ -1044,6 +997,18 @@ fn balance(wallet: &Wallet, settings: &Settings, args: Args) -> Result<(), Walle
             b.handed_over
         );
     }
+    if b.unswapped_psp > 0 {
+        println!(
+            "unswapped {} PSP of the PSP above was received in a handoff and the mint has not swapped it yet (it could not be reached). It can be spent; until it is swapped the sender could still reclaim it. The swap is sent again at the next start",
+            b.unswapped_psp
+        );
+    }
+    if wallet.legacy_receive_psp() > 0 {
+        println!(
+            "waiting {} PSP from an old receive-psp token: its swap is stored and sent again at the next start. It is not counted above until the swap goes through",
+            wallet.legacy_receive_psp()
+        );
+    }
     let pending = wallet
         .handoffs_out()
         .iter()
@@ -1051,7 +1016,7 @@ fn balance(wallet: &Wallet, settings: &Settings, args: Args) -> Result<(), Walle
         .count();
     if pending > 0 {
         println!(
-            "handoffs {pending} pending: their notes are held back until you cancel or finish them (`handoff list`)"
+            "handoffs {pending} pending: their notes are held back until you reclaim, cancel or finish them (`handoff list`)"
         );
     }
     Ok(())
@@ -1070,19 +1035,25 @@ fn did_key_from_file(path: &str) -> Result<DidSecretKey, WalletError> {
 fn handoff(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
     if args.0.is_empty() {
         return Err(WalletError::Invalid(
-            "handoff needs export, import, list, cancel or done. Run with --help".into(),
+            "handoff needs export-psp, export-fsp, import, check, reclaim, list, cancel or done. Run with --help"
+                .into(),
         ));
     }
     let what = args.0.remove(0);
     match what.as_str() {
-        "export" => handoff_export(wallet, args),
+        "export-psp" => handoff_export_psp(wallet, args),
+        "export-fsp" => handoff_export_fsp(wallet, args),
+        "export" => Err(WalletError::Invalid(
+            "`handoff export` was split in two, because the combined handoff could be built in ways that are not allowed. Use `handoff export-psp` (a developer to a user: PSP only, sealed to the user's DID) or `handoff export-fsp` (your own new device: FSP and your DID key)".into(),
+        )),
         "import" => handoff_import(wallet, args),
         "list" => {
             args.done()?;
             for h in wallet.handoffs_out() {
                 println!(
-                    "out {} {:?} {} PSP {} FSP in {} note(s){}",
+                    "out {} {} {:?} {} PSP {} FSP in {} note(s){}{}{}",
                     h.id,
+                    h.kind.label(),
                     h.state,
                     h.psp_units,
                     h.fsp_units,
@@ -1091,13 +1062,24 @@ fn handoff(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
                         ", with a DID key"
                     } else {
                         ""
+                    },
+                    if h.reclaim.is_some() {
+                        ", reclaim stored (run `handoff reclaim` again)"
+                    } else {
+                        ""
+                    },
+                    if h.spent_elsewhere > 0 {
+                        format!(", {} note(s) spent at the mint", h.spent_elsewhere)
+                    } else {
+                        String::new()
                     }
                 );
             }
             for h in wallet.handoffs_in() {
                 println!(
-                    "in  {} from {} {} PSP {} FSP in {} note(s){}",
+                    "in  {} {} from {} {} PSP {} FSP in {} note(s){}",
                     h.id,
+                    h.kind.label(),
                     if h.from.is_empty() {
                         "(unnamed)"
                     } else {
@@ -1109,6 +1091,33 @@ fn handoff(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
                     if h.swapped { ", swapped" } else { "" }
                 );
             }
+            if wallet.unswapped_psp() > 0 {
+                println!(
+                    "{} PSP received in a handoff is in your balance and still waiting to be swapped; the swap is sent again at the next start",
+                    wallet.unswapped_psp()
+                );
+            }
+            Ok(())
+        }
+        "check" => {
+            let rest = args.rest();
+            let [id] = rest.as_slice() else {
+                return Err(WalletError::Invalid("handoff check takes an ID".into()));
+            };
+            let standing = http::check_handoff(wallet, id)?;
+            print_standing(id, &standing);
+            Ok(())
+        }
+        "reclaim" => {
+            let rest = args.rest();
+            let [id] = rest.as_slice() else {
+                return Err(WalletError::Invalid("handoff reclaim takes an ID".into()));
+            };
+            let done = http::reclaim_handoff(wallet, id)?;
+            for line in &done.log {
+                println!("{line}");
+            }
+            print_standing(id, &done.standing);
             Ok(())
         }
         "cancel" => {
@@ -1118,7 +1127,7 @@ fn handoff(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
             };
             let n = wallet.cancel_handoff(id)?;
             println!(
-                "put back {n} note(s). If the other wallet already imported the handoff without --swap, it still holds the same secrets: the first of you to spend a note wins"
+                "put back {n} note(s) without asking the mint. If the other wallet already has the handoff, it holds the same secrets: the first of you to swap or spend a note wins. For a PSP handoff, `handoff reclaim` lets the mint decide first"
             );
             Ok(())
         }
@@ -1137,62 +1146,46 @@ fn handoff(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
     }
 }
 
-fn handoff_export(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
-    let psp = match args.flag("--psp")? {
-        Some(n) => u128::from(number(&n, "--psp")?),
-        None => 0,
-    };
-    let mut fsp = Vec::new();
-    while let Some(v) = args.flag("--fsp")? {
-        let (service, units) = v
-            .split_once(':')
-            .ok_or_else(|| WalletError::Invalid("--fsp takes SERVICE:UNITS".into()))?;
-        fsp.push((
-            service_key(service)?,
-            u128::from(number(units, "the FSP units")?),
-        ));
+/// What a check or a reclaim found, in words.
+fn print_standing(id: &str, standing: &ecash_wallet::handoff::Standing) {
+    use ecash_wallet::handoff::Standing;
+    match standing {
+        Standing::Pending => println!(
+            "{id}: pending. The mint has seen none of the notes spent, so the receiver has not swapped yet and you can still take it back with `handoff reclaim {id}`"
+        ),
+        Standing::Received => println!(
+            "{id}: received. Every note is spent at the mint: the receiver swapped (or spent) them. Nothing is left to reclaim"
+        ),
+        Standing::Partly { spent, left } => println!(
+            "{id}: partly spent. {spent} note(s) are spent at the mint and are not yours any more; {left} are not, and `handoff reclaim {id}` takes those back if the receiver has not swapped them"
+        ),
+        Standing::Reclaimed => println!(
+            "{id}: reclaimed. The notes were swapped back to this wallet at the mint and are in your balance"
+        ),
     }
-    let psp_url = args.flag("--psp-url")?;
-    let did_file = args.flag("--did-key-file")?;
-    let out = args.flag("--out")?;
-    args.done()?;
-    if let Some(path) = &out {
-        if std::path::Path::new(path).exists() {
-            return Err(WalletError::Invalid(format!(
-                "{path} exists; not overwritten"
-            )));
-        }
-    }
-    let did = did_file.as_deref().map(did_key_from_file).transpose()?;
-    if psp == 0 && fsp.is_empty() && did.is_none() {
-        return Err(WalletError::Invalid(
-            "hand off something: --psp N, --fsp SERVICE:UNITS or --did-key-file FILE".into(),
-        ));
-    }
-    let selection = wallet.select_handoff(psp, &fsp)?;
-    let mint = if selection.psp.is_empty() {
-        String::new()
-    } else {
-        mint_url(psp_url, "ECASH_PSP_URL", DEFAULT_PSP_URL)?
-    };
-    let made = wallet.export_handoff(&selection, &mint, did.as_ref())?;
+}
+
+/// Print an export and write it to `--out` or to standard output.
+fn handoff_deliver(
+    made: &ecash_wallet::handoff::HandoffExport,
+    out: Option<String>,
+) -> Result<(), WalletError> {
+    eprintln!("handoff {}: {}", made.id, made.warning);
     eprintln!(
-        "handoff {}: {}",
+        "{} {} handoff, {} note(s): {} PSP, {} FSP{}; {} characters ({} bytes). The notes are held back here until you reclaim (`handoff reclaim {}`, PSP), cancel (`handoff cancel {}`) or finish (`handoff done {}`) it.",
+        made.kind.label(),
         made.id,
-        ecash_wallet::handoff::BEARER_WARNING
-    );
-    eprintln!(
-        "{} note(s): {} PSP, {} FSP{}; {} characters ({} bytes). The notes are held back here until you cancel (`handoff cancel {}`) or finish (`handoff done {}`) it.",
         made.notes,
         made.psp_units,
         made.fsp_units,
         if made.with_did_key {
-            ", and a DID key"
+            ", and the DID key"
         } else {
             ""
         },
         made.chars,
         made.bytes,
+        made.id,
         made.id,
         made.id
     );
@@ -1211,6 +1204,64 @@ fn handoff_export(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError
     Ok(())
 }
 
+fn check_out_file(out: &Option<String>) -> Result<(), WalletError> {
+    if let Some(path) = out {
+        if std::path::Path::new(path).exists() {
+            return Err(WalletError::Invalid(format!(
+                "{path} exists; not overwritten"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn handoff_export_psp(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
+    let to = args.flag("--to")?.ok_or_else(|| {
+        WalletError::Invalid(
+            "a PSP handoff is sealed to the recipient: give their DID public key with --to (66 hex characters)".into(),
+        )
+    })?;
+    let psp = args
+        .flag("--psp")?
+        .ok_or_else(|| WalletError::Invalid("give the amount with --psp N".into()))?;
+    let psp = u128::from(number(&psp, "--psp")?);
+    let psp_url = args.flag("--psp-url")?;
+    let out = args.flag("--out")?;
+    args.done()?;
+    check_out_file(&out)?;
+    let recipient = sp_wire::seal::parse_public_key(&to)
+        .map_err(|e| WalletError::Invalid(format!("--to: {e}")))?;
+    let ids = wallet.select_psp_handoff(psp)?;
+    let mint = mint_url(psp_url, "ECASH_PSP_URL", DEFAULT_PSP_URL)?;
+    let made = wallet.export_psp_handoff(&ids, &mint, &recipient)?;
+    handoff_deliver(&made, out)
+}
+
+fn handoff_export_fsp(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
+    let mut fsp = Vec::new();
+    while let Some(v) = args.flag("--fsp")? {
+        let (service, units) = v
+            .split_once(':')
+            .ok_or_else(|| WalletError::Invalid("--fsp takes SERVICE:UNITS".into()))?;
+        fsp.push((
+            service_key(service)?,
+            u128::from(number(units, "the FSP units")?),
+        ));
+    }
+    let did_file = args.flag("--did-key-file")?.ok_or_else(|| {
+        WalletError::Invalid(
+            "an FSP handoff carries the DID secret key: give the file with --did-key-file".into(),
+        )
+    })?;
+    let out = args.flag("--out")?;
+    args.done()?;
+    check_out_file(&out)?;
+    let key = did_key_from_file(&did_file)?;
+    let ids = wallet.select_fsp_handoff(&fsp)?;
+    let made = wallet.export_fsp_handoff(&ids, &key)?;
+    handoff_deliver(&made, out)
+}
+
 /// The handoff text for `handoff import`: `-` is standard input, a path that
 /// exists is read, anything else is the handoff itself.
 fn handoff_text(arg: &str) -> Result<String, WalletError> {
@@ -1227,9 +1278,10 @@ fn handoff_text(arg: &str) -> Result<String, WalletError> {
 }
 
 fn handoff_import(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
-    let swap = args.switch("--swap");
+    use ecash_wallet::handoff::{FSP_WARNING, HandoffKind, PSP_WARNING};
     let from = args.flag("--from")?.unwrap_or_default();
     let did_out = args.flag("--did-key-out")?;
+    let did_file = args.flag("--did-key-file")?;
     let rest = args.rest();
     let [arg] = rest.as_slice() else {
         return Err(WalletError::Invalid(
@@ -1237,43 +1289,76 @@ fn handoff_import(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError
         ));
     };
     let text = handoff_text(arg)?;
-    // Decide about the DID key before anything is added: a second import is
-    // refused, so the key could not be asked for again.
-    let (payload, _) = ecash_wallet::handoff::inspect(&text)?;
-    if payload.did_key.is_some() {
-        match &did_out {
-            None => {
+    // Everything that can be refused is checked before anything is added: a
+    // second import is refused, so a key could not be asked for again.
+    let got = match ecash_wallet::handoff::kind_of(&text)? {
+        HandoffKind::Psp => {
+            if did_out.is_some() {
                 return Err(WalletError::Invalid(
-                    "this handoff carries a DID secret key. Give --did-key-out FILE to save it (it is never printed). Nothing was imported".into(),
+                    "a PSP handoff carries no DID key, so --did-key-out does not apply".into(),
                 ));
             }
-            Some(path) if std::path::Path::new(path).exists() => {
-                return Err(WalletError::Invalid(format!(
-                    "{path} exists; not overwritten. Nothing was imported"
-                )));
-            }
-            Some(_) => {}
+            let file = did_file.ok_or_else(|| {
+                WalletError::Invalid(
+                    "this is a PSP handoff, sealed to a DID key: give the secret key of that DID with --did-key-file. Nothing was imported".into(),
+                )
+            })?;
+            let key = did_key_from_file(&file)?;
+            wallet.import_psp_handoff(&text, &key, &from)?
         }
-    }
-    let got = wallet.import_handoff(&text, &from, swap)?;
+        _ => {
+            if did_file.is_some() {
+                return Err(WalletError::Invalid(
+                    "an FSP handoff is not encrypted and carries its own DID key, so --did-key-file does not apply".into(),
+                ));
+            }
+            match &did_out {
+                None => {
+                    return Err(WalletError::Invalid(
+                        "this FSP handoff carries a DID secret key. Give --did-key-out FILE to save it (it is never printed). Nothing was imported".into(),
+                    ));
+                }
+                Some(path) if std::path::Path::new(path).exists() => {
+                    return Err(WalletError::Invalid(format!(
+                        "{path} exists; not overwritten. Nothing was imported"
+                    )));
+                }
+                Some(_) => {}
+            }
+            wallet.import_fsp_handoff(&text, &from)?
+        }
+    };
     if let (Some(key), Some(path)) = (&got.did_key, &did_out) {
         write_private(std::path::Path::new(path), &hex::encode(key.to_array()))?;
         eprintln!("DID secret key written to {path} (private)");
     }
-    eprintln!("{}", ecash_wallet::handoff::BEARER_WARNING);
+    eprintln!(
+        "{}",
+        if got.kind == HandoffKind::Psp {
+            PSP_WARNING
+        } else {
+            FSP_WARNING
+        }
+    );
     println!(
-        "imported handoff {}: {} PSP and {} FSP in {} note(s){}",
+        "imported {} handoff {}: {} PSP and {} FSP in {} note(s){}",
+        got.kind.label(),
         got.id,
         got.psp_units,
         got.fsp_units,
         got.notes.len(),
-        if swap { " (swapping)" } else { "" }
+        if got.kind == HandoffKind::Psp {
+            " (in your balance; swapping at the mint)"
+        } else {
+            ""
+        }
     );
     for w in &got.warnings {
         eprintln!("warning: {w}");
     }
-    // Read the mints' keys: this checks the notes against live key sets, moves
-    // those on a retired set to the lost record, and fills in what was unknown.
+    // Read the FSP mints' keys: this checks the notes against live key sets,
+    // moves those on a retired set to the lost record, and fills in what was
+    // unknown.
     for (service, url) in &got.fsp_mints {
         let known = wallet
             .fsp_mints()
@@ -1281,24 +1366,16 @@ fn handoff_import(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError
             .map(|m| m.url.clone());
         sync_and_log(wallet, *service, &known.unwrap_or_else(|| url.clone()));
     }
-    if !swap {
-        for base in &got.psp_mints {
-            if let Err(e) = mint_url(Some(base.clone()), "ECASH_PSP_URL", DEFAULT_PSP_URL)
-                .and_then(|b| http::rotation_sync(wallet, ecash_wallet::Kind::Psp, &b))
-                .map(|lines| {
-                    for l in lines {
-                        eprintln!("{base}: {l}");
-                    }
-                })
-            {
-                eprintln!("{base}: key sets not checked, tried again at the next start: {e}");
-            }
-        }
+    // A PSP handoff is swapped now. If the mint cannot be reached the swap
+    // stays stored and the notes stay unswapped (in the balance, spendable), and
+    // the startup sync sends it.
+    for line in http::complete_import(wallet, &got) {
+        println!("{line}");
     }
-    if swap {
-        for line in http::complete_import(wallet, &got) {
-            println!("{line}");
-        }
+    if got.kind == HandoffKind::Fsp {
+        println!(
+            "Next: fetch your wallet from the AIR, then run `merge FILE` on the copy you fetched."
+        );
     }
     Ok(())
 }
@@ -1623,9 +1700,9 @@ fn run(raw: Vec<String>) -> Result<(), WalletError> {
         "transfer" => transfer(&mut wallet, args),
         "redeem" => redeem(&mut wallet, args),
         "balance" => balance(&wallet, &settings, args),
-        "send-psp" => send_psp(&mut wallet, args),
-        "receive-psp" => receive_psp(&mut wallet, args),
-        "sent" => sent(&mut wallet, args),
+        "send-psp" | "receive-psp" | "sent" => Err(WalletError::Invalid(format!(
+            "`{command}` was removed. A PSP handoff replaces it: `handoff export-psp --to DID --psp N` to give PSP, `handoff import` to take it, `handoff check ID` and `handoff reclaim ID` for what `sent --check` and `sent --reclaim` did. Tokens in an old wallet file are PSP handoffs now (see `handoff list`)"
+        ))),
         "handoff" => handoff(&mut wallet, args),
         "merge" => merge_command(&mut wallet, args),
         other => Err(WalletError::Invalid(format!(

@@ -656,7 +656,7 @@ mod tests {
         let b = w.balance();
         assert_eq!(b.esp, u128::from(2 * ONE));
         assert_eq!((b.notes, b.handed_over), (2, 1));
-        assert_eq!(w.handovers(), &[handover.clone()]);
+        assert_eq!(w.handovers(), std::slice::from_ref(&handover));
         // the record is on disk
         let again = Wallet::open(&dir.join("wallet.json")).unwrap();
         assert_eq!(again.handovers(), &[handover]);

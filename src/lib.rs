@@ -20,8 +20,13 @@
 //! - [`redeem`]: redeeming ESP with the Issuer.
 //! - [`fsp`]: FSP from a service's fsp-mint: issue from ESP, spend with change,
 //!   automatic rollover to the current keyset, and the ESP schedule.
-//! - [`handoff`]: moving PSP and FSP notes, and a DID key, from one wallet to
-//!   another without the AIR, as a string or a QR code.
+//! - [`handoff`]: moving notes from one wallet to another without the AIR, as a
+//!   string or a QR code, in exactly two kinds: a PSP handoff (a developer to a
+//!   user, sealed to the user's DID key, always swapped, and reclaimable by the
+//!   sender until the receiver swaps) and an FSP handoff (a user's own new
+//!   device: FSP and the DID key, never swapped).
+//! - [`legacy`]: the records `send-psp` left in old wallet files, migrated to
+//!   PSP handoff records when the file is opened.
 //! - [`merge`]: reconciling a copy of the wallet retrieved from storage with
 //!   the local one.
 //! - [`rotate`]: the automatic, staggered rollover of PSP and ESP (and the
@@ -37,11 +42,11 @@ pub mod fsp;
 pub mod handoff;
 #[cfg(feature = "http")]
 pub mod http;
+pub mod legacy;
 pub mod merge;
 pub mod psp;
 pub mod redeem;
 pub mod rotate;
-pub mod send;
 pub mod split;
 pub mod store;
 pub mod transfer;

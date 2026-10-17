@@ -487,7 +487,7 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
 name = "ecash-wallet"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "axum",
  "bdhke",
@@ -506,6 +506,7 @@ dependencies = [
  "sha2",
  "sp-wire",
  "tokio",
+ "toml",
 ]
 
 [[package]]
@@ -538,8 +539,8 @@ dependencies = [
 
 [[package]]
 name = "esp-mint"
-version = "0.3.0"
-source = "git+https://github.com/dav-anderson/esp-mint.git?tag=v0.3.0#76897cb04bddd18ab879bfc58c73539b39f45adc"
+version = "0.4.0"
+source = "git+https://github.com/dav-anderson/esp-mint.git?tag=v0.4.0#182a1794ac222ca382cca04471866f62f56ba1c4"
 dependencies = [
  "axum",
  "bdhke",
@@ -609,8 +610,8 @@ dependencies = [
 
 [[package]]
 name = "fsp-mint"
-version = "0.2.1"
-source = "git+https://github.com/dav-anderson/fsp-mint.git?tag=v0.2.1#8fbe7d8f539595e38efe80ec9081033168675b05"
+version = "0.3.0"
+source = "git+https://github.com/dav-anderson/fsp-mint.git?tag=v0.3.0#57e9898dfcf8e375f0584ac50e00fea1b8174272"
 dependencies = [
  "axum",
  "bdhke",
@@ -1483,8 +1484,8 @@ dependencies = [
 
 [[package]]
 name = "psp-mint"
-version = "0.2.1"
-source = "git+https://github.com/dav-anderson/psp-mint.git?tag=v0.2.1#5ee0ca381ad68a8cbf19b56e9a0de58311825ca1"
+version = "0.3.0"
+source = "git+https://github.com/dav-anderson/psp-mint.git?tag=v0.3.0#52c8c2f2e8c6ee03f59c9a216909bcead885e19a"
 dependencies = [
  "axum",
  "bdhke",
@@ -2152,8 +2153,8 @@ dependencies = [
 
 [[package]]
 name = "sp-wire"
-version = "0.3.0"
-source = "git+https://github.com/dav-anderson/sp-wire.git?tag=v0.3.0#6670c69e0ea42a86f0f32c1ea9e627f66b5b201e"
+version = "0.4.0"
+source = "git+https://github.com/dav-anderson/sp-wire.git?tag=v0.4.0#60ed3bca435c9613e4c94fde0eab72d2e3c6ce89"
 dependencies = [
  "air",
  "hex",

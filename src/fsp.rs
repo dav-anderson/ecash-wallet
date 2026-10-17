@@ -163,18 +163,76 @@ impl Wallet {
         self.data().fsp_keysets.get(&note.id())
     }
 
-    /// FSP units by service (hex) and keyset.
+    /// FSP units by service (hex) and keyset. A note whose service is not known
+    /// is under [`crate::store::UNKNOWN_SERVICE`].
     pub fn fsp_by_keyset(&self) -> BTreeMap<(String, String), u128> {
         let mut out = BTreeMap::new();
         for n in self.notes().iter().filter(|n| n.kind == Kind::Fsp) {
             let service = n
-                .terms
-                .map(|t| hex::encode(t.service.serialize()))
-                .unwrap_or_default();
+                .fsp_service()
+                .map(|k| hex::encode(k.serialize()))
+                .unwrap_or_else(|| crate::store::UNKNOWN_SERVICE.to_string());
             let ks = self.fsp_keyset(n).cloned().unwrap_or_default();
             *out.entry((service, ks)).or_default() += u128::from(n.amount);
         }
         out
+    }
+
+    /// The FSP notes whose service is not known, and their units. They are not
+    /// spent, handed off or counted under a service until it is known (see
+    /// [`Wallet::fill_fsp_services`]).
+    pub fn fsp_unknown_service(&self) -> (usize, u128) {
+        self.notes()
+            .iter()
+            .filter(|n| n.kind == Kind::Fsp && n.terms.is_none())
+            .fold((0, 0), |(c, u), n| (c + 1, u + u128::from(n.amount)))
+    }
+
+    /// Fill in the service of FSP notes that have none, from the FSP mints this
+    /// wallet has seen: a note whose key set is the current or previous one of
+    /// exactly one known mint belongs to that mint's service. Anything else is
+    /// left unknown, not guessed. Returns how many notes were filled in. Run at
+    /// startup (a wallet file from before the service was kept) and whenever a
+    /// mint's keys are read.
+    pub fn fill_fsp_services(&mut self) -> Result<usize, WalletError> {
+        let mut owner: BTreeMap<String, Option<XOnlyPublicKey>> = BTreeMap::new();
+        for (svc, m) in &self.data().fsp_mints {
+            let Ok(raw) = hex::decode(svc) else { continue };
+            let Ok(key) = XOnlyPublicKey::from_slice(&raw) else {
+                continue;
+            };
+            for ks in std::iter::once(&m.current).chain(m.previous.iter()) {
+                // a key set that two mints both claim belongs to neither
+                owner
+                    .entry(ks.clone())
+                    .and_modify(|o| *o = None)
+                    .or_insert(Some(key));
+            }
+        }
+        let wanted: Vec<(String, XOnlyPublicKey)> = self
+            .notes()
+            .iter()
+            .filter(|n| n.kind == Kind::Fsp && n.terms.is_none())
+            .filter_map(|n| {
+                let ks = self.data().fsp_keysets.get(&n.id())?;
+                let service = (*owner.get(ks)?)?;
+                Some((n.id(), service))
+            })
+            .collect();
+        if wanted.is_empty() {
+            return Ok(0);
+        }
+        self.update(|d| {
+            for n in d.notes.iter_mut().filter(|n| n.kind == Kind::Fsp) {
+                if let Some((_, service)) = wanted.iter().find(|(id, _)| *id == n.id()) {
+                    n.terms = Some(StoredTerms {
+                        service: *service,
+                        redeemable_after_day: 0,
+                    });
+                }
+            }
+            Ok(wanted.len())
+        })
     }
 
     /// Record what an FSP mint's `/keys` said, and move FSP on keysets it no
@@ -205,7 +263,18 @@ impl Wallet {
             );
             let mut lost = 0u128;
             let mut keep = Vec::new();
-            for n in std::mem::take(&mut d.notes) {
+            for mut n in std::mem::take(&mut d.notes) {
+                // A note of this mint's whose service was not known: its key
+                // set is one only this mint has, so the service is this one.
+                if n.kind == Kind::Fsp
+                    && n.terms.is_none()
+                    && d.fsp_keysets.get(&n.id()).is_some_and(|k| live.contains(k))
+                {
+                    n.terms = Some(StoredTerms {
+                        service,
+                        redeemable_after_day: 0,
+                    });
+                }
                 let ours = n.kind == Kind::Fsp
                     && n.terms.is_some_and(|t| t.service == service)
                     && n.reserved_by.is_none();
@@ -434,7 +503,7 @@ impl Wallet {
         })
     }
 
-    fn build_swap(
+    pub(crate) fn build_swap(
         &mut self,
         service: XOnlyPublicKey,
         chosen: Vec<StoredNote>,
@@ -630,6 +699,7 @@ impl Wallet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::WalletData;
 
     #[test]
     fn splits_and_outputs() {
@@ -641,6 +711,146 @@ mod tests {
         assert_eq!(o.iter().map(|&x| u128::from(x)).sum::<u128>() + fee, 1000);
         assert_eq!(outputs_for(100, 1, 1), None);
         assert_eq!(outputs_for(2, 1, 0), Some(vec![2]));
+    }
+
+    fn service_of(seed: u8) -> XOnlyPublicKey {
+        secp256k1::SecretKey::from_slice(&[seed; 32])
+            .unwrap()
+            .public_key(secp256k1::SECP256K1)
+            .x_only_public_key()
+            .0
+    }
+
+    /// An FSP note of `amount` with no service recorded (as an older wallet
+    /// file has it), on key set `keyset` unless that is empty.
+    fn bare_note(seed: u8, amount: u64) -> StoredNote {
+        let sk = secp256k1::SecretKey::from_slice(&[seed; 32]).unwrap();
+        let pk = sk.public_key(secp256k1::SECP256K1);
+        StoredNote {
+            kind: Kind::Fsp,
+            amount,
+            note: mint_types::Note {
+                nonce: mint_types::Nonce(pk),
+                signature: pk,
+            },
+            spend_secret: sk,
+            terms: None,
+            reserved_by: None,
+        }
+    }
+
+    fn scratch_file(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("wallet-fsp-svc-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d.join("wallet.json")
+    }
+
+    fn fsp_mint(url: &str, current: &str, previous: Option<&str>) -> FspMint {
+        FspMint {
+            url: url.into(),
+            current: current.into(),
+            previous: previous.map(String::from),
+            next_rotation: None,
+        }
+    }
+
+    #[test]
+    fn the_service_of_an_old_note_is_filled_from_the_one_mint_that_has_its_keyset() {
+        let (s1, s2) = (service_of(41), service_of(42));
+        // k0 is only service 1's previous set and k2 only service 2's current
+        // set; k1 is claimed by both mints, so it belongs to neither.
+        let notes = [
+            (bare_note(1, 8), "k0"),
+            (bare_note(2, 4), "k2"),
+            (bare_note(3, 2), "k1"),
+            (bare_note(4, 1), "kz"),
+        ];
+        let mut with_terms = bare_note(5, 16);
+        with_terms.terms = Some(StoredTerms {
+            service: s2,
+            redeemable_after_day: 0,
+        });
+        let mut data = WalletData::default();
+        for (n, ks) in &notes {
+            data.fsp_keysets.insert(n.id(), ks.to_string());
+        }
+        data.fsp_keysets.insert(with_terms.id(), "k0".into());
+        data.notes = notes.iter().map(|(n, _)| n.clone()).collect();
+        data.notes.push(with_terms.clone());
+        data.fsp_mints.insert(
+            hex::encode(s1.serialize()),
+            fsp_mint("http://one", "k1", Some("k0")),
+        );
+        data.fsp_mints.insert(
+            hex::encode(s2.serialize()),
+            fsp_mint("http://two", "k2", Some("k1")),
+        );
+        let path = scratch_file("fill");
+        std::fs::write(&path, serde_json::to_vec(&data).unwrap()).unwrap();
+
+        let mut w = Wallet::open(&path).unwrap();
+        assert_eq!(
+            w.fsp_unknown_service(),
+            (4, 15),
+            "four notes have no service"
+        );
+        assert_eq!(w.fill_fsp_services().unwrap(), 2);
+        let svc = |seed: u8| {
+            w.notes()
+                .iter()
+                .find(|n| n.id() == bare_note(seed, 1).id())
+                .unwrap()
+                .fsp_service()
+        };
+        assert_eq!(svc(1), Some(s1));
+        assert_eq!(svc(2), Some(s2));
+        assert_eq!(svc(3), None, "a keyset two mints claim is not guessed");
+        assert_eq!(svc(4), None, "a keyset no mint has is not guessed");
+        assert_eq!(svc(5), Some(s2), "a recorded service is never changed");
+        assert_eq!(w.fsp_unknown_service(), (2, 3));
+
+        // Grouped by service in the balance and by keyset.
+        let by = w.balance().fsp_by_service;
+        assert_eq!(by[&hex::encode(s1.serialize())], 8);
+        assert_eq!(by[&hex::encode(s2.serialize())], 4 + 16);
+        assert_eq!(by[crate::store::UNKNOWN_SERVICE], 3);
+        assert_eq!(w.balance().fsp, 8 + 4 + 2 + 1 + 16);
+        let ks = w.fsp_by_keyset();
+        assert_eq!(ks[&(hex::encode(s1.serialize()), "k0".to_string())], 8);
+        assert_eq!(
+            ks[&(crate::store::UNKNOWN_SERVICE.to_string(), "k1".to_string())],
+            2
+        );
+
+        // It is saved, and a second run has nothing left to do.
+        assert_eq!(w.fill_fsp_services().unwrap(), 0);
+        let again = Wallet::open(&path).unwrap();
+        assert_eq!(again.fsp_unknown_service(), (2, 3));
+    }
+
+    #[test]
+    fn only_a_note_with_a_service_is_picked_for_it() {
+        let s = service_of(43);
+        let mut known = bare_note(7, 4);
+        known.terms = Some(StoredTerms {
+            service: s,
+            redeemable_after_day: 0,
+        });
+        let unknown = bare_note(8, 4);
+        let data = WalletData {
+            notes: vec![known.clone(), unknown],
+            ..Default::default()
+        };
+        let path = scratch_file("pick");
+        std::fs::write(&path, serde_json::to_vec(&data).unwrap()).unwrap();
+        let w = Wallet::open(&path).unwrap();
+        assert_eq!(known.fsp_service(), Some(s));
+        assert!(
+            w.select_handoff(0, &[(s, 8)]).is_err(),
+            "only 4 is the service's"
+        );
+        assert_eq!(w.select_handoff(0, &[(s, 4)]).unwrap().fsp.len(), 1);
     }
 
     #[test]

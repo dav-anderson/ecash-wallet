@@ -1024,28 +1024,91 @@ pub fn receive_psp(wallet: &mut Wallet, token: &str) -> Result<crate::send::Rece
         wallet.note_live_keysets(&t.mint, &w)?;
     }
     let id = wallet.begin_receive(&t)?;
+    settle_receive_swap(wallet, &id, t.total())
+}
+
+/// Send a stored swap of received notes (a PSP token's, or a handoff's) and
+/// settle it. A note of it spent already (a copy was received first) is a
+/// refusal: nothing was burned and nothing here was ever the receiver's, so the
+/// stored swap is dropped and the receive is rejected like any other refusal.
+/// Anything else leaves the swap stored, to be sent again.
+fn settle_receive_swap(
+    wallet: &mut Wallet,
+    id: &str,
+    amount: u128,
+) -> Result<crate::send::Received, WalletError> {
     let p = wallet
         .pending_rollovers()
         .iter()
         .find(|p| p.id == id)
         .cloned()
-        .expect("just stored");
+        .ok_or_else(|| WalletError::Unknown(format!("no stored swap {id}")))?;
     match fsp_post::<_, sp_wire::psp::RolloverResponse>(&p.url, "rollover", &p.body) {
         Ok(r) => {
             let sigs: Vec<_> = r.outcomes.into_iter().map(|o| o.0).collect();
-            wallet.finish_rollover(&id, r.epoch, &r.keyset, &sigs, &r.keys)?;
-            Ok(crate::send::Received::Final { amount: t.total() })
+            wallet.finish_rollover(id, r.epoch, &r.keyset, &sigs, &r.keys)?;
+            Ok(crate::send::Received::Final { amount })
         }
-        // A note of the token was spent already (a copy of it was received
-        // first). Nothing was burned and nothing here was ever the
-        // receiver's, so the stored swap is dropped and the token is
-        // rejected like any other refusal.
         Err(WalletError::Refused(why)) | Err(WalletError::SpentElsewhere { why, .. }) => {
-            wallet.cancel_rollover(&id)?;
+            wallet.cancel_rollover(id)?;
             Ok(crate::send::Received::Rejected { why })
         }
         Err(e) => Err(e),
     }
+}
+
+/// Finish an import made with a swap (`Wallet::import_handoff(.., swap = true)`):
+/// send the stored PSP swaps, and swap the imported FSP notes at their
+/// services' fsp-mints (a normal swap that pays 0). Returns lines for the log.
+/// A mint that cannot be reached leaves its swap stored (PSP) or the notes
+/// imported and unswapped (FSP), which is allowed: the next run sends the stored
+/// swap again, and the notes are good meanwhile.
+pub fn complete_import(wallet: &mut Wallet, imported: &crate::handoff::Imported) -> Vec<String> {
+    let mut log = Vec::new();
+    for id in &imported.psp_swaps {
+        let amount: u128 = wallet
+            .pending_rollovers()
+            .iter()
+            .find(|p| &p.id == id)
+            .map(|p| p.outputs.iter().map(|o| u128::from(o.amount)).sum())
+            .unwrap_or(0);
+        match settle_receive_swap(wallet, id, amount) {
+            Ok(crate::send::Received::Final { amount }) => {
+                log.push(format!("swapped {amount} PSP at the mint: final"))
+            }
+            Ok(crate::send::Received::Rejected { why }) => log.push(format!(
+                "the mint refused the PSP swap, so none of it was kept: {why}. Tell the sender"
+            )),
+            Err(e) => log.push(format!(
+                "the PSP swap was not finished and is kept to be sent again on the next run: {e}"
+            )),
+        }
+    }
+    for (service, ids) in &imported.fsp_swaps {
+        let known = wallet
+            .fsp_mints()
+            .get(&hex::encode(service.serialize()))
+            .map(|m| m.url.clone());
+        let named = imported
+            .fsp_mints
+            .iter()
+            .find(|(s, _)| s == service)
+            .map(|(_, u)| u.clone());
+        let Some(url) = known.or(named) else {
+            log.push("no FSP mint is known for an imported service, so it was not swapped".into());
+            continue;
+        };
+        match wallet.build_fsp_swap_of(*service, ids) {
+            Ok(rid) => match settle_fsp(wallet, &url, &rid) {
+                Ok(text) => log.push(format!("FSP swap {rid}: {text}")),
+                Err(e) => log.push(format!(
+                    "the FSP swap was not finished and is kept to be sent again on the next run: {e}"
+                )),
+            },
+            Err(e) => log.push(format!("the FSP notes were not swapped: {e}")),
+        }
+    }
+    log
 }
 
 /// Ask the mint where a token this wallet sent stands, and record it.

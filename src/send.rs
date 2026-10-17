@@ -195,7 +195,7 @@ fn token_note(n: &StoredNote, keyset: Option<&String>) -> TokenNote {
 /// current keyset as last seen, or, if this wallet has not seen it yet, the
 /// first note's (the mint signs with any live keyset named, and refuses one
 /// that is retired or unknown).
-fn swap_keyset(live: Option<&(String, Option<String>)>, notes: &[TokenNote]) -> String {
+pub(crate) fn swap_keyset(live: Option<&(String, Option<String>)>, notes: &[TokenNote]) -> String {
     live.map(|(c, _)| c.clone())
         .or_else(|| {
             notes

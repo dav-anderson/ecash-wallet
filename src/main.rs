@@ -3,9 +3,10 @@
 
 use std::env;
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use ecash_wallet::config::{self, Settings};
 use ecash_wallet::esp::ExchangeBuild;
 use ecash_wallet::psp::parse_signatures;
 use ecash_wallet::redeem::{EntryOutcome, RedeemOutcome, RedemptionState};
@@ -13,13 +14,14 @@ use ecash_wallet::store::{Handover, parse_did};
 use ecash_wallet::transfer::TransferBuild;
 use ecash_wallet::{Wallet, WalletError, http};
 use secp256k1::{SecretKey, XOnlyPublicKey};
+use sp_wire::seal::SecretKey as DidSecretKey;
 use sp_wire::units::ESP_PER_PSP;
 
 const DEFAULT_PSP_URL: &str = "http://127.0.0.1:3000";
 const DEFAULT_ESP_URL: &str = "http://127.0.0.1:3100";
 
 const USAGE: &str = "\
-ecash-wallet [--wallet FILE] [--regtest|--signet|--testnet] <command>
+ecash-wallet [--wallet FILE] [--config FILE] [--regtest|--signet|--testnet] <command>
 
   The network defaults to mainnet. Before talking to a mint the wallet asks
   its GET /health which network it is on and refuses if it is another.
@@ -68,6 +70,33 @@ ecash-wallet [--wallet FILE] [--regtest|--signet|--testnet] <command>
   sent [--check ID | --reclaim ID]
       Tokens this wallet sent and where they stand. --check asks the mint;
       --reclaim takes back a token that was never swapped.
+  handoff export [--psp N] [--fsp SERVICE:UNITS]... [--psp-url URL]
+                 [--did-key-file FILE] [--out FILE]
+      Hand PSP and FSP notes (and, with --did-key-file, a DID secret key) to
+      another wallet without the AIR: a string, or a file with --out, that the
+      other wallet reads with `handoff import`. N and UNITS must be sums of
+      notes this wallet holds. The notes leave this wallet, kept as a pending
+      handoff. THE STRING HOLDS BEARER SECRETS: anyone who sees it can spend
+      the notes. Pass it on in person or on a channel you trust. To show it as a
+      QR code, pipe the output to `qrencode -t ANSIUTF8` (about 20 notes fit
+      one code; see DESIGN.md).
+  handoff import STRING|FILE|- [--swap] [--from NAME] [--did-key-out FILE]
+      Take a handoff in. It is checked against the key sets this wallet has
+      seen, and refused if damaged, of another version, or imported before.
+      --swap swaps the notes at their mints for fresh ones only this wallet
+      knows (PSP with a rollover, FSP with a swap that pays 0), which makes the
+      handoff final; without it the notes are used as they are. A DID key in
+      the handoff is written to --did-key-out (required then), never printed.
+  handoff list
+      The handoffs made and taken in.
+  handoff cancel ID | handoff done ID
+      cancel puts a pending handoff's notes back (local only: if the other
+      wallet already imported it without --swap, the first to spend wins);
+      done drops the notes it kept once you know it was claimed.
+  merge FILE
+      Merge a copy of this wallet retrieved from storage (a wallet file) into
+      this one: notes united, anything spent in either copy stays spent,
+      pending requests merged once each. Save this wallet back to storage.
   redeem --service-key HEX --memo TEXT [--max-bytes N] [--esp-url URL]
       As the service (HEX is its 32 byte secret key): redeem every free ESP
       note for that service whose redeemable-after day has come, mixed days
@@ -81,12 +110,18 @@ ecash-wallet [--wallet FILE] [--regtest|--signet|--testnet] <command>
   redeem --collect [--esp-url URL]
       Ask the mint about every redemption queued for payout: completed ones end,
       declined ones give the reissued notes back with the operator's reason.
-  fsp issue --service HEX [--esp UNITS | --psp N] [--fsp-url URL]
+  config
+      Print the settings in use and where each came from: the storage policy
+      (storage.wallet and storage.app, each an ordered list of service IDs,
+      first is the primary), from config.toml beside the wallet file (or
+      --config FILE, or $ECASH_CONFIG) and $ECASH_STORAGE_WALLET and
+      $ECASH_STORAGE_APP. Nothing reads or writes the AIR yet.
+  fsp issue [--service HEX] [--esp UNITS | --psp N] [--fsp-url URL]
       Hand ESP for a service to its FSP mint for FSP, 1:1 less its issue fee.
       All of the service's ESP by default, any day, mature or not.
-  fsp pay --service HEX --units N [--memo TEXT] [--fsp-url URL]
+  fsp pay [--service HEX] --units N [--memo TEXT] [--fsp-url URL]
       Pay N FSP units to the service, with change.
-  fsp sync --service HEX [--fsp-url URL]
+  fsp sync [--service HEX] [--fsp-url URL]
       What runs on its own: finish pending FSP requests, read the mint's keys,
       and swap FSP on the previous keyset to the current one.
   fsp-window --service HEX [--fsp-url URL]
@@ -94,6 +129,10 @@ ecash-wallet [--wallet FILE] [--regtest|--signet|--testnet] <command>
       keysets with their start and retire times, and the next rotation.
   esp-schedule [--by YYYY-MM-DD]
       When this wallet's ESP is redeemable: now, by DATE, and by month.
+
+  Without --service, the fsp commands use the storage service: the primary of
+  storage.wallet. Fees for storage are paid to it, not to whichever service
+  the wallet holds FSP for. With storage.wallet empty, --service is needed.
 
   At startup, and every time it talks to an FSP mint, the wallet checks that
   mint's keys and rolls FSP on the previous keyset over to the current one.
@@ -120,6 +159,13 @@ impl Args {
         let value = self.0.remove(at + 1);
         self.0.remove(at);
         Ok(Some(value))
+    }
+
+    /// Take a flag that has no value, such as `--swap`.
+    fn switch(&mut self, name: &str) -> bool {
+        let before = self.0.len();
+        self.0.retain(|a| a != name);
+        self.0.len() != before
     }
 
     fn rest(self) -> Vec<String> {
@@ -909,7 +955,7 @@ fn later_failure_line(first: &mut Option<WalletError>, e: WalletError) -> Option
     None
 }
 
-fn balance(wallet: &Wallet, args: Args) -> Result<(), WalletError> {
+fn balance(wallet: &Wallet, settings: &Settings, args: Args) -> Result<(), WalletError> {
     args.done()?;
     let b = wallet.balance();
     println!("psp  {}", b.psp);
@@ -918,14 +964,34 @@ fn balance(wallet: &Wallet, args: Args) -> Result<(), WalletError> {
         println!("       {units} for {service}, redeemable after day {day}");
     }
     println!("fsp  {}", b.fsp);
-    for ((service, keyset), units) in wallet.fsp_by_keyset() {
-        let m = wallet.fsp_mints().get(&service);
-        let role = match m {
-            Some(m) if m.current == keyset => "current",
-            Some(m) if m.previous.as_deref() == Some(keyset.as_str()) => "previous",
-            _ => "not checked yet",
-        };
-        println!("       {units} for {service}, keyset {keyset} ({role})");
+    let by_keyset = wallet.fsp_by_keyset();
+    for (service, units) in &b.fsp_by_service {
+        println!("       {units} for service {service}");
+        for ((_, keyset), units) in by_keyset.iter().filter(|((s, _), _)| s == service) {
+            let role = match wallet.fsp_mints().get(service) {
+                Some(m) if &m.current == keyset => "current",
+                Some(m) if m.previous.as_deref() == Some(keyset.as_str()) => "previous",
+                _ => "not checked yet",
+            };
+            println!("         {units} on keyset {keyset} ({role})");
+        }
+    }
+    match settings.storage_service() {
+        Some(service) => {
+            let key = hex::encode(service.serialize());
+            let held = b.fsp_by_service.get(&key).copied().unwrap_or(0);
+            println!(
+                "       storage service {key}: {held} FSP held for it ({})",
+                settings.storage_wallet.describe()
+            );
+        }
+        None => println!("       storage: {}", settings.storage_wallet.describe()),
+    }
+    let (unknown, unknown_units) = wallet.fsp_unknown_service();
+    if unknown > 0 {
+        println!(
+            "       {unknown_units} FSP in {unknown} note(s) whose service is not known yet: they are not spent until it is. Connect to their mint (any `fsp` command) to fill it in"
+        );
     }
     for p in wallet.pending_fsp() {
         println!("pending fsp {}", p.id);
@@ -978,6 +1044,276 @@ fn balance(wallet: &Wallet, args: Args) -> Result<(), WalletError> {
             b.handed_over
         );
     }
+    let pending = wallet
+        .handoffs_out()
+        .iter()
+        .filter(|h| h.state == ecash_wallet::handoff::HandoffState::Pending)
+        .count();
+    if pending > 0 {
+        println!(
+            "handoffs {pending} pending: their notes are held back until you cancel or finish them (`handoff list`)"
+        );
+    }
+    Ok(())
+}
+
+/// A DID secret key from a file of 64 hex characters.
+fn did_key_from_file(path: &str) -> Result<DidSecretKey, WalletError> {
+    let text = std::fs::read_to_string(path)?;
+    let bytes = hex::decode(text.trim()).map_err(|_| {
+        WalletError::Invalid(format!("{path}: a DID secret key is 64 hex characters"))
+    })?;
+    DidSecretKey::from_bytes(&bytes)
+        .map_err(|_| WalletError::Invalid(format!("{path}: a DID secret key is 64 hex characters")))
+}
+
+fn handoff(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
+    if args.0.is_empty() {
+        return Err(WalletError::Invalid(
+            "handoff needs export, import, list, cancel or done. Run with --help".into(),
+        ));
+    }
+    let what = args.0.remove(0);
+    match what.as_str() {
+        "export" => handoff_export(wallet, args),
+        "import" => handoff_import(wallet, args),
+        "list" => {
+            args.done()?;
+            for h in wallet.handoffs_out() {
+                println!(
+                    "out {} {:?} {} PSP {} FSP in {} note(s){}",
+                    h.id,
+                    h.state,
+                    h.psp_units,
+                    h.fsp_units,
+                    h.note_count,
+                    if h.with_did_key {
+                        ", with a DID key"
+                    } else {
+                        ""
+                    }
+                );
+            }
+            for h in wallet.handoffs_in() {
+                println!(
+                    "in  {} from {} {} PSP {} FSP in {} note(s){}",
+                    h.id,
+                    if h.from.is_empty() {
+                        "(unnamed)"
+                    } else {
+                        &h.from
+                    },
+                    h.psp_units,
+                    h.fsp_units,
+                    h.notes.len(),
+                    if h.swapped { ", swapped" } else { "" }
+                );
+            }
+            Ok(())
+        }
+        "cancel" => {
+            let rest = args.rest();
+            let [id] = rest.as_slice() else {
+                return Err(WalletError::Invalid("handoff cancel takes an ID".into()));
+            };
+            let n = wallet.cancel_handoff(id)?;
+            println!(
+                "put back {n} note(s). If the other wallet already imported the handoff without --swap, it still holds the same secrets: the first of you to spend a note wins"
+            );
+            Ok(())
+        }
+        "done" => {
+            let rest = args.rest();
+            let [id] = rest.as_slice() else {
+                return Err(WalletError::Invalid("handoff done takes an ID".into()));
+            };
+            wallet.finish_handoff(id)?;
+            println!("handoff {id} is done; its notes are no longer kept here");
+            Ok(())
+        }
+        other => Err(WalletError::Invalid(format!(
+            "unknown handoff command `{other}`"
+        ))),
+    }
+}
+
+fn handoff_export(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
+    let psp = match args.flag("--psp")? {
+        Some(n) => u128::from(number(&n, "--psp")?),
+        None => 0,
+    };
+    let mut fsp = Vec::new();
+    while let Some(v) = args.flag("--fsp")? {
+        let (service, units) = v
+            .split_once(':')
+            .ok_or_else(|| WalletError::Invalid("--fsp takes SERVICE:UNITS".into()))?;
+        fsp.push((
+            service_key(service)?,
+            u128::from(number(units, "the FSP units")?),
+        ));
+    }
+    let psp_url = args.flag("--psp-url")?;
+    let did_file = args.flag("--did-key-file")?;
+    let out = args.flag("--out")?;
+    args.done()?;
+    if let Some(path) = &out {
+        if std::path::Path::new(path).exists() {
+            return Err(WalletError::Invalid(format!(
+                "{path} exists; not overwritten"
+            )));
+        }
+    }
+    let did = did_file.as_deref().map(did_key_from_file).transpose()?;
+    if psp == 0 && fsp.is_empty() && did.is_none() {
+        return Err(WalletError::Invalid(
+            "hand off something: --psp N, --fsp SERVICE:UNITS or --did-key-file FILE".into(),
+        ));
+    }
+    let selection = wallet.select_handoff(psp, &fsp)?;
+    let mint = if selection.psp.is_empty() {
+        String::new()
+    } else {
+        mint_url(psp_url, "ECASH_PSP_URL", DEFAULT_PSP_URL)?
+    };
+    let made = wallet.export_handoff(&selection, &mint, did.as_ref())?;
+    eprintln!(
+        "handoff {}: {}",
+        made.id,
+        ecash_wallet::handoff::BEARER_WARNING
+    );
+    eprintln!(
+        "{} note(s): {} PSP, {} FSP{}; {} characters ({} bytes). The notes are held back here until you cancel (`handoff cancel {}`) or finish (`handoff done {}`) it.",
+        made.notes,
+        made.psp_units,
+        made.fsp_units,
+        if made.with_did_key {
+            ", and a DID key"
+        } else {
+            ""
+        },
+        made.chars,
+        made.bytes,
+        made.id,
+        made.id
+    );
+    match out {
+        Some(path) => {
+            if let Err(e) = write_private(std::path::Path::new(&path), &made.text) {
+                println!("{}", made.text);
+                return Err(WalletError::Invalid(format!(
+                    "could not write {path}: {e}. The handoff is printed above; it is kept as pending here"
+                )));
+            }
+            eprintln!("written to {path} (private: it holds secrets)");
+        }
+        None => println!("{}", made.text),
+    }
+    Ok(())
+}
+
+/// The handoff text for `handoff import`: `-` is standard input, a path that
+/// exists is read, anything else is the handoff itself.
+fn handoff_text(arg: &str) -> Result<String, WalletError> {
+    if arg == "-" {
+        let mut text = String::new();
+        std::io::stdin().read_to_string(&mut text)?;
+        return Ok(text);
+    }
+    let path = std::path::Path::new(arg);
+    if path.is_file() {
+        return Ok(std::fs::read_to_string(path)?);
+    }
+    Ok(arg.to_string())
+}
+
+fn handoff_import(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
+    let swap = args.switch("--swap");
+    let from = args.flag("--from")?.unwrap_or_default();
+    let did_out = args.flag("--did-key-out")?;
+    let rest = args.rest();
+    let [arg] = rest.as_slice() else {
+        return Err(WalletError::Invalid(
+            "handoff import takes the handoff string, a file, or -".into(),
+        ));
+    };
+    let text = handoff_text(arg)?;
+    // Decide about the DID key before anything is added: a second import is
+    // refused, so the key could not be asked for again.
+    let (payload, _) = ecash_wallet::handoff::inspect(&text)?;
+    if payload.did_key.is_some() {
+        match &did_out {
+            None => {
+                return Err(WalletError::Invalid(
+                    "this handoff carries a DID secret key. Give --did-key-out FILE to save it (it is never printed). Nothing was imported".into(),
+                ));
+            }
+            Some(path) if std::path::Path::new(path).exists() => {
+                return Err(WalletError::Invalid(format!(
+                    "{path} exists; not overwritten. Nothing was imported"
+                )));
+            }
+            Some(_) => {}
+        }
+    }
+    let got = wallet.import_handoff(&text, &from, swap)?;
+    if let (Some(key), Some(path)) = (&got.did_key, &did_out) {
+        write_private(std::path::Path::new(path), &hex::encode(key.to_array()))?;
+        eprintln!("DID secret key written to {path} (private)");
+    }
+    eprintln!("{}", ecash_wallet::handoff::BEARER_WARNING);
+    println!(
+        "imported handoff {}: {} PSP and {} FSP in {} note(s){}",
+        got.id,
+        got.psp_units,
+        got.fsp_units,
+        got.notes.len(),
+        if swap { " (swapping)" } else { "" }
+    );
+    for w in &got.warnings {
+        eprintln!("warning: {w}");
+    }
+    // Read the mints' keys: this checks the notes against live key sets, moves
+    // those on a retired set to the lost record, and fills in what was unknown.
+    for (service, url) in &got.fsp_mints {
+        let known = wallet
+            .fsp_mints()
+            .get(&hex::encode(service.serialize()))
+            .map(|m| m.url.clone());
+        sync_and_log(wallet, *service, &known.unwrap_or_else(|| url.clone()));
+    }
+    if !swap {
+        for base in &got.psp_mints {
+            if let Err(e) = mint_url(Some(base.clone()), "ECASH_PSP_URL", DEFAULT_PSP_URL)
+                .and_then(|b| http::rotation_sync(wallet, ecash_wallet::Kind::Psp, &b))
+                .map(|lines| {
+                    for l in lines {
+                        eprintln!("{base}: {l}");
+                    }
+                })
+            {
+                eprintln!("{base}: key sets not checked, tried again at the next start: {e}");
+            }
+        }
+    }
+    if swap {
+        for line in http::complete_import(wallet, &got) {
+            println!("{line}");
+        }
+    }
+    Ok(())
+}
+
+fn merge_command(wallet: &mut Wallet, args: Args) -> Result<(), WalletError> {
+    let rest = args.rest();
+    let [path] = rest.as_slice() else {
+        return Err(WalletError::Invalid("merge takes one wallet file".into()));
+    };
+    let r = wallet.merge_file(std::path::Path::new(path))?;
+    println!(
+        "merged {path}: {} note(s) added, {} removed because the other copy spent them, {} pending request(s) added, {} ended; version {}",
+        r.notes_added, r.notes_removed, r.requests_added, r.requests_dropped, r.version
+    );
+    println!("Save this wallet back to storage: it is now the current copy.");
     Ok(())
 }
 
@@ -1060,18 +1396,29 @@ fn sync_and_log(wallet: &mut Wallet, service: XOnlyPublicKey, url: &str) {
     }
 }
 
-fn fsp(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
+fn fsp(wallet: &mut Wallet, settings: &Settings, mut args: Args) -> Result<(), WalletError> {
     if args.0.is_empty() {
         return Err(WalletError::Invalid(
             "fsp needs issue, pay or sync. Run with --help".into(),
         ));
     }
     let what = args.0.remove(0);
-    let service = service_key(
-        &args
-            .flag("--service")?
-            .ok_or_else(|| WalletError::Invalid("--service HEX is needed".into()))?,
-    )?;
+    let service = match args.flag("--service")? {
+        Some(text) => service_key(&text)?,
+        None => {
+            let service = settings.storage_service().ok_or_else(|| {
+                WalletError::Invalid(
+                    "--service HEX is needed (storage.wallet is empty, so there is no storage service to default to)"
+                        .into(),
+                )
+            })?;
+            eprintln!(
+                "using the storage service {} (the primary of storage.wallet)",
+                hex::encode(service.serialize())
+            );
+            service
+        }
+    };
     let flag = args.flag("--fsp-url")?;
     let base = fsp_url(wallet, &service, flag)?;
     // Every connection: pending requests, keys, rollover.
@@ -1197,9 +1544,48 @@ fn esp_schedule(wallet: &Wallet, mut args: Args) -> Result<(), WalletError> {
     Ok(())
 }
 
+/// The settings: `config.toml` beside the wallet file (or `--config`, or
+/// `$ECASH_CONFIG`), then the `ECASH_STORAGE_...` variables.
+fn load_settings(wallet: &Path, flag: Option<String>) -> Result<config::Loaded, WalletError> {
+    let dir = wallet.parent().unwrap_or(Path::new(""));
+    config::load(dir, flag.as_deref().map(Path::new), &|name| {
+        env::var(name).ok()
+    })
+    .map_err(|problems| WalletError::Invalid(format!("settings:\n  {}", problems.join("\n  "))))
+}
+
+fn config_command(loaded: &config::Loaded, args: Args) -> Result<(), WalletError> {
+    args.done()?;
+    match &loaded.file {
+        Some(path) => println!(
+            "ecash-wallet settings from {}, then the environment:",
+            path.display()
+        ),
+        None => println!("ecash-wallet settings: no config file, so defaults and the environment:"),
+    }
+    for line in loaded.describe() {
+        println!("{line}");
+    }
+    println!(
+        "storage.wallet: {}",
+        loaded.settings.storage_wallet.describe()
+    );
+    println!("storage.app: {}", loaded.settings.storage_app.describe());
+    match loaded.settings.storage_service() {
+        Some(service) => println!(
+            "storage service for FSP fees: {} (the primary of storage.wallet)",
+            hex::encode(service.serialize())
+        ),
+        None => println!("storage service for FSP fees: none (storage.wallet is empty)"),
+    }
+    println!("Setting only: nothing reads or writes the AIR yet.");
+    Ok(())
+}
+
 fn run(raw: Vec<String>) -> Result<(), WalletError> {
     let mut args = Args(raw);
     let wallet_flag = args.flag("--wallet")?;
+    let config_flag = args.flag("--config")?;
     let _ = NETWORK.set(take_network(&mut args)?);
     if args.0.is_empty() || args.0.iter().any(|a| a == "--help" || a == "-h") {
         println!("{USAGE}");
@@ -1209,11 +1595,24 @@ fn run(raw: Vec<String>) -> Result<(), WalletError> {
     if command == "migrate" {
         return migrate_wallet();
     }
-    let mut wallet = Wallet::open(&wallet_path(wallet_flag)?)?;
+    let path = wallet_path(wallet_flag)?;
+    let loaded = load_settings(&path, config_flag)?;
+    if command == "config" {
+        return config_command(&loaded, args);
+    }
+    let settings = loaded.settings;
+    let mut wallet = Wallet::open(&path)?;
+    // A wallet file from before an FSP note's service was kept: fill it in from
+    // the mints seen, and leave the rest marked unknown.
+    match wallet.fill_fsp_services() {
+        Ok(0) => {}
+        Ok(n) => eprintln!("the service of {n} FSP note(s) was filled in from the mints seen"),
+        Err(e) => eprintln!("FSP services not filled in: {e}"),
+    }
     startup_fsp_sync(&mut wallet);
     startup_rotation_sync(&mut wallet);
     match command.as_str() {
-        "fsp" => fsp(&mut wallet, args),
+        "fsp" => fsp(&mut wallet, &settings, args),
         "fsp-window" => fsp_window(&mut wallet, args),
         "esp-schedule" => esp_schedule(&wallet, args),
         "buy-psp" => buy_psp(&mut wallet, args),
@@ -1223,10 +1622,12 @@ fn run(raw: Vec<String>) -> Result<(), WalletError> {
         "receive" => receive(&mut wallet, args),
         "transfer" => transfer(&mut wallet, args),
         "redeem" => redeem(&mut wallet, args),
-        "balance" => balance(&wallet, args),
+        "balance" => balance(&wallet, &settings, args),
         "send-psp" => send_psp(&mut wallet, args),
         "receive-psp" => receive_psp(&mut wallet, args),
         "sent" => sent(&mut wallet, args),
+        "handoff" => handoff(&mut wallet, args),
+        "merge" => merge_command(&mut wallet, args),
         other => Err(WalletError::Invalid(format!(
             "unknown command `{other}`. Run with --help"
         ))),

@@ -11,7 +11,7 @@
 //! factors are safely on disk. A missing file is an empty wallet. A file that
 //! cannot be read is an error and is never replaced.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -37,6 +37,9 @@ pub enum Kind {
     Fsp,
 }
 
+/// What an FSP note's service is called when it is not known.
+pub const UNKNOWN_SERVICE: &str = "unknown";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredTerms {
     pub service: XOnlyPublicKey,
@@ -58,6 +61,19 @@ impl StoredNote {
     /// The note's id: its nonce, as hex.
     pub fn id(&self) -> String {
         hex::encode(self.note.nonce.0.serialize())
+    }
+
+    /// The service an FSP note belongs to: the service whose fsp-mint issued it.
+    /// The wallet keeps it in `terms.service` (with day 0, which FSP does not
+    /// use), filled in from the mint the note came from. It is not part of what
+    /// the mint signs. `None` for a note of another kind, and for an FSP note
+    /// whose service is not known; such a note is not spent until it is.
+    pub fn fsp_service(&self) -> Option<XOnlyPublicKey> {
+        if self.kind == Kind::Fsp {
+            self.terms.map(|t| t.service)
+        } else {
+            None
+        }
     }
 }
 
@@ -201,6 +217,34 @@ pub struct WalletData {
     /// PSP and ESP notes whose key set the mint deleted. Not in any total.
     #[serde(default)]
     pub lost: Vec<StoredNote>,
+    /// Counts the writes. It goes up by one every time the wallet saves, so of
+    /// two copies of one wallet the one with the higher number has been written
+    /// to more. [`crate::merge`] uses it for the merged copy's number only;
+    /// what is kept comes from the ledgers below, not from this.
+    #[serde(default)]
+    pub version: u64,
+    /// For each note that has left `notes`, how many times it has (spent,
+    /// swapped away, handed off, lost, ...). Kept so that a copy of the wallet
+    /// retrieved from storage cannot bring back a note this copy has spent. A
+    /// note that comes back (a cancelled handoff) is counted in `returned`.
+    /// Maintained by `update`; nothing else writes it. About 70 bytes a note.
+    #[serde(default)]
+    pub departed: BTreeMap<String, u32>,
+    /// For each note that has come back into `notes` after leaving it, the
+    /// number of times it had left when it came back. A note is spent, as far as
+    /// the wallet knows, when `departed` is above `returned`.
+    #[serde(default)]
+    pub returned: BTreeMap<String, u32>,
+    /// Ids of requests that have ended (finished, cancelled or refused), so that
+    /// a copy retrieved from storage cannot bring them back as pending.
+    #[serde(default)]
+    pub finished: BTreeSet<String>,
+    /// Notes this wallet has handed off to another wallet (see `handoff.rs`).
+    #[serde(default)]
+    pub handoffs_out: Vec<crate::handoff::OutgoingHandoff>,
+    /// Handoffs this wallet has imported, so that none is imported twice.
+    #[serde(default)]
+    pub handoffs_in: Vec<crate::handoff::IncomingHandoff>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -208,6 +252,9 @@ pub struct Balance {
     pub psp: u128,
     pub esp: u128,
     pub fsp: u128,
+    /// FSP units by service (hex), the service each note belongs to. Notes
+    /// whose service is not known are under [`UNKNOWN_SERVICE`].
+    pub fsp_by_service: BTreeMap<String, u128>,
     /// ESP units by service (hex) and redeemable-after day.
     pub esp_by_terms: BTreeMap<(String, u64), u128>,
     pub notes: usize,
@@ -339,9 +386,31 @@ impl Wallet {
     ) -> Result<T, WalletError> {
         let mut next = self.data.clone();
         let out = change(&mut next)?;
+        track(&self.data, &mut next);
+        next.version = self.data.version.max(next.version) + 1;
         write_atomic(&self.path, &next)?;
         self.data = next;
         Ok(out)
+    }
+
+    /// Replace the whole wallet with `next` and save it, as the merge does. The
+    /// ledgers are not touched: `next` already holds the merged ones.
+    pub(crate) fn replace(&mut self, mut next: WalletData) -> Result<(), WalletError> {
+        next.version = self.data.version.max(next.version) + 1;
+        write_atomic(&self.path, &next)?;
+        self.data = next;
+        Ok(())
+    }
+
+    /// A copy of everything the wallet holds, as it would be saved. For handing
+    /// to storage; `merge_from` takes one back.
+    pub fn snapshot(&self) -> WalletData {
+        self.data.clone()
+    }
+
+    /// The write counter (see [`WalletData::version`]).
+    pub fn version(&self) -> u64 {
+        self.data.version
     }
 
     /// The reply DID the command line uses by default: 33 bytes, made once and
@@ -369,7 +438,14 @@ impl Wallet {
             let units = u128::from(n.amount);
             match n.kind {
                 Kind::Psp => b.psp += units,
-                Kind::Fsp => b.fsp += units,
+                Kind::Fsp => {
+                    b.fsp += units;
+                    let service = n
+                        .fsp_service()
+                        .map(|k| hex::encode(k.serialize()))
+                        .unwrap_or_else(|| UNKNOWN_SERVICE.to_string());
+                    *b.fsp_by_service.entry(service).or_default() += units;
+                }
                 Kind::Esp => {
                     b.esp += units;
                     if let Some(t) = &n.terms {
@@ -397,6 +473,55 @@ impl Wallet {
         }
         b
     }
+}
+
+/// The ids of the requests a wallet is waiting on, of every kind.
+fn pending_ids(d: &WalletData) -> BTreeSet<String> {
+    let mut ids = BTreeSet::new();
+    ids.extend(d.pending_purchases.iter().map(|p| p.id.clone()));
+    ids.extend(d.pending_exchanges.iter().map(|p| p.id.clone()));
+    ids.extend(d.pending_transfers.iter().map(|p| p.id.clone()));
+    ids.extend(d.pending_redemptions.iter().map(|p| p.id.clone()));
+    ids.extend(d.pending_fsp.iter().map(|p| p.id.clone()));
+    ids.extend(d.pending_rollovers.iter().map(|p| p.id.clone()));
+    ids.extend(
+        d.handoffs_out
+            .iter()
+            .filter(|h| h.state == crate::handoff::HandoffState::Pending)
+            .map(|h| h.id.clone()),
+    );
+    ids
+}
+
+/// Keep the ledgers of a change that `update` is about to save: a note that is
+/// no longer in `notes` has departed, a note that is back has returned, a
+/// request that is no longer pending has finished and one that is again is not.
+fn track(before: &WalletData, after: &mut WalletData) {
+    let was: BTreeSet<String> = before.notes.iter().map(StoredNote::id).collect();
+    let is: BTreeSet<String> = after.notes.iter().map(StoredNote::id).collect();
+    for id in was.difference(&is) {
+        *after.departed.entry(id.clone()).or_default() += 1;
+    }
+    for id in is.difference(&was) {
+        if let Some(&left) = after.departed.get(id) {
+            if after.returned.get(id).copied().unwrap_or(0) < left {
+                after.returned.insert(id.clone(), left);
+            }
+        }
+    }
+    let was = pending_ids(before);
+    let is = pending_ids(after);
+    for id in was.difference(&is) {
+        after.finished.insert(id.clone());
+    }
+    for id in is.difference(&was) {
+        after.finished.remove(id);
+    }
+}
+
+/// Whether the ledgers say the note has left the wallet and not come back.
+pub(crate) fn has_departed(d: &WalletData, id: &str) -> bool {
+    d.departed.get(id).copied().unwrap_or(0) > d.returned.get(id).copied().unwrap_or(0)
 }
 
 pub fn parse_did(text: &str) -> Result<[u8; 33], WalletError> {

@@ -6,6 +6,9 @@
 //! pays.
 //!
 //! - [`blind`]: blinding outputs and unblinding signatures.
+//! - [`config`]: the wallet's settings, so far the storage policy (an ordered
+//!   list of service IDs for the wallet's data and the app's), and the storage
+//!   service that FSP fees are paid to.
 //! - [`store`]: the note file, which holds each note with its spend key, amount
 //!   and terms, and the requests waiting for a reply.
 //! - [`psp`]: buying PSP (`build_psp_payload`, `claim_psp`).
@@ -17,17 +20,24 @@
 //! - [`redeem`]: redeeming ESP with the Issuer.
 //! - [`fsp`]: FSP from a service's fsp-mint: issue from ESP, spend with change,
 //!   automatic rollover to the current keyset, and the ESP schedule.
+//! - [`handoff`]: moving PSP and FSP notes, and a DID key, from one wallet to
+//!   another without the AIR, as a string or a QR code.
+//! - [`merge`]: reconciling a copy of the wallet retrieved from storage with
+//!   the local one.
 //! - [`rotate`]: the automatic, staggered rollover of PSP and ESP (and the
 //!   swap schedule FSP shares) when a mint rotates its keys.
 //! - [`http`] (feature `http`): the calls to the mints.
 
 pub mod blind;
+pub mod config;
 pub mod date;
 pub mod error;
 pub mod esp;
 pub mod fsp;
+pub mod handoff;
 #[cfg(feature = "http")]
 pub mod http;
+pub mod merge;
 pub mod psp;
 pub mod redeem;
 pub mod rotate;

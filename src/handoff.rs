@@ -12,7 +12,7 @@
 //! | carries | PSP notes only | FSP notes and the DID secret key |
 //! | encrypted | always, to the recipient's DID public key | never (it carries the key it would be encrypted to) |
 //! | swapped on import | always, at the PSP mint, for new notes | never (the owner does not change) |
-//! | string starts | `SPHP1:` | `SPHF1:` |
+//! | string starts | `SPHP2:` | `SPHF2:` |
 //!
 //! The command line is `handoff export-psp`, `handoff export-fsp`, `handoff
 //! import`, `handoff check`, `handoff reclaim`, `handoff cancel`, `handoff done`
@@ -131,12 +131,12 @@
 //! The old combined `SPH1:` handoff of wallet 0.4.0 is refused with a message.
 //!
 //! ```text
-//! PSP:  SPHP1:  base44( sealed ‖ check )
+//! PSP:  SPHP2:  base44( sealed ‖ check )
 //!   sealed   the body below, sealed to the recipient's DID key (80 bytes longer)
 //!   check    4  the first 4 bytes of SHA-256 of the sealed bytes
 //!
 //!   body:
-//!   version      1   1
+//!   version      1   2
 //!   kind         1   0 (PSP)
 //!   mint         2+n the PSP mint's URL, a length and UTF-8
 //!   keysets      1+8k how many key sets the notes use, and each (8 bytes)
@@ -148,15 +148,15 @@
 //!     sig       33   the mint's signature (compressed)
 //!     secret    32   the spend secret
 //!
-//! FSP:  SPHF1:  base44( body ‖ check )
+//! FSP:  SPHF2:  base44( body ‖ check )
 //!   check    4  the first 4 bytes of SHA-256 of the body
 //!
 //!   body:
-//!   version      1   1
+//!   version      1   2
 //!   kind         1   1 (FSP)
 //!   groups       1   how many groups (1 to 255)
 //!     per group:
-//!     service   32   the service's x-only key
+//!     service   33   the service's AIR DID (compressed key)
 //!     mint, keysets, notes   as for PSP
 //!   did key     32   the DID secret key
 //! ```
@@ -165,7 +165,7 @@
 //! first 16 bytes of SHA-256 of the body (not of the sealed bytes, which change
 //! every time they are sealed), in hex, so the sender and the receiver both
 //! have it. A PSP handoff of N notes of one key set with a 22-character URL is
-//! about 188 + 150N characters, an FSP handoff of one service about 165 + 150N.
+//! about 188 + 150N characters, an FSP handoff of one service about 166 + 150N.
 //! A QR code holds at most 4,296 alphanumeric characters (error correction L,
 //! version 40) or 3,391 (M), so one code holds about 27 notes at L or 21 at M. A
 //! funding handoff of $100 is 3 PSP notes (64, 32 and 4 PSP), about 640
@@ -175,9 +175,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use mint_types::{Nonce, Note};
-use secp256k1::{Keypair, PublicKey, SECP256K1, SecretKey, XOnlyPublicKey};
+use secp256k1::{Keypair, PublicKey, SECP256K1, SecretKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use sp_wire::ServiceDid;
 use sp_wire::seal::{PublicKey as DidPublicKey, SealError, SecretKey as DidSecretKey};
 
 use crate::blind::PendingOutput;
@@ -192,13 +193,13 @@ pub const PSP_WARNING: &str = "This PSP handoff holds the secret keys that spend
 pub const FSP_WARNING: &str = "This FSP handoff holds the secret keys that spend its notes AND the DID secret key itself, and it is not encrypted. Anyone who sees it can spend the notes and act as this DID. Hand it over in person or by QR code between your own devices, never post or send it over a network, and delete it once it is imported.";
 
 /// A PSP handoff string starts with this. The digit is the format version.
-pub const PSP_PREFIX: &str = "SPHP1:";
+pub const PSP_PREFIX: &str = "SPHP2:";
 /// An FSP handoff string starts with this. The digit is the format version.
-pub const FSP_PREFIX: &str = "SPHF1:";
+pub const FSP_PREFIX: &str = "SPHF2:";
 /// The combined handoff of wallet 0.4.0. It is refused.
 pub const OLD_PREFIX: &str = "SPH1:";
 /// The format version this wallet reads and writes, for both kinds.
-pub const FORMAT_VERSION: u8 = 1;
+pub const FORMAT_VERSION: u8 = 2;
 /// Bytes of one note in the payload.
 pub const NOTE_BYTES: usize = 100;
 /// Bytes of a DID secret key in the payload.
@@ -316,7 +317,7 @@ pub struct PspPayload {
 /// FSP notes of one service and its mint.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FspGroup {
-    pub service: XOnlyPublicKey,
+    pub service: ServiceDid,
     pub mint: String,
     pub notes: Vec<PayloadNote>,
 }
@@ -545,9 +546,9 @@ fn classify(clean: &str) -> Result<(HandoffKind, usize), WalletError> {
     if !b[4].is_ascii_digit() || b.get(5) != Some(&b':') {
         return Err(not_one());
     }
-    if b[4] != b'1' {
+    if b[4] != b'0' + FORMAT_VERSION {
         return Err(WalletError::Invalid(format!(
-            "this handoff is version {}, and this wallet reads version 1 only. Update the older of the two wallets",
+            "this handoff is version {}, and this wallet reads version {FORMAT_VERSION} only. Update the older of the two wallets",
             b[4] as char
         )));
     }
@@ -720,8 +721,8 @@ fn parse_fsp_body(body: &[u8]) -> Result<FspPayload, WalletError> {
     let mut total = 0usize;
     let mut groups = Vec::new();
     for _ in 0..group_count {
-        let service = XOnlyPublicKey::from_slice(c.take(32)?)
-            .map_err(|_| WalletError::Invalid("a service key in it is not valid".into()))?;
+        let service = ServiceDid::from_slice(c.take(33)?)
+            .map_err(|_| WalletError::Invalid("a service ID in it is not valid".into()))?;
         let (mint, notes) = read_notes(&mut c, &mut seen, &mut total)?;
         groups.push(FspGroup {
             service,
@@ -860,7 +861,7 @@ pub struct Imported {
     /// The PSP mint and the FSP (service, mint) pairs the notes are for, so a
     /// caller can read their keys.
     pub psp_mints: Vec<String>,
-    pub fsp_mints: Vec<(XOnlyPublicKey, String)>,
+    pub fsp_mints: Vec<(ServiceDid, String)>,
     /// Stored PSP swaps to send (ids of pending rollovers). A PSP handoff has
     /// one; an FSP handoff never does.
     pub psp_swaps: Vec<String>,
@@ -905,7 +906,7 @@ impl Wallet {
     /// service. Largest notes first.
     pub fn select_fsp_handoff(
         &self,
-        fsp: &[(XOnlyPublicKey, u128)],
+        fsp: &[(ServiceDid, u128)],
     ) -> Result<Vec<String>, WalletError> {
         let mut ids = Vec::new();
         for (service, units) in fsp {
@@ -1051,7 +1052,7 @@ impl Wallet {
         did_key: &DidSecretKey,
     ) -> Result<HandoffExport, WalletError> {
         let picked = self.pick_notes(ids, Kind::Fsp)?;
-        let mut by_service: BTreeMap<[u8; 32], Vec<&StoredNote>> = BTreeMap::new();
+        let mut by_service: BTreeMap<[u8; 33], Vec<&StoredNote>> = BTreeMap::new();
         for n in &picked {
             let service = n.fsp_service().ok_or_else(|| {
                 WalletError::Invalid(format!(
@@ -1074,7 +1075,7 @@ impl Wallet {
                     ))
                 })?;
             groups.push(FspGroup {
-                service: XOnlyPublicKey::from_slice(service).expect("it came from a key"),
+                service: ServiceDid::from_slice(service).expect("it came from a service ID"),
                 mint,
                 notes: notes
                     .iter()
@@ -1806,7 +1807,7 @@ pub(crate) fn swap_keyset(
 /// Notes of one mint (and, for FSP, one service), as the import works on them.
 struct Group {
     kind: Kind,
-    service: Option<XOnlyPublicKey>,
+    service: Option<ServiceDid>,
     mint: String,
     notes: Vec<PayloadNote>,
 }
@@ -1836,13 +1837,13 @@ mod tests {
     const PSP_URL: &str = "http://127.0.0.1:3000";
     const FSP_URL: &str = "http://127.0.0.1:3200";
 
-    fn service(n: u8) -> XOnlyPublicKey {
+    fn service(n: u8) -> ServiceDid {
         let sk = SecretKey::from_slice(&[n; 32]).unwrap();
-        sk.public_key(SECP256K1).x_only_public_key().0
+        ServiceDid::from(sk.public_key(SECP256K1))
     }
 
     /// A note with a real key pair, so its secret matches its nonce.
-    fn note(kind: Kind, amount: u64, service: Option<XOnlyPublicKey>) -> StoredNote {
+    fn note(kind: Kind, amount: u64, service: Option<ServiceDid>) -> StoredNote {
         let out = PendingOutput::new(amount);
         let sk = SecretKey::new(&mut rand::rngs::OsRng);
         let sig = bdhke::sign_message(&sk, &out.blind_nonce.0);
@@ -1913,7 +1914,7 @@ mod tests {
     }
 
     /// An FSP handoff of the given units per service, with `did()`.
-    fn fsp_out(a: &mut Wallet, fsp: &[(XOnlyPublicKey, u128)]) -> HandoffExport {
+    fn fsp_out(a: &mut Wallet, fsp: &[(ServiceDid, u128)]) -> HandoffExport {
         let ids = a.select_fsp_handoff(fsp).unwrap();
         a.export_fsp_handoff(&ids, &did()).unwrap()
     }
@@ -1961,7 +1962,10 @@ mod tests {
         assert_ne!(PSP_PREFIX, OLD_PREFIX);
         assert_ne!(FSP_PREFIX, OLD_PREFIX);
         for p in [PSP_PREFIX, FSP_PREFIX] {
-            assert!(p.starts_with("SPH") && p.ends_with("1:"), "{p}");
+            assert!(
+                p.starts_with("SPH") && p.ends_with(&format!("{FORMAT_VERSION}:")),
+                "{p}"
+            );
             assert!(p.bytes().all(|c| ALPHABET.contains(&c)));
         }
     }
@@ -2439,7 +2443,7 @@ mod tests {
         // the old combined handoff
         let e = kind_of("SPH1:ABCDEF").unwrap_err().to_string();
         assert!(
-            e.contains("old combined handoff") && e.contains("SPHP1:") && e.contains("SPHF1:"),
+            e.contains("old combined handoff") && e.contains("SPHP2:") && e.contains("SPHF2:"),
             "{e}"
         );
         let mut b = Wallet::open(&dir.join("b.json")).unwrap();
@@ -2448,11 +2452,17 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(e.contains("old combined handoff"), "{e}");
-        // another version of either kind, and a digit this wallet does not know
-        for t in ["SPHP2:AB", "SPHF2:AB"] {
+        // another version of either kind (1 is the one before service IDs were
+        // DIDs), and a digit this wallet does not know
+        for (t, n) in [
+            ("SPHP1:AB", 1),
+            ("SPHF1:AB", 1),
+            ("SPHP3:AB", 3),
+            ("SPHF3:AB", 3),
+        ] {
             let e = kind_of(t).unwrap_err().to_string();
             assert!(
-                e.contains("version 2") && e.contains("version 1 only"),
+                e.contains(&format!("version {n}")) && e.contains("version 2 only"),
                 "{e}"
             );
         }
@@ -2460,7 +2470,7 @@ mod tests {
         assert!(e.contains("does not know"), "{e}");
         // not a handoff
         for junk in [
-            "", "hello", "SPH", "SPHP", "SPHP1", "SPHX1:AB", "SPHPA:AB", "psp1abcd", "SPHÉ1:A",
+            "", "hello", "SPH", "SPHP", "SPHP2", "SPHX1:AB", "SPHPA:AB", "psp1abcd", "SPHÉ1:A",
         ] {
             assert!(kind_of(junk).is_err(), "{junk}");
         }
@@ -2488,7 +2498,7 @@ mod tests {
         let fsp = fsp_out(&mut a, &[(service(1), 16)]);
         let url = format!("{FSP_URL}0");
         let raw =
-            3 + (32 + 2 + url.len() + 1 + 8 + 2 + 2 * NOTE_BYTES) + DID_KEY_BYTES + CHECK_BYTES;
+            3 + (33 + 2 + url.len() + 1 + 8 + 2 + 2 * NOTE_BYTES) + DID_KEY_BYTES + CHECK_BYTES;
         assert_eq!(
             base44_decode(&fsp.text[FSP_PREFIX.len()..]).unwrap().len(),
             raw
@@ -2582,11 +2592,11 @@ mod tests {
             "",
             "hello",
             "SPH",
-            "SPHP1",
-            "SPHP1:",
-            "SPHP1:!!!",
-            "SPHF1:",
-            "SPHF1:!!!",
+            "SPHP2",
+            "SPHP2:",
+            "SPHP2:!!!",
+            "SPHF2:",
+            "SPHF2:!!!",
             "psp1abcd",
         ] {
             assert!(b.import_handoff(junk, Some(&did()), "").is_err(), "{junk}");
@@ -2621,13 +2631,16 @@ mod tests {
             did_key: did(),
         };
         let mut body = payload.body().unwrap();
-        body[0] = 2;
+        body[0] = FORMAT_VERSION + 1;
         let mut b = Wallet::open(&dir.join("b.json")).unwrap();
         let e = b
             .import_fsp_handoff(&frame(FSP_PREFIX, &body), "")
             .unwrap_err()
             .to_string();
-        assert!(e.contains("version 2"), "{e}");
+        assert!(
+            e.contains(&format!("version {}", FORMAT_VERSION + 1)),
+            "{e}"
+        );
         // the same inside a sealed PSP handoff
         let mut body = PspPayload {
             mint: PSP_URL.into(),
@@ -2641,13 +2654,16 @@ mod tests {
         }
         .body()
         .unwrap();
-        body[0] = 2;
+        body[0] = FORMAT_VERSION + 1;
         let sealed = sp_wire::seal::encrypt(&did().public_key(), &body).unwrap();
         let e = b
             .import_psp_handoff(&frame(PSP_PREFIX, &sealed), &did(), "")
             .unwrap_err()
             .to_string();
-        assert!(e.contains("version 2"), "{e}");
+        assert!(
+            e.contains(&format!("version {}", FORMAT_VERSION + 1)),
+            "{e}"
+        );
         assert!(b.notes().is_empty());
         fs::remove_dir_all(&dir).unwrap();
     }

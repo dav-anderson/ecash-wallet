@@ -17,8 +17,9 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use mint_types::Note;
-use secp256k1::{SecretKey, XOnlyPublicKey};
+use secp256k1::SecretKey;
 use serde::{Deserialize, Serialize};
+use sp_wire::ServiceDid;
 use sp_wire::esp::exchange::ExchangeRequest;
 use sp_wire::esp::transfer::TransferRequest;
 use sp_wire::seal::SecretKey as DidSecretKey;
@@ -42,7 +43,7 @@ pub const UNKNOWN_SERVICE: &str = "unknown";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredTerms {
-    pub service: XOnlyPublicKey,
+    pub service: ServiceDid,
     pub redeemable_after_day: u64,
 }
 
@@ -68,7 +69,7 @@ impl StoredNote {
     /// use), filled in from the mint the note came from. It is not part of what
     /// the mint signs. `None` for a note of another kind, and for an FSP note
     /// whose service is not known; such a note is not spent until it is.
-    pub fn fsp_service(&self) -> Option<XOnlyPublicKey> {
+    pub fn fsp_service(&self) -> Option<ServiceDid> {
         if self.kind == Kind::Fsp {
             self.terms.map(|t| t.service)
         } else {
@@ -93,7 +94,7 @@ pub struct PendingPurchase {
 pub struct PendingExchange {
     /// The request hash, as the mint stores it.
     pub id: String,
-    pub service: XOnlyPublicKey,
+    pub service: ServiceDid,
     pub input_ids: Vec<String>,
     pub outputs: Vec<PendingOutput>,
     /// Kept so that a retry sends exactly the same request.
@@ -109,7 +110,7 @@ pub struct PendingExchange {
 pub struct PendingTransfer {
     /// The request hash, as the mint stores it.
     pub id: String,
-    pub service: XOnlyPublicKey,
+    pub service: ServiceDid,
     pub input_ids: Vec<String>,
     pub outputs: Vec<PendingOutput>,
     /// Kept so that a retry sends exactly the same request.
@@ -135,7 +136,7 @@ pub struct HandedNote {
 /// deferred: for now the command line writes this to a file.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Handover {
-    pub service: XOnlyPublicKey,
+    pub service: ServiceDid,
     pub redeemable_after_day: u64,
     pub notes: Vec<HandedNote>,
 }
@@ -710,11 +711,9 @@ mod tests {
     fn the_balance_adds_up_by_kind_and_by_esp_terms() {
         let dir = scratch("balance");
         let mut w = Wallet::open(&dir.join("wallet.json")).unwrap();
-        let service = XOnlyPublicKey::from_slice(
-            &hex::decode("79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
-                .unwrap(),
-        )
-        .unwrap();
+        let service =
+            ServiceDid::parse("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+                .unwrap();
         let mut esp = some_note(Kind::Esp, 3_000_000_000_000);
         esp.terms = Some(StoredTerms {
             service,

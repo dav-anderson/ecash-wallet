@@ -24,7 +24,8 @@ use mint_types::{Amount, MintInput, Nonce};
 use psp_mint::records::Records;
 use psp_mint::scan::Received;
 use psp_mint::settle::{self, Settlement};
-use secp256k1::{Keypair, SECP256K1, SecretKey, XOnlyPublicKey};
+use secp256k1::{Keypair, SECP256K1, SecretKey};
+use sp_wire::ServiceDid;
 use sp_wire::seal::SecretKey as DidSecretKey;
 
 const G_X: &str = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
@@ -34,8 +35,8 @@ const ONE_PSP: u64 = 100_000_000_000;
 /// 5,000 sats is exactly 5 PSP.
 const BTC_10K: u64 = 1_000_000;
 
-fn service() -> XOnlyPublicKey {
-    XOnlyPublicKey::from_slice(&hex::decode(G_X).unwrap()).unwrap()
+fn service() -> ServiceDid {
+    ServiceDid::parse(&format!("02{G_X}")).unwrap()
 }
 
 /// The service's DID secret key. Secret key 1 is the generator point, whose
@@ -201,9 +202,7 @@ fn exchange_hand_over_and_transfer_end_to_end() {
     app.note_esp_keysets("esp", &esp_keyset, None).unwrap();
 
     assert_eq!(
-        Keypair::from_secret_key(SECP256K1, &service_secret())
-            .x_only_public_key()
-            .0,
+        ServiceDid::from(Keypair::from_secret_key(SECP256K1, &service_secret()).public_key()),
         service()
     );
 

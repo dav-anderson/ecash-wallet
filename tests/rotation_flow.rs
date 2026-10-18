@@ -14,7 +14,8 @@ use esp_mint::terms::Terms;
 use mint_server::state::AppState;
 use mint_types::{Amount, BlindNonce, MintInput, MintOutput, Nonce, Note};
 use rand::rngs::OsRng;
-use secp256k1::{Keypair, SECP256K1, XOnlyPublicKey};
+use secp256k1::{Keypair, SECP256K1};
+use sp_wire::ServiceDid;
 use tokio::runtime::Runtime;
 
 const T: u64 = 1_800_000_000;
@@ -328,8 +329,8 @@ impl Psp for NoPsp {
 fn service_kp() -> Keypair {
     Keypair::from_seckey_slice(SECP256K1, &[7u8; 32]).unwrap()
 }
-fn service() -> XOnlyPublicKey {
-    service_kp().x_only_public_key().0
+fn service() -> ServiceDid {
+    ServiceDid::from(service_kp().public_key())
 }
 
 /// A rotating ESP mint (1-hour periods from `T`) and three notes of its

@@ -2,6 +2,18 @@
 
 ecash-wallet 0.1.2 builds on `sp-wire` 0.2.0 (wire version 2) and the 0.1.2 mints. 0.1.1 moved the types to `sp-wire`, added the wire-version check and removed the mint crates from the library. 0.1.0 is the first release. Nothing was recorded per version before this file; the section below is everything the README said about what was built and when.
 
+## 0.6.0 (unreleased)
+
+**Wire version 3: the service ID is the 33-byte AIR DID.** Builds on `sp-wire` 0.5.0 (`WIRE_VERSION` 3). `Cargo.toml` still names `sp-wire` and the three mints (dev-dependencies) by their old tags, which move when the new releases are tagged; until then the integration tests run against local copies (`scripts/test-wallet-against-local-mints.sh` in sandbox-mint). No migration and no dual format.
+
+- **A service is `sp_wire::ServiceDid` everywhere:** `--service` takes the 66-character DID (the old 64-character form is refused with a message that says to use the DID); the stored terms, the pending exchange, transfer and redemption, the hand-over, the FSP mint map and the balance's per-service totals hold the DID (the map keys are its 66 hex characters). `Settings::storage_service()` returns a `ServiceDid`.
+- **`--service-key` is still the service's secret key, and its DID is derived from it** (the compressed public key, parity byte included), so it is the DID `fsp-mint service-key` prints.
+- **Sizes:** a redemption is `120 + 187 per input + memo + 82 per output` (was `119 / 186 / 81`), and the wallet's check of `GET /fees` compares with the new constants.
+- **Handoff format 2.** An FSP handoff names its service by 33 bytes, so the format version is 2 for both kinds: the strings start `SPHP2:` and `SPHF2:`. A version 1 string (`SPHP1:`, `SPHF1:`) is refused with the existing "this handoff is version 1, and this wallet reads version 2 only" message. The PSP handoff's bytes did not change, but it shares the version with the FSP one, so both moved together.
+- **A wallet file from 0.5.0 that holds a service does not load** (stored terms, pending requests and the FSP mint map name the service by 64 hex characters). There is nothing to migrate: the family has no live notes.
+- Tests: fixtures use the DID `02` + the generator's x coordinate; the config test checks that the parity byte is part of the ID (`03` is not `02`); the handoff tests check the version 1 and 3 refusals; the redemption tests use the new sizes (the memo that makes a one-note request exactly 512 bytes is 205 bytes, was 207).
+- REGTEST.md: the service is the 66-character DID. Its recorded outputs are from wire version 2 and are not re-run; a note at the start says what moves.
+
 ## Unreleased
 
 - AIR 2.1.0 (commit `741b1cf`) comes with the next sp-wire (0.4.1): `PublicKey` and `SecretKey` are the same types under the same names, the sealed bytes and the `mint_did_key.json` format are unchanged, and `WIRE_VERSION` stays 2. the wallet's code is not changed for it. The wallet's `sp_wire::seal` uses are unchanged.

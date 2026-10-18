@@ -27,8 +27,9 @@
 use std::collections::{BTreeSet, HashSet};
 
 use mint_types::{Amount, MintInput};
-use secp256k1::{Keypair, SECP256K1, SecretKey, XOnlyPublicKey};
+use secp256k1::{Keypair, SECP256K1, SecretKey};
 
+use sp_wire::ServiceDid;
 use sp_wire::esp::transfer::{self, TransferRequest, TransferResponse};
 
 use crate::blind::PendingOutput;
@@ -110,7 +111,7 @@ pub(crate) fn pick_exact(amounts: &[u64], target: u128) -> Option<Vec<usize>> {
 }
 
 /// Whether `note` is ESP for `service` and free to use.
-fn is_free_esp_for(note: &StoredNote, service: &XOnlyPublicKey) -> bool {
+fn is_free_esp_for(note: &StoredNote, service: &ServiceDid) -> bool {
     note.kind == Kind::Esp
         && note.reserved_by.is_none()
         && note.terms.as_ref().is_some_and(|t| t.service == *service)
@@ -155,7 +156,7 @@ impl Wallet {
     /// call fails and the wallet is unchanged.
     pub fn hand_over_esp(
         &mut self,
-        service: XOnlyPublicKey,
+        service: ServiceDid,
         esp_units: u128,
         day: Option<u64>,
     ) -> Result<Handover, WalletError> {
@@ -295,7 +296,8 @@ impl Wallet {
         esp_amounts: Option<&[u64]>,
     ) -> Result<TransferBuild, WalletError> {
         let service_keypair = Keypair::from_secret_key(SECP256K1, service_secret);
-        let service = service_keypair.x_only_public_key().0;
+        // The service's ID is its DID: the compressed key, parity byte included.
+        let service = ServiceDid::from(service_keypair.public_key());
 
         let free: Vec<&StoredNote> = self
             .notes()
@@ -539,17 +541,13 @@ mod tests {
         SecretKey::from_slice(&bytes).unwrap()
     }
 
-    /// The service with secret key 1 (the generator, x-only `79be...`).
-    fn service() -> XOnlyPublicKey {
-        Keypair::from_secret_key(SECP256K1, &key(1))
-            .x_only_public_key()
-            .0
+    /// The service with secret key 1 (the generator: the DID `0279be...`).
+    fn service() -> ServiceDid {
+        ServiceDid::from(Keypair::from_secret_key(SECP256K1, &key(1)).public_key())
     }
 
-    fn other_service() -> XOnlyPublicKey {
-        Keypair::from_secret_key(SECP256K1, &key(2))
-            .x_only_public_key()
-            .0
+    fn other_service() -> ServiceDid {
+        ServiceDid::from(Keypair::from_secret_key(SECP256K1, &key(2)).public_key())
     }
 
     fn scratch(name: &str) -> PathBuf {
@@ -568,7 +566,7 @@ mod tests {
 
     /// A stored ESP note. The mint's signature is made up, so only selection,
     /// requests and bookkeeping are checked here.
-    fn esp_note(amount: u64, service: XOnlyPublicKey, day: u64) -> StoredNote {
+    fn esp_note(amount: u64, service: ServiceDid, day: u64) -> StoredNote {
         let sk = SecretKey::new(&mut rand::rngs::OsRng);
         let out = PendingOutput::new(amount);
         let sig = bdhke::sign_message(&sk, &out.blind_nonce.0);
@@ -846,7 +844,7 @@ mod tests {
 
         let digest = request.digest();
         SECP256K1
-            .verify_schnorr(&request.service_signature, &digest, &service())
+            .verify_schnorr(&request.service_signature, &digest, &service().x_only())
             .unwrap();
         for input in &request.inputs {
             SECP256K1

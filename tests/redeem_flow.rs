@@ -24,8 +24,9 @@ use esp_mint::server::{self, EspState};
 use esp_mint::terms::Terms;
 use mint_types::{Amount, BlindNonce, MintInput, MintOutput, Nonce, Note};
 use rand::rngs::OsRng;
-use secp256k1::{Keypair, SECP256K1, SecretKey, XOnlyPublicKey};
+use secp256k1::{Keypair, SECP256K1, SecretKey};
 use serde_json::{Value, json};
+use sp_wire::ServiceDid;
 use tokio::runtime::Runtime;
 
 /// A test amount, a power of two (about $1.10). Every ESP note is one.
@@ -67,10 +68,8 @@ fn secret(n: u8) -> SecretKey {
     SecretKey::from_slice(&bytes).unwrap()
 }
 
-fn service() -> XOnlyPublicKey {
-    Keypair::from_secret_key(SECP256K1, &secret(1))
-        .x_only_public_key()
-        .0
+fn service() -> ServiceDid {
+    ServiceDid::from(Keypair::from_secret_key(SECP256K1, &secret(1)).public_key())
 }
 
 struct NoPsp;
@@ -276,7 +275,7 @@ fn queued_then_declined_then_collected_with_the_fee_shown_and_retries_idempotent
     assert!(declines >= 2);
     assert_eq!(
         b0.size_bytes,
-        119 + 2 * 186 + MEMO.len() as u64 + declines as u64 * 81
+        120 + 2 * 187 + MEMO.len() as u64 + declines as u64 * 82
     );
     assert_eq!(b0.fee_esp, RATE * u128::from(b0.size_bytes));
 

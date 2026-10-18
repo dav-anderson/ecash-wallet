@@ -22,7 +22,8 @@ use mint_types::{Amount, BlindNonce, MintInput, Nonce};
 use psp_mint::records::Records;
 use psp_mint::scan::Received;
 use psp_mint::settle::{self, Settlement};
-use secp256k1::{PublicKey, XOnlyPublicKey};
+use secp256k1::PublicKey;
+use sp_wire::ServiceDid;
 use sp_wire::seal::SecretKey as DidSecretKey;
 
 const G_X: &str = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
@@ -32,8 +33,8 @@ const ONE_PSP_ESP: u128 = 100_000_000_000;
 /// 5,000 sats is exactly 5 PSP.
 const BTC_10K: u64 = 1_000_000;
 
-fn service() -> XOnlyPublicKey {
-    XOnlyPublicKey::from_slice(&hex::decode(G_X).unwrap()).unwrap()
+fn service() -> ServiceDid {
+    ServiceDid::parse(&format!("02{G_X}")).unwrap()
 }
 
 fn scratch(name: &str) -> PathBuf {

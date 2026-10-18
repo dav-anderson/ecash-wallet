@@ -54,7 +54,7 @@ fn a_handover_with_a_note_without_a_keyset_is_refused_and_nothing_is_stored() {
             keyset: keyset.into(),
         }
     };
-    let service = Keypair::new(SECP256K1, &mut OsRng).x_only_public_key().0;
+    let service = sp_wire::ServiceDid::from(Keypair::new(SECP256K1, &mut OsRng).public_key());
     // The first note is fine; the second names no keyset.
     let h = Handover {
         service,

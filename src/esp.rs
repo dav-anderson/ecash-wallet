@@ -23,8 +23,9 @@
 //! power of two.
 
 use mint_types::{Amount, MintInput, melt_sighash};
-use secp256k1::{Keypair, SECP256K1, XOnlyPublicKey};
+use secp256k1::{Keypair, SECP256K1};
 
+use sp_wire::ServiceDid;
 use sp_wire::esp::exchange::{self, ExchangeRequest, ExchangeResponse};
 use sp_wire::units::ESP_PER_PSP;
 
@@ -187,7 +188,7 @@ impl Wallet {
     pub fn build_exchange(
         &mut self,
         psp_units: u64,
-        service: XOnlyPublicKey,
+        service: ServiceDid,
         esp_amounts: Option<&[u64]>,
     ) -> Result<ExchangeBuild, WalletError> {
         if psp_units == 0 {
@@ -496,8 +497,8 @@ mod tests {
 
     const G_X: &str = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
 
-    fn service() -> XOnlyPublicKey {
-        XOnlyPublicKey::from_slice(&hex::decode(G_X).unwrap()).unwrap()
+    fn service() -> ServiceDid {
+        ServiceDid::parse(&format!("02{G_X}")).unwrap()
     }
 
     fn scratch(name: &str) -> PathBuf {
@@ -918,11 +919,9 @@ mod tests {
             size_bytes: 0,
         };
         let mut wrong_service = good.clone();
-        wrong_service.service = XOnlyPublicKey::from_slice(
-            &hex::decode("c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5")
-                .unwrap(),
-        )
-        .unwrap();
+        wrong_service.service =
+            ServiceDid::parse("02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5")
+                .unwrap();
         assert!(w.finish_exchange(&built.id, &wrong_service).is_err());
         let mut short = good.clone();
         short.signatures.clear();

@@ -13,7 +13,8 @@ use ecash_wallet::redeem::{EntryOutcome, RedeemOutcome, RedemptionState};
 use ecash_wallet::store::{Handover, parse_did};
 use ecash_wallet::transfer::TransferBuild;
 use ecash_wallet::{Wallet, WalletError, http};
-use secp256k1::{SecretKey, XOnlyPublicKey};
+use secp256k1::SecretKey;
+use sp_wire::ServiceDid;
 use sp_wire::seal::SecretKey as DidSecretKey;
 use sp_wire::units::ESP_PER_PSP;
 
@@ -35,15 +36,15 @@ ecash-wallet [--wallet FILE] [--config FILE] [--regtest|--signet|--testnet] <com
   claim-psp [--psp-url URL] [--file FILE|-] [BLIND_NONCE:SIGNATURE...]
       Turn the PSP's signatures into notes. Paste the PSP's output into a file,
       or pass pairs. With neither, reads standard input.
-  exchange --service HEX --psp N [--amounts A,B,C] [--esp-url URL] [--resume ID]
-      Exchange at least N PSP for ESP bound to a service (32 byte x-only key,
-      hex). The smallest exchange is 1 PSP. The mint's exchange is exact, so the
+  exchange --service DID --psp N [--amounts A,B,C] [--esp-url URL] [--resume ID]
+      Exchange at least N PSP for ESP bound to a service (its 33-byte AIR DID,
+      66 hex characters). The smallest exchange is 1 PSP. The mint's exchange is exact, so the
       wallet spends whole PSP notes worth at least N and asks for all of their
       value: N PSP of ESP, plus any difference as extra ESP notes (change) under
       the same terms. ESP notes are powers of two: the wallet splits the amount
       (and the change) into the fewest of them. --amounts picks other sizes,
       each a power of two, adding up to the same total.
-  hand-over --service HEX (--esp UNITS | --psp N) [--day D] --out FILE
+  hand-over --service DID (--esp UNITS | --psp N) [--day D] --out FILE
       Hand whole ESP notes bound to a service to that service, worth exactly
       UNITS ESP units (or N PSP). Notes cannot be split, so the wallet needs a
       set that adds up to the amount. The notes leave this wallet and are
@@ -128,15 +129,15 @@ ecash-wallet [--wallet FILE] [--config FILE] [--regtest|--signet|--testnet] <com
       first is the primary), from config.toml beside the wallet file (or
       --config FILE, or $ECASH_CONFIG) and $ECASH_STORAGE_WALLET and
       $ECASH_STORAGE_APP. Nothing reads or writes the AIR yet.
-  fsp issue [--service HEX] [--esp UNITS | --psp N] [--fsp-url URL]
+  fsp issue [--service DID] [--esp UNITS | --psp N] [--fsp-url URL]
       Hand ESP for a service to its FSP mint for FSP, 1:1 less its issue fee.
       All of the service's ESP by default, any day, mature or not.
-  fsp pay [--service HEX] --units N [--memo TEXT] [--fsp-url URL]
+  fsp pay [--service DID] --units N [--memo TEXT] [--fsp-url URL]
       Pay N FSP units to the service, with change.
-  fsp sync [--service HEX] [--fsp-url URL]
+  fsp sync [--service DID] [--fsp-url URL]
       What runs on its own: finish pending FSP requests, read the mint's keys,
       and swap FSP on the previous keyset to the current one.
-  fsp-window --service HEX [--fsp-url URL]
+  fsp-window --service DID [--fsp-url URL]
       The FSP mint's rotation schedule (GET /rotation): current and previous
       keysets with their start and retire times, and the next rotation.
   esp-schedule [--by YYYY-MM-DD]
@@ -387,7 +388,7 @@ fn exchange(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
         None => {
             let service = args
                 .flag("--service")?
-                .ok_or_else(|| WalletError::Invalid("--service HEX is required".into()))?;
+                .ok_or_else(|| WalletError::Invalid("--service DID is required".into()))?;
             let psp = number(
                 &args
                     .flag("--psp")?
@@ -403,13 +404,7 @@ fn exchange(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
                 None => None,
             };
             args.done()?;
-            let bytes = hex::decode(service.trim())
-                .map_err(|_| WalletError::Invalid("the service must be hex".into()))?;
-            let service = XOnlyPublicKey::from_slice(&bytes).map_err(|_| {
-                WalletError::Invalid(
-                    "the service must be a 32 byte x-only key (64 hex characters)".into(),
-                )
-            })?;
+            let service = service_did(&service)?;
             http::sync_esp_keysets(wallet, &base)?;
             http::sync_esp_limits(wallet, &base)?;
             wallet.build_exchange(psp, service, amounts.as_deref())?
@@ -458,12 +453,11 @@ fn exchange(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
     }
 }
 
-fn service_key(text: &str) -> Result<XOnlyPublicKey, WalletError> {
-    let bytes = hex::decode(text.trim())
-        .map_err(|_| WalletError::Invalid("the service must be hex".into()))?;
-    XOnlyPublicKey::from_slice(&bytes).map_err(|_| {
-        WalletError::Invalid("the service must be a 32 byte x-only key (64 hex characters)".into())
-    })
+/// A service as typed: its 33-byte AIR DID, 66 hex characters. The old 32-byte
+/// x-only form is refused, and the error says what to use instead. (Not to be
+/// confused with `--service-key`, a service's secret key, see `secret_key`.)
+fn service_did(text: &str) -> Result<ServiceDid, WalletError> {
+    ServiceDid::parse(text).map_err(|e| WalletError::Invalid(e.to_string()))
 }
 
 fn secret_key(text: &str) -> Result<SecretKey, WalletError> {
@@ -493,10 +487,10 @@ fn write_private(path: &std::path::Path, text: &str) -> Result<(), std::io::Erro
 }
 
 fn hand_over(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
-    let service = service_key(
+    let service = service_did(
         &args
             .flag("--service")?
-            .ok_or_else(|| WalletError::Invalid("--service HEX is required".into()))?,
+            .ok_or_else(|| WalletError::Invalid("--service DID is required".into()))?,
     )?;
     let units: u128 = match (args.flag("--esp")?, args.flag("--psp")?) {
         (Some(esp), None) => esp.trim().parse::<u128>().map_err(|_| {
@@ -1244,7 +1238,7 @@ fn handoff_export_fsp(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletE
             .split_once(':')
             .ok_or_else(|| WalletError::Invalid("--fsp takes SERVICE:UNITS".into()))?;
         fsp.push((
-            service_key(service)?,
+            service_did(service)?,
             u128::from(number(units, "the FSP units")?),
         ));
     }
@@ -1407,7 +1401,7 @@ fn today() -> u64 {
 /// `$ECASH_FSP_URL`, else the default. Checked for the network first.
 fn fsp_url(
     wallet: &Wallet,
-    service: &XOnlyPublicKey,
+    service: &ServiceDid,
     flag: Option<String>,
 ) -> Result<String, WalletError> {
     let known = wallet
@@ -1453,14 +1447,14 @@ fn startup_fsp_sync(wallet: &mut Wallet) {
         .map(|(s, m)| (s.clone(), m.url.clone()))
         .collect();
     for (service, url) in mints {
-        let Ok(key) = service_key(&service) else {
+        let Ok(key) = service_did(&service) else {
             continue;
         };
         sync_and_log(wallet, key, &url);
     }
 }
 
-fn sync_and_log(wallet: &mut Wallet, service: XOnlyPublicKey, url: &str) {
+fn sync_and_log(wallet: &mut Wallet, service: ServiceDid, url: &str) {
     let result =
         http::verify_mint(url, network()).and_then(|_| http::fsp_sync(wallet, service, url));
     match result {
@@ -1481,11 +1475,11 @@ fn fsp(wallet: &mut Wallet, settings: &Settings, mut args: Args) -> Result<(), W
     }
     let what = args.0.remove(0);
     let service = match args.flag("--service")? {
-        Some(text) => service_key(&text)?,
+        Some(text) => service_did(&text)?,
         None => {
             let service = settings.storage_service().ok_or_else(|| {
                 WalletError::Invalid(
-                    "--service HEX is needed (storage.wallet is empty, so there is no storage service to default to)"
+                    "--service DID is needed (storage.wallet is empty, so there is no storage service to default to)"
                         .into(),
                 )
             })?;
@@ -1552,10 +1546,10 @@ fn fsp(wallet: &mut Wallet, settings: &Settings, mut args: Args) -> Result<(), W
 }
 
 fn fsp_window(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
-    let service = service_key(
+    let service = service_did(
         &args
             .flag("--service")?
-            .ok_or_else(|| WalletError::Invalid("--service HEX is needed".into()))?,
+            .ok_or_else(|| WalletError::Invalid("--service DID is needed".into()))?,
     )?;
     let flag = args.flag("--fsp-url")?;
     args.done()?;

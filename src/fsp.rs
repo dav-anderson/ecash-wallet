@@ -18,8 +18,9 @@ use std::collections::BTreeMap;
 
 use mint_types::{Amount, MintInput};
 use secp256k1::schnorr::Signature;
-use secp256k1::{Keypair, SECP256K1, XOnlyPublicKey};
+use secp256k1::{Keypair, SECP256K1};
 use serde::{Deserialize, Serialize};
+use sp_wire::ServiceDid;
 use sp_wire::fsp::{
     FspInput, GroupResult, HandedEsp, IssueGroup, IssueRequest, IssueResponse, KeysResponse,
     SpendRequest, SpendResponse, issue_group_size,
@@ -59,7 +60,7 @@ pub enum FspOp {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PendingFsp {
     pub id: String,
-    pub service: XOnlyPublicKey,
+    pub service: ServiceDid,
     pub op: FspOp,
 }
 
@@ -195,10 +196,9 @@ impl Wallet {
     /// startup (a wallet file from before the service was kept) and whenever a
     /// mint's keys are read.
     pub fn fill_fsp_services(&mut self) -> Result<usize, WalletError> {
-        let mut owner: BTreeMap<String, Option<XOnlyPublicKey>> = BTreeMap::new();
+        let mut owner: BTreeMap<String, Option<ServiceDid>> = BTreeMap::new();
         for (svc, m) in &self.data().fsp_mints {
-            let Ok(raw) = hex::decode(svc) else { continue };
-            let Ok(key) = XOnlyPublicKey::from_slice(&raw) else {
+            let Ok(key) = ServiceDid::parse(svc) else {
                 continue;
             };
             for ks in std::iter::once(&m.current).chain(m.previous.iter()) {
@@ -209,7 +209,7 @@ impl Wallet {
                     .or_insert(Some(key));
             }
         }
-        let wanted: Vec<(String, XOnlyPublicKey)> = self
+        let wanted: Vec<(String, ServiceDid)> = self
             .notes()
             .iter()
             .filter(|n| n.kind == Kind::Fsp && n.terms.is_none())
@@ -240,7 +240,7 @@ impl Wallet {
     /// that is not the service's.
     pub fn note_fsp_keys(
         &mut self,
-        service: XOnlyPublicKey,
+        service: ServiceDid,
         url: &str,
         keys: &KeysResponse,
     ) -> Result<u128, WalletError> {
@@ -295,7 +295,7 @@ impl Wallet {
     /// exactly `units`), grouped by day, for FSP at `fee_per_byte`.
     pub fn build_fsp_issue(
         &mut self,
-        service: XOnlyPublicKey,
+        service: ServiceDid,
         units: Option<u128>,
         fee_per_byte: u64,
     ) -> Result<IssueRequest, WalletError> {
@@ -505,7 +505,7 @@ impl Wallet {
 
     pub(crate) fn build_swap(
         &mut self,
-        service: XOnlyPublicKey,
+        service: ServiceDid,
         chosen: Vec<StoredNote>,
         pay: u64,
         memo: &str,
@@ -556,7 +556,7 @@ impl Wallet {
         Ok(request)
     }
 
-    fn free_fsp(&self, service: &XOnlyPublicKey) -> Vec<StoredNote> {
+    fn free_fsp(&self, service: &ServiceDid) -> Vec<StoredNote> {
         self.notes()
             .iter()
             .filter(|n| {
@@ -572,7 +572,7 @@ impl Wallet {
     /// first until they cover the payment.
     pub fn build_fsp_spend(
         &mut self,
-        service: XOnlyPublicKey,
+        service: ServiceDid,
         pay: u64,
         memo: &str,
     ) -> Result<SpendRequest, WalletError> {
@@ -602,7 +602,7 @@ impl Wallet {
     /// the current one (pay 0). `None` if there is nothing to roll over.
     pub fn build_fsp_rollover(
         &mut self,
-        service: XOnlyPublicKey,
+        service: ServiceDid,
     ) -> Result<Option<SpendRequest>, WalletError> {
         let Some(previous) = self
             .fsp_mints()
@@ -713,12 +713,12 @@ mod tests {
         assert_eq!(outputs_for(2, 1, 0), Some(vec![2]));
     }
 
-    fn service_of(seed: u8) -> XOnlyPublicKey {
-        secp256k1::SecretKey::from_slice(&[seed; 32])
-            .unwrap()
-            .public_key(secp256k1::SECP256K1)
-            .x_only_public_key()
-            .0
+    fn service_of(seed: u8) -> ServiceDid {
+        ServiceDid::from(
+            secp256k1::SecretKey::from_slice(&[seed; 32])
+                .unwrap()
+                .public_key(secp256k1::SECP256K1),
+        )
     }
 
     /// An FSP note of `amount` with no service recorded (as an older wallet

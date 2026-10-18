@@ -24,7 +24,9 @@ Use four terminals and keep them open:
 | T3 | The ESP mint (`esp-mint serve`). |
 | T4 | The wallet. Shell variables set here (`ECASH_WALLET_FILE`, `HEX`, `CLI`, `PAYER`, `SERVICE`) are used by later steps. |
 
-`balance` prints the service as its full 64-character key. The outputs below show it shortened as `79be...1798`.
+`balance` prints the service as its full 66-character DID (the 33-byte compressed key: `02` or `03`, then 64 hex characters). The outputs below show it shortened as `0279be...1798`.
+
+**Wire version 3 (sp-wire 0.5.0).** A service is its DID, so `$SERVICE` below is `02` and the generator's x coordinate, and a command given the old 64-character form is refused with a message that says to use the DID. The outputs below were recorded at wire version 2 and have **not been run again**: every number that comes from a size moves with the new sizes. A redemption of one note with one decline output is 3 bytes larger (`120 + 187 + memo + 82`, was `119 + 186 + memo + 81`), so its size, its fee (the size times the rate) and the payout (the note less the fee) change by that many bytes and `rate × 3` ESP units, and the audit totals that follow from them move with them. The exchange and transfer sizes are one byte larger (`49` and `121` fixed). Re-run the walkthrough to capture the new figures.
 
 The commands that need `bitcoin-cli` use `CLI=~/bitcoin-core/bitcoin-31.1/bin/bitcoin-cli`, set in the terminal that runs them.
 
@@ -187,7 +189,7 @@ notes 2 (0 held for a pending request)
 The wallet holds a 4 and a 1. No set of its notes makes exactly 3, so it spends the 4. The exchange is exact, so it asks for the full 4 PSP of ESP, and the 1 PSP over what was asked for comes back as ESP change. The service below is the generator point, a test value.
 
 ```
-SERVICE=79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798
+SERVICE=0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798
 cargo run -q -- --regtest exchange --service $SERVICE --psp 3
 cargo run -q -- --regtest balance
 ```
@@ -201,7 +203,7 @@ received 400000000000 ESP in 2 note(s), redeemable after day 21106
 
 psp  1
 esp  400000000000
-       400000000000 for 79be...1798, redeemable after day 21106
+       400000000000 for 0279be...1798, redeemable after day 21106
 fsp  0
 notes 3 (0 held for a pending request)
 ```
@@ -232,7 +234,7 @@ received 100000000000 ESP in 1 note(s), redeemable after day 21106
 
 psp  0
 esp  500000000000
-       500000000000 for 79be...1798, redeemable after day 21106
+       500000000000 for 0279be...1798, redeemable after day 21106
 fsp  0
 notes 3 (0 held for a pending request)
 ```
@@ -311,7 +313,7 @@ wrote /tmp/handover.json. It holds the notes' spend secrets: give it to the serv
 
 psp  0
 esp  200000000000
-       200000000000 for 79be...1798, redeemable after day 21106
+       200000000000 for 0279be...1798, redeemable after day 21106
 fsp  0
 notes 2 (0 held for a pending request)
 handed over 1 time(s); the hand-overs are kept in the wallet file
@@ -328,7 +330,7 @@ ECASH_WALLET_FILE=/tmp/wallet-service.json cargo run -q -- --regtest receive /tm
 Expected:
 
 ```
-received 300000000000 ESP in 1 note(s) for 79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798, redeemable after day 21106
+received 300000000000 ESP in 1 note(s) for 0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798, redeemable after day 21106
 ```
 
 Running it a second time on the same wallet file is refused, because the wallet already holds that note.
@@ -351,7 +353,7 @@ transferred 300000000000 ESP to 1 new note(s) that only this service controls, r
 
 psp  0
 esp  300000000000
-       300000000000 for 79be...1798, redeemable after day 21106
+       300000000000 for 0279be...1798, redeemable after day 21106
 fsp  0
 notes 1 (0 held for a pending request)
 ```
@@ -408,7 +410,7 @@ error: no free ESP for that service in this wallet
 
 This continues the two runs above (purchase to ESP, then the transfer), with the same four terminals, the Bitcoin node, the PSP mint (T2) and the ESP mint (T3) running, and one more terminal, T5, for the FSP mint. It was run end to end on 2026-10-16 (macOS, Apple Silicon) from a clean start (step 1 moved the old data aside), and every output below is what that run printed, apart from values that differ each run (ids, transaction ids, keys, the price, the day numbers). Today's day number in that run was 20742, so notes issued after step 22 are "redeemable after day 20742" and the year-out notes are day 21107. Use your own: the day is the number of days since 1970-01-01, and the first run's notes carry today plus 365.
 
-The app wallet is the default one, `~/.ecash-wallet/regtest/wallet.json`. The service has its own wallet file, set per command with `ECASH_WALLET_FILE=/tmp/wallet-service.json`. `$SERVICE` is the generator point `79be…1798` and `$KEY` its secret key `000…01` (see "Regtest, ESP transfer"). `$CLI`, `$PAYER`, `$HEX` and `$TXID` are shell variables in T4.
+The app wallet is the default one, `~/.ecash-wallet/regtest/wallet.json`. The service has its own wallet file, set per command with `ECASH_WALLET_FILE=/tmp/wallet-service.json`. `$SERVICE` is the generator point `0279be…1798` and `$KEY` its secret key `000…01` (see "Regtest, ESP transfer"). `$CLI`, `$PAYER`, `$HEX` and `$TXID` are shell variables in T4.
 
 ### 21. Look at the ESP mint's rates (T1)
 
@@ -416,7 +418,7 @@ The app wallet is the default one, `~/.ecash-wallet/regtest/wallet.json`. The se
 curl -s http://127.0.0.1:3100/fees | python3 -m json.tool
 ```
 
-Expected: `exchange` with `fee_per_byte "0"`, `maturity_days 365`, `max_items 1000`, `max_request_bytes 1048576`, `min_psp 1` and size `48 + 146 per input + 41 per output`; `transfer` with fee `"0"`, ceiling 1048576 and size `120 + 146 + 41`; `redeem` with `fee_per_byte "1000000"` (set by `ESP_REDEEM_FEE_PER_BYTE` in step 4; the default is `"0"`), `max_memo_bytes 256`, `max_request_bytes 67108864` and size `119 + 186 per input + 81 per output + the memo`. These are the mint's settings (esp-mint README, "Settings and fees"). The wallet reads this before it builds a redemption.
+Expected: `exchange` with `fee_per_byte "0"`, `maturity_days 365`, `max_items 1000`, `max_request_bytes 1048576`, `min_psp 1` and size `49 + 146 per input + 41 per output`; `transfer` with fee `"0"`, ceiling 1048576 and size `121 + 146 + 41`; `redeem` with `fee_per_byte "1000000"` (set by `ESP_REDEEM_FEE_PER_BYTE` in step 4; the default is `"0"`), `max_memo_bytes 256`, `max_request_bytes 67108864` and size `120 + 187 per input + 82 per output + the memo`. These are the mint's settings (esp-mint README, "Settings and fees"). The wallet reads this before it builds a redemption.
 
 ### 22. Make new notes mature the day they are issued (T1)
 
@@ -562,7 +564,7 @@ ESP_NETWORK=regtest cargo run -q -- pay $SERVICE regtest-demo-payment-1 <redempt
 ESP_NETWORK=regtest cargo run -q -- payouts
 ```
 
-Expected: one entry owed 0.199185 USD, then `marked 1 entry completed for 79be…1798: 0.199185000000 USD (199185000000 ESP), payment reference regtest-demo-payment-1`, then `nothing is owed: no open redemption entries`.
+Expected: one entry owed 0.199185 USD, then `marked 1 entry completed for 0279be…1798: 0.199185000000 USD (199185000000 ESP), payment reference regtest-demo-payment-1`, then `nothing is owed: no open redemption entries`.
 
 ### 33. The service sees it completed (T4)
 
@@ -597,14 +599,14 @@ cd ~/fsp-mint
 FSP_NETWORK=regtest cargo run -q -- service-key
 ```
 
-Expected: the settings, then `service.did = 79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798`. In T5:
+Expected: the settings, then `service.did = 0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798`. In T5:
 
 ```
 cd ~/fsp-mint
-FSP_NETWORK=regtest FSP_SERVICE_DID=79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798 cargo run -- serve
+FSP_NETWORK=regtest FSP_SERVICE_DID=0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798 cargo run -- serve
 ```
 
-Expected: the settings (with `service.did` from the environment) and `fsp-mint api listening on http://127.0.0.1:3200`. In T1, `curl -s http://127.0.0.1:3200/health` returns `{"network":"regtest","service":"79be…1798","status":"ok"}` and `/fees` returns `{"issue_fee_per_byte":0,"issue_group_fixed_bytes":16,"issue_note_bytes":106,"issue_output_bytes":41,"max_request_bytes":1048576}`.
+Expected: the settings (with `service.did` from the environment) and `fsp-mint api listening on http://127.0.0.1:3200`. In T1, `curl -s http://127.0.0.1:3200/health` returns `{"network":"regtest","service":"0279be…1798","status":"ok"}` and `/fees` returns `{"issue_fee_per_byte":0,"issue_group_fixed_bytes":16,"issue_note_bytes":106,"issue_output_bytes":41,"max_request_bytes":1048576}`.
 
 ### 36. Issue FSP from ESP (T4)
 
@@ -688,7 +690,7 @@ ESP_NETWORK=regtest cargo run -q -- payouts
 ESP_NETWORK=regtest cargo run -q -- pay $SERVICE regtest-split-payment <id1> <id2> <id3>
 ```
 
-Expected: `payouts` shows one service, owed 0.198394 USD in 3 entries with one memo, and `pay` prints `marked 3 entries completed for 79be…1798: 0.198394000000 USD (198394000000 ESP), payment reference regtest-split-payment`. Entries with different memos need `--mixed-memos`. In T4, `redeem --collect` prints `payout completed, payment reference regtest-split-payment` three times. The audit was `{"issued":2398787000000,"outstanding":500000000000,"redeemed":1898787000000}`: the decline and the transfer each issued 199597000000 again, and the three redemptions burned it.
+Expected: `payouts` shows one service, owed 0.198394 USD in 3 entries with one memo, and `pay` prints `marked 3 entries completed for 0279be…1798: 0.198394000000 USD (198394000000 ESP), payment reference regtest-split-payment`. Entries with different memos need `--mixed-memos`. In T4, `redeem --collect` prints `payout completed, payment reference regtest-split-payment` three times. The audit was `{"issued":2398787000000,"outstanding":500000000000,"redeemed":1898787000000}`: the decline and the transfer each issued 199597000000 again, and the three redemptions burned it.
 
 ### 42. ESP the FSP mint has kept, not yet mature (T1, then T4)
 

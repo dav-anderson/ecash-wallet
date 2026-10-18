@@ -22,7 +22,8 @@ use fsp_mint::server::FspState;
 use fsp_mint::spend::Spender;
 use mint_types::{Amount, BlindNonce, MintInput, MintOutput, Nonce, Note};
 use rand::rngs::OsRng;
-use secp256k1::{Keypair, SECP256K1, SecretKey, XOnlyPublicKey};
+use secp256k1::{Keypair, SECP256K1, SecretKey};
+use sp_wire::ServiceDid;
 use tokio::runtime::Runtime;
 
 const NOW: u64 = 1_791_571_184;
@@ -48,8 +49,8 @@ fn service_keypair() -> Keypair {
     Keypair::from_secret_key(SECP256K1, &SecretKey::from_slice(&b).unwrap())
 }
 
-fn service() -> XOnlyPublicKey {
-    service_keypair().x_only_public_key().0
+fn service() -> ServiceDid {
+    ServiceDid::from(service_keypair().public_key())
 }
 
 struct NoPsp;

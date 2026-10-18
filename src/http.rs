@@ -484,12 +484,12 @@ mod tests {
 
     #[test]
     fn the_fees_body_is_read_and_a_different_size_formula_is_refused() {
-        let body = r#"{"redeem":{"fee_per_byte":"1000000","max_request_bytes":67108864,"max_memo_bytes":256,"size":{"fixed":119,"per_input":186,"per_output":81,"plus":"the memo's length in bytes"}}}"#;
+        let body = r#"{"redeem":{"fee_per_byte":"1000000","max_request_bytes":67108864,"max_memo_bytes":256,"size":{"fixed":120,"per_input":187,"per_output":82,"plus":"the memo's length in bytes"}}}"#;
         let fees = parse_redeem_fees(body).unwrap();
         assert_eq!(fees.fee_per_byte, 1_000_000);
         assert_eq!(fees.max_request_bytes, 64 << 20);
         assert_eq!(fees.max_memo_bytes, 256);
-        let changed = body.replace("\"per_input\":186", "\"per_input\":188");
+        let changed = body.replace("\"per_input\":187", "\"per_input\":188");
         assert!(
             parse_redeem_fees(&changed)
                 .unwrap_err()
@@ -711,7 +711,7 @@ pub struct FspSync {
 /// left pending, so the next connection tries again.
 pub fn fsp_sync(
     wallet: &mut crate::Wallet,
-    service: secp256k1::XOnlyPublicKey,
+    service: sp_wire::ServiceDid,
     base: &str,
 ) -> Result<FspSync, WalletError> {
     let mut out = FspSync::default();

@@ -13,7 +13,7 @@
 //!    `Terms::is_redeemable_at`), not flagged for a bad proof. Mixed days go in
 //!    one request. A request that would owe nothing is not sent, with the reason.
 //! 2. **Size and fee.** The size is exact before anything is signed:
-//!    `119 + 186 × notes + memo bytes + 81 × outputs`. The fee is the size times
+//!    `120 + 187 × notes + memo bytes + 82 × outputs`. The fee is the size times
 //!    the rate from `GET /fees`. The mint charges the rate in force when it
 //!    accepts the request and says which on the reply.
 //! 3. **Outputs.** The wallet expects every note to be accepted, so it asks for
@@ -48,9 +48,10 @@
 use std::collections::BTreeMap;
 
 use mint_types::{Amount, MintInput};
-use secp256k1::{Keypair, SECP256K1, SecretKey, XOnlyPublicKey};
+use secp256k1::{Keypair, SECP256K1, SecretKey};
 use serde::{Deserialize, Serialize};
 
+use sp_wire::ServiceDid;
 use sp_wire::esp::queue::Status;
 use sp_wire::esp::redeem::{
     self, NoteResult, Reason, RedeemInput, RedeemOutput, RedeemRequest, RedeemResponse, Totals,
@@ -105,7 +106,7 @@ impl Default for RedeemFees {
 /// One output of a redemption, with its terms and blinding factors.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TermsOutput {
-    pub service: XOnlyPublicKey,
+    pub service: ServiceDid,
     pub redeemable_after_day: u64,
     pub output: PendingOutput,
 }
@@ -124,7 +125,7 @@ pub enum RedemptionState {
 pub struct PendingRedemption {
     /// The request hash, as the mint stores it and names its queue entry.
     pub id: String,
-    pub service: XOnlyPublicKey,
+    pub service: ServiceDid,
     pub memo: String,
     /// The notes in the request, in its order.
     pub input_ids: Vec<String>,
@@ -386,7 +387,7 @@ pub fn allocate(
 /// Whether a list of outputs is within what the mint will sign: at most `cap`
 /// in all, and for each service and day at most what `per_terms` holds.
 fn within(list: &[(StoredTerms, u64)], cap: u128, per_terms: &[(StoredTerms, u128)]) -> bool {
-    let mut asked: BTreeMap<([u8; 32], u64), u128> = BTreeMap::new();
+    let mut asked: BTreeMap<([u8; 33], u64), u128> = BTreeMap::new();
     for (t, v) in list {
         *asked
             .entry((t.service.serialize(), t.redeemable_after_day))
@@ -434,7 +435,7 @@ pub fn mint_would_accept(
 
 /// Totals by service and day, in the mint's order (service bytes, then day).
 fn by_terms(notes: &[&StoredNote]) -> Vec<(StoredTerms, u128)> {
-    let mut map: BTreeMap<([u8; 32], u64), (StoredTerms, u128)> = BTreeMap::new();
+    let mut map: BTreeMap<([u8; 33], u64), (StoredTerms, u128)> = BTreeMap::new();
     for n in notes {
         if let Some(t) = n.terms {
             let slot = map
@@ -487,7 +488,7 @@ fn sign_request(
             "the ESP mint's current keyset is not known yet: connect to the mint first".into(),
         ));
     }
-    let service = service_keypair.x_only_public_key().0;
+    let service = ServiceDid::from(service_keypair.public_key());
     let make = |list: &[(StoredTerms, u64)]| -> Vec<TermsOutput> {
         list.iter()
             .map(|(t, amount)| TermsOutput {
@@ -655,7 +656,7 @@ impl Wallet {
     ) -> Result<RedeemPlan, WalletError> {
         check_memo(memo, fees.max_memo_bytes)?;
         let keypair = Keypair::from_secret_key(SECP256K1, service_secret);
-        let service = keypair.x_only_public_key().0;
+        let service = ServiceDid::from(keypair.public_key());
         let mut chosen: Vec<StoredNote> = self
             .notes()
             .iter()
@@ -791,7 +792,7 @@ impl Wallet {
             )));
         }
         let keypair = Keypair::from_secret_key(SECP256K1, service_secret);
-        if keypair.x_only_public_key().0 != pending.service {
+        if ServiceDid::from(keypair.public_key()) != pending.service {
             return Err(WalletError::Invalid(
                 "that is not the key of the service this redemption is for".into(),
             ));
@@ -1191,10 +1192,8 @@ mod tests {
         SecretKey::from_slice(&bytes).unwrap()
     }
 
-    fn service() -> XOnlyPublicKey {
-        Keypair::from_secret_key(SECP256K1, &key(1))
-            .x_only_public_key()
-            .0
+    fn service() -> ServiceDid {
+        ServiceDid::from(Keypair::from_secret_key(SECP256K1, &key(1)).public_key())
     }
 
     fn terms(day: u64) -> StoredTerms {
@@ -1232,7 +1231,7 @@ mod tests {
     }
 
     /// A stored ESP note with a made-up mint signature.
-    fn esp_note(amount: u64, service: XOnlyPublicKey, day: u64) -> StoredNote {
+    fn esp_note(amount: u64, service: ServiceDid, day: u64) -> StoredNote {
         let sk = SecretKey::new(&mut rand::rngs::OsRng);
         let out = PendingOutput::new(amount);
         let sig = bdhke::sign_message(&sk, &out.blind_nonce.0);
@@ -1291,7 +1290,7 @@ mod tests {
         assert!(n > 1);
         assert_eq!(
             a.size_bytes,
-            119 + 2 * 186 + MEMO.len() as u64 + 81 * n as u64
+            120 + 2 * 187 + MEMO.len() as u64 + 82 * n as u64
         );
         assert_eq!(a.fee_esp, fee_of(2, n, 0));
         assert!(a.decline.iter().all(|(_, v)| v.is_power_of_two()));
@@ -1480,9 +1479,7 @@ mod tests {
             esp_note(ONE, service(), FUTURE),
             esp_note(
                 ONE,
-                Keypair::from_secret_key(SECP256K1, &key(2))
-                    .x_only_public_key()
-                    .0,
+                ServiceDid::from(Keypair::from_secret_key(SECP256K1, &key(2)).public_key()),
                 PAST,
             ),
         ];
@@ -1508,7 +1505,11 @@ mod tests {
         assert_eq!(request.memo, MEMO);
         assert_eq!(request.service, service());
         SECP256K1
-            .verify_schnorr(&request.service_signature, &request.digest(), &service())
+            .verify_schnorr(
+                &request.service_signature,
+                &request.digest(),
+                &service().x_only(),
+            )
             .unwrap();
         for input in &request.inputs {
             SECP256K1
@@ -2171,10 +2172,10 @@ mod tests {
         );
         // alone, the reason is the error
         // A note worth exactly the fee: the mint would take it all and owe
-        // nothing. Notes are powers of two, so make the fee one: a memo of 207
+        // nothing. Notes are powers of two, so make the fee one: a memo of 205
         // bytes makes a request of one note 512 bytes, and at 2^31 a byte its
         // fee is 2^40, which is ONE.
-        let memo = "x".repeat(207);
+        let memo = "x".repeat(205);
         let rated = RedeemFees {
             fee_per_byte: 1 << 31,
             ..fees()

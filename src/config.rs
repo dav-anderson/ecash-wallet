@@ -35,7 +35,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use secp256k1::XOnlyPublicKey;
+use sp_wire::ServiceDid;
 use sp_wire::storage::{DataKind, StoragePolicy};
 
 /// The name of the file looked for beside the wallet file.
@@ -60,14 +60,14 @@ pub const SPECS: &[Spec] = &[
         key: "storage.wallet",
         env: "ECASH_STORAGE_WALLET",
         default: "",
-        units: "service IDs",
-        what: "Which AIR services will keep the wallet file, as an ordered list of service IDs: index 0 is the primary and the rest are secondaries, in the order they would be promoted. A service ID is a 32-byte x-only key in hex (64 characters); a 33-byte DID key is reduced to it. In the environment the IDs are separated by commas; in the file it is an array of strings or one such string. One entry: that service holds the wallet and the wallet keeps a local backup copy. Empty (the default): local only. At most 8, no duplicates. The primary is also the service that FSP fees for storage are paid to. Setting only for now: nothing reads or writes the AIR yet.",
+        units: "service DIDs (66 hex characters)",
+        what: "Which AIR services will keep the wallet file, as an ordered list of service IDs: index 0 is the primary and the rest are secondaries, in the order they would be promoted. A service ID is the service's AIR DID, a 33-byte compressed key in hex (66 characters, starting 02 or 03); the old 32-byte x-only form is refused. In the environment the IDs are separated by commas; in the file it is an array of strings or one such string. One entry: that service holds the wallet and the wallet keeps a local backup copy. Empty (the default): local only. At most 8, no duplicates. The primary is also the service that FSP fees for storage are paid to. Setting only for now: nothing reads or writes the AIR yet.",
     },
     Spec {
         key: "storage.app",
         env: "ECASH_STORAGE_APP",
         default: "",
-        units: "service IDs",
+        units: "service DIDs (66 hex characters)",
         what: "Which AIR services will keep the app's own data, in the same form as storage.wallet. The wallet only checks and reports it; it is for the app that embeds the library. Setting only for now.",
     },
 ];
@@ -113,8 +113,8 @@ impl Settings {
 
     /// The service that FSP fees for storage are paid to: the primary of
     /// `storage.wallet`. `None` when that list is empty (local only).
-    pub fn storage_service(&self) -> Option<XOnlyPublicKey> {
-        self.storage_wallet.primary().map(|id| id.x_only())
+    pub fn storage_service(&self) -> Option<ServiceDid> {
+        self.storage_wallet.primary().copied()
     }
 }
 
@@ -275,8 +275,8 @@ pub fn load(
 mod tests {
     use super::*;
 
-    const A: &str = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
-    const B: &str = "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5";
+    const A: &str = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+    const B: &str = "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5";
 
     fn dir(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("wallet-config-{}-{name}", std::process::id()));
@@ -336,27 +336,25 @@ mod tests {
         assert_eq!(s.storage_app.to_config_string(), B);
         assert_eq!(l.sources["storage.wallet"], Source::File);
         // The storage service is the wallet policy's primary, not the app's.
-        assert_eq!(
-            s.storage_service().unwrap().serialize().to_vec(),
-            hex::decode(A).unwrap()
-        );
+        assert_eq!(s.storage_service().unwrap().to_hex(), A);
         assert_eq!(
             s.policy(DataKind::App).unwrap().to_config_string(),
             B.to_string()
         );
         assert!(s.policy(DataKind::MintState).is_none());
 
-        // The environment wins; a DID key is reduced to its service.
-        let did = format!("03{B}");
+        // The environment wins. The parity byte is part of the ID: 03 is not 02.
+        let did = format!("03{}", &B[2..]);
         let l = load(&d, None, &env_of(&[("ECASH_STORAGE_WALLET", did.as_str())])).unwrap();
-        assert_eq!(l.settings.storage_wallet.to_config_string(), B);
+        assert_eq!(l.settings.storage_wallet.to_config_string(), did);
+        assert_ne!(l.settings.storage_wallet.to_config_string(), B);
         assert_eq!(
             l.sources["storage.wallet"],
             Source::Env("ECASH_STORAGE_WALLET")
         );
         assert_eq!(l.sources["storage.app"], Source::File);
         assert!(l.describe().iter().any(
-            |x| x == &format!("  storage.wallet = {B} service IDs (env ECASH_STORAGE_WALLET)")
+            |x| x == &format!("  storage.wallet = {did} service DIDs (66 hex characters) (env ECASH_STORAGE_WALLET)")
         ));
         fs::remove_dir_all(&d).unwrap();
     }

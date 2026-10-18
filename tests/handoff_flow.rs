@@ -26,7 +26,8 @@ use fsp_mint::spend::Spender;
 use mint_server::state::AppState;
 use mint_types::{Amount, BlindNonce, MintInput, MintOutput, Nonce, Note};
 use rand::rngs::OsRng;
-use secp256k1::{Keypair, SECP256K1, SecretKey, XOnlyPublicKey};
+use secp256k1::{Keypair, SECP256K1, SecretKey};
+use sp_wire::ServiceDid;
 use sp_wire::seal::SecretKey as DidSecretKey;
 use tokio::runtime::Runtime;
 
@@ -598,12 +599,12 @@ fn a_cancelled_psp_handoff_returns_the_notes() {
 
 // ---- FSP ---------------------------------------------------------------------------
 
-fn service() -> XOnlyPublicKey {
+fn service() -> ServiceDid {
     let mut b = [0u8; 32];
     b[31] = 1;
-    Keypair::from_secret_key(SECP256K1, &SecretKey::from_slice(&b).unwrap())
-        .x_only_public_key()
-        .0
+    ServiceDid::from(
+        Keypair::from_secret_key(SECP256K1, &SecretKey::from_slice(&b).unwrap()).public_key(),
+    )
 }
 
 struct NoPsp;

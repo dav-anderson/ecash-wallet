@@ -67,11 +67,15 @@ name = "handoff_flow"
 required-features = ["http"]
 
 # For local work, put this in .cargo/config.toml (git-ignored) or uncomment it
-# here and do not commit it. See the top-level README. AIR 2.0.3 has no path
-# dependencies, so nothing needs patching for it.
+# here and do not commit it. See the top-level README.
 #
 # [patch."https://github.com/dav-anderson/sp-wire.git"]
 # sp-wire = { path = "../sp-wire" }
+#
+# While sp-wire's AIR pin (2.1.0) has no `SecretKey` export upstream, AIR is taken
+# from a local checkout that has it:
+# [patch."https://github.com/ramp-stack/air"]
+# air = { path = "../air" }
 #
 # [patch."https://github.com/dav-anderson/mint-core.git"]
 # mint-types = { path = "../mint-core-v0.1.3/crates/mint-types" }

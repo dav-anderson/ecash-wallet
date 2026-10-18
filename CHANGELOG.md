@@ -2,6 +2,10 @@
 
 ecash-wallet 0.1.2 builds on `sp-wire` 0.2.0 (wire version 2) and the 0.1.2 mints. 0.1.1 moved the types to `sp-wire`, added the wire-version check and removed the mint crates from the library. 0.1.0 is the first release. Nothing was recorded per version before this file; the section below is everything the README said about what was built and when.
 
+## Unreleased
+
+- AIR 2.1.0 (commit `741b1cf`) comes with the next sp-wire (0.4.1): `PublicKey` and `SecretKey` are the same types under the same names, the sealed bytes and the `mint_did_key.json` format are unchanged, and `WIRE_VERSION` stays 2. the wallet's code is not changed for it. The wallet's `sp_wire::seal` uses are unchanged.
+
 ## 0.5.0 (2026-10-17)
 
 - The fee the wallet assumes before it has read `GET /fees` is 0, the mint's new default (esp-mint 0.5.0); it was 1,000,000. The rate in force is still read from the mint before a redemption is built. REGTEST.md starts esp-mint with `ESP_REDEEM_FEE_PER_BYTE=1000000` so that its redemption steps still show a fee.

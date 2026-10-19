@@ -141,12 +141,17 @@ pub struct Handover {
     pub notes: Vec<HandedNote>,
 }
 
-/// A mint-info request sent over AIR and not yet answered (see `air.rs`). The
+/// A request sent over AIR and not yet answered (see `air.rs`). The
 /// wallet keeps the pair that can read the reply, `request_id` and the one-off
 /// key `r`, until the request ends, so that a reply that came while the wallet
 /// was not looking can still be read.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingAirRequest {
+    /// What was asked: the request kind byte (1 mint info, 2 keys, 3 keysets,
+    /// 4 rotation). A file from before the keys calls moved to AIR has none, and
+    /// every request in it is mint info.
+    #[serde(default = "mint_info_kind")]
+    pub kind: u8,
     /// 32 random bytes, hex.
     pub request_id: String,
     /// The mint's DID the request was written for, hex.
@@ -157,6 +162,10 @@ pub struct PendingAirRequest {
     pub slots: Vec<u32>,
     /// When the request was made, unix seconds.
     pub created_at: u64,
+}
+
+fn mint_info_kind() -> u8 {
+    sp_wire::air_request::KIND_MINT_INFO
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -265,7 +274,7 @@ pub struct WalletData {
     /// Handoffs this wallet has imported, so that none is imported twice.
     #[serde(default)]
     pub handoffs_in: Vec<crate::handoff::IncomingHandoff>,
-    /// Mint-info requests over AIR that have not ended (see `air.rs`). Local to
+    /// Requests over AIR that have not ended (see `air.rs`). Local to
     /// this copy of the wallet: a merge keeps this copy's.
     #[serde(default)]
     pub air_requests: Vec<PendingAirRequest>,
@@ -419,12 +428,12 @@ impl Wallet {
         &self.data.bad_proof
     }
 
-    /// The mint-info requests over AIR that have not ended, oldest first.
+    /// The requests over AIR that have not ended, oldest first.
     pub fn air_requests(&self) -> &[PendingAirRequest] {
         &self.data.air_requests
     }
 
-    /// Keep a mint-info request (new, or with more slots than before) and save.
+    /// Keep a request over AIR (new, or with more slots than before) and save.
     pub(crate) fn save_air_request(
         &mut self,
         request: PendingAirRequest,
@@ -442,7 +451,7 @@ impl Wallet {
         })
     }
 
-    /// Forget a mint-info request that has ended (answered, or refused for good).
+    /// Forget a request over AIR that has ended (answered, or refused for good).
     pub(crate) fn end_air_request(&mut self, request_id: &str) -> Result<(), WalletError> {
         self.update(|d| {
             d.air_requests.retain(|r| r.request_id != request_id);

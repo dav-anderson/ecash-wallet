@@ -32,10 +32,10 @@
 //! - [`rotate`]: the automatic, staggered rollover of PSP and ESP (and the
 //!   swap schedule FSP shares) when a mint rotates its keys.
 //! - [`http`] (feature `http`): the calls to the mints.
-//! - [`mint_info`]: the PSP's mint info (`verify_mint`), over AIR when the wallet
-//!   is configured for it and over HTTP otherwise.
-//! - [`air`] (feature `air`): the PSP's mint info over AIR, the first call that
-//!   does not go over HTTP.
+//! - [`mint_info`]: the PSP's mint info (`verify_mint`) and its keys, keysets and
+//!   rotation, over AIR when the wallet is configured for it and over HTTP
+//!   otherwise.
+//! - [`air`] (feature `air`): those four read-only calls over AIR.
 
 #[cfg(feature = "air")]
 pub mod air;

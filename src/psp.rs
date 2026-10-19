@@ -205,6 +205,36 @@ impl Wallet {
     }
 }
 
+/// The keys to unblind a PSP settlement's signatures with: those of the keyset
+/// the PSP printed (`keyset <id>`), read from the PSP's keysets, never assumed to
+/// be the current set. Older output names none and was signed with the keys of
+/// `GET /keys`. A printed keyset that is no longer live means the outputs
+/// expired before they were claimed.
+///
+/// How the keys and the keysets are read (over HTTP, or over AIR) is the
+/// caller's: `keys` and `keysets` are called only when needed.
+pub fn claim_keys_with(
+    settlement_text: &str,
+    keys: impl FnOnce() -> Result<BTreeMap<Amount, PublicKey>, WalletError>,
+    keysets: impl FnOnce() -> Result<sp_wire::psp::KeysetsResponse, WalletError>,
+) -> Result<BTreeMap<Amount, PublicKey>, WalletError> {
+    match parse_keyset(settlement_text) {
+        None => keys(),
+        Some(id) => {
+            let live = keysets()?;
+            let Some(keys) = live.keysets.get(&id) else {
+                return Err(WalletError::Mint(format!(
+                    "keyset {id}, which signed these, is no longer live at the PSP (it was retired at a rotation): the outputs expired before they were claimed and cannot be claimed now"
+                )));
+            };
+            Ok(keys
+                .iter()
+                .map(|(u, k)| (Amount::from_units(*u), *k))
+                .collect())
+        }
+    }
+}
+
 /// The keyset the PSP printed with its signatures (`keyset <16 hex>`), if
 /// any. Output from before keysets were printed has none.
 pub fn parse_keyset(text: &str) -> Option<String> {

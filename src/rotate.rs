@@ -104,6 +104,22 @@ pub struct Window {
     pub now: u64,
 }
 
+impl From<sp_wire::fsp::RotationResponse> for Window {
+    /// The window a mint's `GET /rotation` body describes, however it came (over
+    /// HTTP, or as the signed body of a reply over AIR).
+    fn from(w: sp_wire::fsp::RotationResponse) -> Self {
+        Window {
+            current_epoch: w.current.epoch,
+            current_id: w.current.id,
+            current_starts: w.current.starts,
+            previous_epoch: w.previous.as_ref().map(|p| p.epoch),
+            previous_id: w.previous.map(|p| p.id),
+            period_hours: w.rotation_period_hours,
+            now: w.now,
+        }
+    }
+}
+
 impl Wallet {
     pub fn pending_rollovers(&self) -> &[crate::rotate::PendingRollover] {
         &self.data().pending_rollovers

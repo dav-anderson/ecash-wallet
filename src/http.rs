@@ -158,21 +158,11 @@ pub fn psp_claim_keys(
     base: &str,
     settlement_text: &str,
 ) -> Result<BTreeMap<Amount, PublicKey>, WalletError> {
-    match crate::psp::parse_keyset(settlement_text) {
-        None => fetch_psp_keys(base),
-        Some(id) => {
-            let live = fetch_psp_keysets(base)?;
-            let Some(keys) = live.keysets.get(&id) else {
-                return Err(WalletError::Mint(format!(
-                    "keyset {id}, which signed these, is no longer live at the PSP (it was retired at a rotation): the outputs expired before they were claimed and cannot be claimed now"
-                )));
-            };
-            Ok(keys
-                .iter()
-                .map(|(u, k)| (Amount::from_units(*u), *k))
-                .collect())
-        }
-    }
+    crate::psp::claim_keys_with(
+        settlement_text,
+        || fetch_psp_keys(base),
+        || fetch_psp_keysets(base),
+    )
 }
 
 pub fn fetch_psp_keys(base: &str) -> Result<BTreeMap<Amount, PublicKey>, WalletError> {
@@ -879,16 +869,7 @@ mod network_tests {
 /// A mint's `GET /rotation`, as the rollover needs it. psp-mint, esp-mint and
 /// fsp-mint answer it in the same shape.
 pub fn fetch_window(base: &str) -> Result<crate::rotate::Window, WalletError> {
-    let w = fetch_fsp_rotation(base)?;
-    Ok(crate::rotate::Window {
-        current_epoch: w.current.epoch,
-        current_id: w.current.id,
-        current_starts: w.current.starts,
-        previous_epoch: w.previous.as_ref().map(|p| p.epoch),
-        previous_id: w.previous.map(|p| p.id),
-        period_hours: w.rotation_period_hours,
-        now: w.now,
-    })
+    fetch_fsp_rotation(base).map(Into::into)
 }
 
 /// Send one stored rollover and settle it. A refusal that burned nothing
@@ -1030,6 +1011,24 @@ pub fn rotation_sync(
     kind: Kind,
     base: &str,
 ) -> Result<Vec<String>, WalletError> {
+    rotation_sync_with(wallet, kind, base, &mut |_| fetch_window(base))
+}
+
+/// How a rotation sync reads the mint's window: given the wallet (a read over
+/// AIR keeps its request in the wallet file), the window as the mint says it is
+/// now.
+pub type WindowSource<'a> =
+    &'a mut dyn FnMut(&mut Wallet) -> Result<crate::rotate::Window, WalletError>;
+
+/// [`rotation_sync`], with the mint's window read by `window` (over HTTP, or for
+/// the PSP over AIR). Everything else it sends the mint (`POST /rollover`) is
+/// HTTP either way.
+pub fn rotation_sync_with(
+    wallet: &mut Wallet,
+    kind: Kind,
+    base: &str,
+    window: WindowSource<'_>,
+) -> Result<Vec<String>, WalletError> {
     let mut log = Vec::new();
     let pending: Vec<String> = wallet
         .pending_rollovers()
@@ -1045,7 +1044,7 @@ pub fn rotation_sync(
             )),
         }
     }
-    let w = fetch_window(base)?;
+    let w = window(wallet)?;
     // Refreshed on every connection, so the cached live keysets never go stale.
     match kind {
         Kind::Psp => wallet.note_live_keysets(base, &w)?,
@@ -1171,6 +1170,17 @@ pub struct Reclaim {
 /// takes whichever swap reaches it first. If the receiver swapped first, the
 /// handoff is recorded as done and nothing comes back; the standing says so.
 pub fn reclaim_handoff(wallet: &mut Wallet, id: &str) -> Result<Reclaim, WalletError> {
+    reclaim_handoff_with(wallet, id, &mut |_, mint| fetch_window(mint))
+}
+
+/// [`reclaim_handoff`], with the mint's window read by `window` (given the wallet
+/// and the mint's URL): over HTTP, or for the PSP over AIR. The swap itself, and
+/// the question whether the receiver swapped first, are HTTP either way.
+pub fn reclaim_handoff_with(
+    wallet: &mut Wallet,
+    id: &str,
+    window: &mut dyn FnMut(&mut Wallet, &str) -> Result<crate::rotate::Window, WalletError>,
+) -> Result<Reclaim, WalletError> {
     use crate::handoff::Standing;
     let mut log = Vec::new();
     if let s @ (Standing::Received | Standing::Reclaimed) = check_handoff(wallet, id)? {
@@ -1185,7 +1195,7 @@ pub fn reclaim_handoff(wallet: &mut Wallet, id: &str) -> Result<Reclaim, WalletE
     if h.reclaim.is_none() {
         // The swap names the mint's current key set, read fresh; the mint signs
         // with any live key set, so one rotation in between does not refuse it.
-        if let Ok(w) = fetch_window(&h.mint) {
+        if let Ok(w) = window(wallet, &h.mint) {
             wallet.note_live_keysets(&h.mint, &w)?;
         }
     }

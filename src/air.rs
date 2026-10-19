@@ -1,11 +1,13 @@
-//! The PSP's mint info over AIR: the wallet's side of the first call between a
-//! wallet and a mint that does not go over HTTP. Feature `air`.
+//! The PSP's read-only calls over AIR: the wallet's side of the calls between a
+//! wallet and a mint that do not go over HTTP. Feature `air`.
 //!
-//! The call is what `GET /health` reports (`wire_version` and `network`), which
-//! `verify_mint` reads before anything else is sent to a mint. Over AIR the
-//! wallet writes one small sealed request into a mailbox of the mint's DID on a
-//! configured AIR server and waits for the mint's signed reply in a cell only it
-//! and the mint can find. The protocol, the checks on the reply and the reasons
+//! The calls are **mint info** (what `GET /health` reports, `wire_version` and
+//! `network`, which `verify_mint` reads before anything else is sent to a mint),
+//! and the PSP's **keys**, **keysets** and **rotation** (`GET /keys`, `/keysets`,
+//! `/rotation`), whose reply bodies are the JSON the HTTP routes return. Over AIR
+//! the wallet writes one small sealed request into a mailbox of the mint's DID on
+//! a configured AIR server and waits for the mint's signed reply in a cell only
+//! it and the mint can find. The protocol, the checks on the reply and the reasons
 //! are `sp_wire::air_request` and REQUEST-DESIGN.md (sandbox-mint,
 //! `air-sandbox/`); this module is the wallet's part around them:
 //!
@@ -16,16 +18,18 @@
 //!   written for it (the reply cell is read first).
 //! - **Retries:** `air.attempts` tries (3) of `air.reply_wait_secs` (30) each,
 //!   the same request every time, each try in the next free mailbox slot. Then
-//!   "mint unreachable", and the request stays in the file; the next call
-//!   resumes it.
+//!   "mint unreachable", and the request stays in the file; the next call of
+//!   the same kind resumes it (one kept request per mint and kind).
 //! - **A request ends** when it is answered and checked, or when a reply comes
 //!   that fails a check (a write-once cell cannot be answered differently, so
 //!   the request is dropped and the error says what was wrong). It does not
 //!   end when the mint did not answer.
 //! - **A kept request that is answered late is not trusted as current.** If the
 //!   reply found is older than `air.max_skew_secs` the request is dropped and
-//!   one new request is made in the same call: mint info is "how is the mint
-//!   now", and a reply from hours ago says nothing about now.
+//!   one new request is made in the same call: each of these calls is "how is
+//!   the mint now", and a reply from hours ago says nothing about now (above
+//!   all keys: an old reply is how a mint's retired keys would come back).
+//! - **No caching**, like the HTTP calls they replace: every call asks again.
 //!
 //! The call blocks (the wallet is blocking): the AIR client is async, so it runs
 //! on a runtime built for the call, on a thread of its own, which also works
@@ -33,13 +37,15 @@
 //!
 //! The mint's DID is the one in `air.psp_did`; the AIR server and its host are
 //! configuration (upstream item 4 will resolve them from the DID). Over AIR,
-//! only this one call changes: everything else the wallet sends the PSP is
-//! still HTTP.
+//! only these four read-only calls change: everything else the wallet sends the
+//! PSP (`/melt`, `/rollover`, `/burns`, `/check-state`, `/audit`) is still HTTP.
 
-use sp_wire::air_request::VerifyError;
-use sp_wire::air_request::addr;
-use sp_wire::air_request::ask::{AskConfig, AskError, InFlight, Outcome, ask_mint_info};
+use sp_wire::air_request::ask::{AskConfig, AskError, InFlight, Verified, ask};
 use sp_wire::air_request::client::{self, ServerRef, block_on_new_runtime};
+use sp_wire::air_request::{
+    KIND_KEYS, KIND_KEYSETS, KIND_MINT_INFO, KIND_ROTATION, STATUS_UNAVAILABLE, VerifyError, addr,
+    check_mint_info,
+};
 use sp_wire::version::WireMismatch;
 
 use crate::Wallet;
@@ -50,13 +56,24 @@ use crate::store::PendingAirRequest;
 /// What one run of a request came to, when it did not fail.
 enum Ended {
     /// Answered and checked.
-    Verified,
+    Verified(Verified),
     /// The reply was too old to be a statement about now (only a kept request
     /// can be): the request is dropped and a new one is made.
     Stale,
 }
 
-fn ask_config(air: &AirSettings, expected_network: &str) -> Result<AskConfig, WalletError> {
+/// What a kind of request is called in messages.
+fn what(kind: u8) -> &'static str {
+    match kind {
+        KIND_MINT_INFO => "mint info",
+        KIND_KEYS => "keys",
+        KIND_KEYSETS => "keysets",
+        KIND_ROTATION => "rotation",
+        _ => "a request",
+    }
+}
+
+fn ask_config(air: &AirSettings) -> Result<AskConfig, WalletError> {
     let missing = |what: &str| {
         WalletError::Invalid(format!(
             "AIR is not configured for the PSP: {what} is not set"
@@ -75,8 +92,9 @@ fn ask_config(air: &AirSettings, expected_network: &str) -> Result<AskConfig, Wa
             host: air.host.clone(),
         },
         mint,
+        // Only `ask_mint_info` reads these two; `verify_mint` checks them itself.
         wire_version: sp_wire::WIRE_VERSION,
-        network: expected_network.to_string(),
+        network: String::new(),
         reply_wait_secs: air.reply_wait_secs,
         attempts: air.attempts,
         max_skew_secs: air.max_skew_secs,
@@ -87,6 +105,7 @@ fn ask_config(air: &AirSettings, expected_network: &str) -> Result<AskConfig, Wa
 fn pending_of(flight: &InFlight, cfg: &AskConfig, created_at: u64) -> PendingAirRequest {
     PendingAirRequest {
         request_id: hex::encode(flight.request_id),
+        kind: flight.kind,
         mint: cfg.mint.to_hex(),
         r: addr::secret_to_hex(&flight.r),
         slots: flight.slots.clone(),
@@ -107,6 +126,7 @@ fn flight_of(pending: &PendingAirRequest) -> Result<InFlight, WalletError> {
         .ok_or_else(|| corrupt("a request id that is not 64 hex characters"))?;
     let r = addr::secret_from_hex(&pending.r).map_err(|_| corrupt("a key that is not valid"))?;
     Ok(InFlight {
+        kind: pending.kind,
         request_id,
         r,
         slots: pending.slots.clone(),
@@ -121,14 +141,14 @@ async fn run_async(
     cfg: &AskConfig,
     flight: &mut InFlight,
     created_at: u64,
-) -> Result<Outcome, AskError> {
+) -> Result<Verified, AskError> {
     let mut save = |f: &InFlight| {
         wallet
             .save_air_request(pending_of(f, cfg, created_at))
             .map_err(|e| format!("the AIR request could not be saved to the wallet file: {e}"))
     };
     let client = client::connect(&cfg.server).await?;
-    ask_mint_info(&client, cfg, flight, &mut save).await
+    ask(&client, cfg, flight, &mut save).await
 }
 
 /// Run one request to its end (or to "unreachable") and settle the wallet file.
@@ -141,15 +161,16 @@ fn run_request(
     resumed: bool,
 ) -> Result<Ended, WalletError> {
     let request_id = hex::encode(flight.request_id);
+    let what = what(flight.kind);
     let result = {
         let (wallet, flight) = (&mut *wallet, &mut flight);
         block_on_new_runtime(move || run_async(wallet, cfg, flight, created_at))
-            .map_err(|e| WalletError::Mint(format!("mint info over AIR: {}", e.0)))?
+            .map_err(|e| WalletError::Mint(format!("{what} over AIR: {}", e.0)))?
     };
     match result {
-        Ok(_) => {
+        Ok(verified) => {
             wallet.end_air_request(&request_id)?;
-            Ok(Ended::Verified)
+            Ok(Ended::Verified(verified))
         }
         Err(AskError::Verify(VerifyError::Stale { .. })) if resumed => {
             wallet.end_air_request(&request_id)?;
@@ -161,7 +182,7 @@ fn run_request(
         ))),
         Err(AskError::Verify(e)) => {
             wallet.end_air_request(&request_id)?;
-            Err(refusal(cfg, e))
+            Err(refusal(&cfg.mint.to_hex(), what, e))
         }
         Err(AskError::NotOpenable(e)) => {
             wallet.end_air_request(&request_id)?;
@@ -169,14 +190,14 @@ fn run_request(
                 "the PSP's AIR reply cell does not hold a reply for this wallet: {e}. Nothing was sent"
             )))
         }
-        Err(AskError::Other(e)) => Err(WalletError::Mint(format!("mint info over AIR: {e}"))),
+        Err(AskError::Other(e)) => Err(WalletError::Mint(format!("{what} over AIR: {e}"))),
     }
 }
 
 /// The wallet's error for a reply that failed a check: the same words and
 /// kinds as the HTTP check for the two that `verify_mint` makes.
-fn refusal(cfg: &AskConfig, e: VerifyError) -> WalletError {
-    let mint = format!("the PSP {} (over AIR)", cfg.mint.to_hex());
+fn refusal(mint_hex: &str, what: &str, e: VerifyError) -> WalletError {
+    let mint = format!("the PSP {mint_hex} (over AIR)");
     match e {
         VerifyError::Network { theirs, ours } => WalletError::Invalid(format!(
             "{mint} is on {theirs}, but this wallet is on {ours}. Nothing was sent. Pass the flag for its network (--regtest, --signet, --testnet; none means mainnet) or use another mint"
@@ -188,10 +209,62 @@ fn refusal(cfg: &AskConfig, e: VerifyError) -> WalletError {
                 ours: sp_wire::WIRE_VERSION,
             },
         },
+        VerifyError::Refused(STATUS_UNAVAILABLE) => WalletError::Mint(format!(
+            "{mint} could not answer {what} now (it said so in a signed reply). Nothing was sent. Try again later"
+        )),
         other => WalletError::Mint(format!(
-            "{mint} sent a reply that was refused: {other}. Nothing was sent"
+            "{mint} sent a reply to {what} that was refused: {other}. Nothing was sent"
         )),
     }
+}
+
+/// Ask the PSP one of the read-only questions (`KIND_MINT_INFO`, `KIND_KEYS`,
+/// `KIND_KEYSETS`, `KIND_ROTATION`) over AIR and return the verified reply: the
+/// mint's signature, the request, the status and the age are checked; the body
+/// is the mint's and is read by the caller ([`fetch`], [`verify_mint`]).
+///
+/// Resumes a kept request of this kind for this PSP if there is one. Needs all
+/// of `air.psp_did`, `air.server` and `air.host`.
+pub fn call(wallet: &mut Wallet, air: &AirSettings, kind: u8) -> Result<Verified, WalletError> {
+    let cfg = ask_config(air)?;
+    let mint = cfg.mint.to_hex();
+    let kept = wallet
+        .air_requests()
+        .iter()
+        .find(|r| r.mint == mint && r.kind == kind)
+        .cloned();
+    if let Some(pending) = kept {
+        let flight = flight_of(&pending)?;
+        match run_request(wallet, &cfg, flight, pending.created_at, true)? {
+            Ended::Verified(v) => return Ok(v),
+            Ended::Stale => {} // fall through to a new request
+        }
+    }
+    match run_request(wallet, &cfg, InFlight::of(kind), addr::now_secs(), false)? {
+        Ended::Verified(v) => Ok(v),
+        // Only a kept request is ever dropped as stale.
+        Ended::Stale => Err(WalletError::Mint(format!(
+            "{} over AIR: the reply was dated too far from now",
+            what(kind)
+        ))),
+    }
+}
+
+/// [`call`], with the body read as JSON of type `T`: the type the HTTP call
+/// reads. A signed body that is not that type is the mint's own fault and is
+/// refused as such.
+pub fn fetch<T: serde::de::DeserializeOwned>(
+    wallet: &mut Wallet,
+    air: &AirSettings,
+    kind: u8,
+) -> Result<T, WalletError> {
+    let verified = call(wallet, air, kind)?;
+    verified.json().map_err(|e| {
+        WalletError::Mint(format!(
+            "{} over AIR: the PSP signed a reply that is not what was asked for: {e}",
+            what(kind)
+        ))
+    })
 }
 
 /// Ask the PSP for its mint info over AIR and refuse if its wire version is not
@@ -207,25 +280,9 @@ pub fn verify_mint(
     air: &AirSettings,
     expected_network: &str,
 ) -> Result<(), WalletError> {
-    let cfg = ask_config(air, expected_network)?;
-    let mint = cfg.mint.to_hex();
-    let kept = wallet
-        .air_requests()
-        .iter()
-        .find(|r| r.mint == mint)
-        .cloned();
-    if let Some(pending) = kept {
-        let flight = flight_of(&pending)?;
-        match run_request(wallet, &cfg, flight, pending.created_at, true)? {
-            Ended::Verified => return Ok(()),
-            Ended::Stale => {} // fall through to a new request
-        }
-    }
-    match run_request(wallet, &cfg, InFlight::new(), addr::now_secs(), false)? {
-        Ended::Verified => Ok(()),
-        // Only a kept request is ever dropped as stale.
-        Ended::Stale => Err(WalletError::Mint(
-            "mint info over AIR: the reply was dated too far from now".into(),
-        )),
-    }
+    let verified = call(wallet, air, KIND_MINT_INFO)?;
+    let mint = air.psp_did.map(|d| d.to_hex()).unwrap_or_default();
+    check_mint_info(verified.body(), sp_wire::WIRE_VERSION, expected_network)
+        .map(|_| ())
+        .map_err(|e| refusal(&mint, what(KIND_MINT_INFO), e))
 }

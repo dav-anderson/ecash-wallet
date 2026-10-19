@@ -160,10 +160,12 @@ The wallet file is --wallet, else $ECASH_WALLET_FILE, else
 regtest/). URLs default to $ECASH_PSP_URL / $ECASH_ESP_URL,
 else http://127.0.0.1:3000 and http://127.0.0.1:3100.
 
-The PSP's wire version and network (what its GET /health says) are asked over
-AIR instead of HTTP when config.toml's [air] section (or ECASH_AIR_PSP_DID,
-ECASH_AIR_SERVER and ECASH_AIR_HOST) names the PSP's DID, an AIR server and its
-host. Every other call is HTTP. `config` prints every setting.";
+The PSP's wire version and network (what its GET /health says), its keys
+(GET /keys), its keysets (GET /keysets) and its rotation window (GET /rotation)
+are asked over AIR instead of HTTP when config.toml's [air] section (or
+ECASH_AIR_PSP_DID, ECASH_AIR_SERVER and ECASH_AIR_HOST) names the PSP's DID, an
+AIR server and its host. Every other call is HTTP. `config` prints every
+setting.";
 
 /// The arguments left after flags are taken out.
 struct Args(Vec<String>);
@@ -285,6 +287,11 @@ fn take_network(args: &mut Args) -> Result<&'static str, WalletError> {
 /// The `[air]` settings of this run, set once in `run`. Empty (AIR off) until then.
 static AIR: std::sync::OnceLock<AirSettings> = std::sync::OnceLock::new();
 
+/// The `[air]` settings of this run (empty before `run` sets them: AIR off).
+fn air_settings() -> AirSettings {
+    AIR.get().cloned().unwrap_or_default()
+}
+
 /// What the first check of the PSP in this run came to, with the URL it was for:
 /// the PSP is checked at startup and again by the command, and with AIR a dead
 /// mint costs `air.attempts` tries of `air.reply_wait_secs` each time, so the
@@ -296,7 +303,7 @@ static PSP_CHECKED: std::sync::Mutex<Option<(String, Result<(), String>)>> =
 /// over AIR when `[air]` is configured (see `ecash_wallet::mint_info`), else
 /// over HTTP.
 fn verify_psp(wallet: &mut Wallet, base: &str) -> Result<(), WalletError> {
-    let air = AIR.get().cloned().unwrap_or_default();
+    let air = air_settings();
     if !air.is_configured() {
         return ecash_wallet::mint_info::verify_psp(wallet, &air, base, network());
     }
@@ -336,9 +343,10 @@ fn buy_psp(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
         .ok_or_else(|| WalletError::Invalid("--mint-key HEX is required".into()))?;
     if let Some(base) = args.flag("--psp-url")? {
         verify_psp(wallet, &base)?;
-        let w = http::fetch_window(&base)?;
+        let air = air_settings();
+        let w = ecash_wallet::mint_info::psp_window(wallet, &air, &base)?;
         wallet.note_live_keysets(&base, &w)?;
-        http::sync_psp_limits(wallet, &base)?;
+        ecash_wallet::mint_info::sync_psp_limits(wallet, &air, &base)?;
     }
     let reply = match args.flag("--reply-did")? {
         Some(text) => parse_did(&text)?,
@@ -396,7 +404,7 @@ fn claim_psp(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
     }
     // Unblind with the keys of the keyset the PSP printed; older output names
     // none and was signed with the keys of `GET /keys`.
-    let keys = http::psp_claim_keys(&base, &text)?;
+    let keys = ecash_wallet::mint_info::psp_claim_keys(wallet, &air_settings(), &base, &text)?;
     let claimed = wallet.claim_psp(&signatures, &keys)?;
     println!(
         "claimed {} PSP in {} note(s); {} output(s) still waiting",
@@ -1152,7 +1160,7 @@ fn handoff(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
             let [id] = rest.as_slice() else {
                 return Err(WalletError::Invalid("handoff reclaim takes an ID".into()));
             };
-            let done = http::reclaim_handoff(wallet, id)?;
+            let done = ecash_wallet::mint_info::reclaim_handoff(wallet, &air_settings(), id)?;
             for line in &done.log {
                 println!("{line}");
             }
@@ -1479,7 +1487,7 @@ fn startup_rotation_sync(wallet: &mut Wallet) {
         let Ok(base) = checked else {
             continue;
         };
-        match http::rotation_sync(wallet, kind, &base) {
+        match ecash_wallet::mint_info::rotation_sync(wallet, &air_settings(), kind, &base) {
             Ok(lines) => {
                 for l in lines {
                     eprintln!("{base}: {l}");
@@ -1703,10 +1711,12 @@ fn config_command(loaded: &config::Loaded, args: Args) -> Result<(), WalletError
     let air = &loaded.settings.air;
     if air.is_configured() {
         println!(
-            "PSP mint info: over AIR (air.psp_did, air.server and air.host are set); every other call is HTTP"
+            "PSP mint info, keys, keysets and rotation: over AIR (air.psp_did, air.server and air.host are set); every other call is HTTP"
         );
     } else {
-        println!("PSP mint info: over HTTP (air.psp_did, air.server and air.host are not set)");
+        println!(
+            "PSP mint info, keys, keysets and rotation: over HTTP (air.psp_did, air.server and air.host are not set)"
+        );
     }
     Ok(())
 }

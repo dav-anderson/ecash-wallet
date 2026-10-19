@@ -21,7 +21,7 @@ cargo test
 
 The `http` feature is on by default. It adds the HTTP client and the command line. An app that sends requests its own way can turn it off and use only the library.
 
-The `air` feature is on by default too. It adds the PSP's mint info over AIR (see "The PSP's mint info over AIR"), through sp-wire's `air-client` feature, which builds `air_server`. `air_server` names AIR as `path = "../air"` (upstream issue 3), so building with `air` takes a local patch for it beside the AIR one in the git-ignored `.cargo/config.toml`, and the AIR patch must be the folder `<air_server>/../air`, or two `air` crates are built and their types do not match. For now both are the sandbox checkouts (`.../sandbox-mint/air-sandbox/air` and `.../air_server`; sp-wire's README, "The AIR request", shows the blocks). An app that does not want AIR turns the feature off (`default-features = false, features = ["http"]`). `cargo update -p sp-wire` and `git restore Cargo.lock` apply as above.
+The `air` feature is on by default too. It adds the PSP's mint info, keys, keysets and rotation over AIR (see "The PSP's reads over AIR"), through sp-wire's `air-client` feature, which builds `air_server`. `air_server` names AIR as `path = "../air"` (upstream issue 3), so building with `air` takes a local patch for it beside the AIR one in the git-ignored `.cargo/config.toml`, and the AIR patch must be the folder `<air_server>/../air`, or two `air` crates are built and their types do not match. For now both are the sandbox checkouts (`.../sandbox-mint/air-sandbox/air` and `.../air_server`; sp-wire's README, "The AIR request", shows the blocks). An app that does not want AIR turns the feature off (`default-features = false, features = ["http"]`). `cargo update -p sp-wire` and `git restore Cargo.lock` apply as above.
 
 ## Settings
 
@@ -35,7 +35,7 @@ The `air` feature is on by default too. It adds the PSP's mint info over AIR (se
 | `$ECASH_PSP_URL` | `http://127.0.0.1:3000` | The PSP mint. |
 | `$ECASH_ESP_URL` | `http://127.0.0.1:3100` | The ESP mint. |
 | `$ECASH_FSP_URL` | `http://127.0.0.1:3200` | An FSP mint (one used before is remembered per service). |
-| `$ECASH_AIR_PSP_DID`, or `[air] psp_did` | none | The PSP's DID (66 hex), for the PSP's mint info over AIR. With `air.server` and `air.host` also set, `verify_mint` asks the PSP over AIR; **all three or none** (some but not all is an error). None: HTTP. |
+| `$ECASH_AIR_PSP_DID`, or `[air] psp_did` | none | The PSP's DID (66 hex), for the PSP's mint info, keys, keysets and rotation over AIR. With `air.server` and `air.host` also set, the wallet asks the PSP those four over AIR; **all three or none** (some but not all is an error). None: HTTP. |
 | `$ECASH_AIR_SERVER`, or `[air] server` | none | The AIR server's name: its public key, compressed hex (66 characters). The client checks the server's signed challenge against it. |
 | `$ECASH_AIR_HOST`, or `[air] host` | none | The AIR server's host name or IP, no port (the AIR client always dials port 5702). `127.0.0.1` for a server on this machine. |
 | `$ECASH_AIR_REPLY_WAIT_SECS`, or `[air] reply_wait_secs` | `30` | How long to wait for the reply to one try. 1 to 600. |
@@ -43,19 +43,24 @@ The `air` feature is on by default too. It adds the PSP's mint info over AIR (se
 | `$ECASH_AIR_MAX_SKEW_SECS`, or `[air] max_skew_secs` | `300` | How far the reply's `issued_at` may be from this clock. 1 to 86400. |
 | `$ECASH_AIR_TIMEOUT_SECS`, or `[air] timeout_secs` | `10` | How long the AIR server may take to answer one step. 1 to 600. |
 | the `http` cargo feature | on | The HTTP client and the command line. An app that sends requests its own way can turn it off and use only the library. |
-| the `air` cargo feature | on | The PSP's mint info over AIR (needs the local patches above for now). With it off and the `[air]` settings set, `verify_mint` refuses with a message that says so. |
+| the `air` cargo feature | on | The PSP's mint info, keys, keysets and rotation over AIR (needs the local patches above for now). With it off and the `[air]` settings set, `verify_mint` refuses with a message that says so. |
 
 The wallet file holds spend keys. Losing it loses the notes and the blinding factors for anything in flight. A missing file is an empty wallet; a file that cannot be read is an error and is never replaced. More in [DESIGN.md](DESIGN.md), "Notes and the wallet file".
 
-## The PSP's mint info over AIR
+## The PSP's reads over AIR
 
-The first call between the wallet and a mint that does not go over HTTP. Before it sends anything to the PSP, the wallet asks what `GET /health` reports (`wire_version`, `network`). When `air.psp_did`, `air.server` and `air.host` are all set, that question goes over AIR instead: the wallet writes a small sealed request into a mailbox of the PSP's DID on the configured AIR server and verifies the PSP's signed reply (the signature is the PSP DID key's, checked against the 33-byte DID alone). Every other call to the PSP, and every call to the ESP and FSP mints, is still HTTP.
+Four read-only calls to the PSP can go over AIR: its **mint info** (what `GET /health` reports: `wire_version`, `network`, which the wallet asks before it sends anything to the PSP), its **keys** (`GET /keys`), its **keysets** (`GET /keysets`) and its **rotation window** (`GET /rotation`). When `air.psp_did`, `air.server` and `air.host` are all set, these go over AIR instead: the wallet writes a small sealed request into a mailbox of the PSP's DID on the configured AIR server and verifies the PSP's signed reply (the signature is the PSP DID key's, checked against the 33-byte DID alone). The reply body is the JSON the HTTP route returns, so the wallet reads it with the types it already uses. Every other call to the PSP (`/melt`, `/rollover`, `/burns`, `/check-state`, `/audit`), and every call to the ESP and FSP mints, is still HTTP; so is a call that is local (the wallet's own files never go over AIR).
 
-- **The request is kept in the wallet file** (`air_requests`: the request id, the one-off key, the slots written) from before the first write until it is answered, so a reply that comes while the wallet is not looking is read on the next call without writing a second request.
-- **Retry:** 3 tries of 30 s (`air.attempts`, `air.reply_wait_secs`), the same request each time in the next free slot; then "the PSP did not answer over AIR" and the request stays. The next call carries on with it.
+- **Where the calls are made.** The keys are read when the wallet learns the PSP's largest note size and live keysets (`buy-psp --psp-url`), when it unblinds a settlement (`claim-psp`: the keys of the keyset the PSP printed, from the keysets, or `GET /keys` for older output), and when it keeps notes on a live key set (`rotation_sync`, at startup and in `handoff reclaim`: the rotation window). The code that picks the way is `mint_info` (`psp_keys`, `psp_keysets`, `psp_window`, `sync_psp_limits`, `psp_claim_keys`, `rotation_sync`, `reclaim_handoff`).
+- **What the signed reply adds.** Over HTTP the wallet trusts the network path to the PSP for its keys; over AIR the keys come in a reply signed by the PSP's DID key, so nothing in between, not the AIR server and not a man in the middle, can substitute keys.
+- **No caching.** As over HTTP, every call asks again; nothing is remembered between calls except the run's first mint-info answer (below).
+- **A PSP that cannot answer** (its mint lock is poisoned, a rotation step failed) says so in a signed reply, and the wallet fails at once with "could not answer keys now" instead of waiting out its tries.
+
+- **The request is kept in the wallet file** (`air_requests`: the request kind, the request id, the one-off key, the slots written) from before the first write until it is answered, so a reply that comes while the wallet is not looking is read on the next call without writing a second request.
+- **Retry:** 3 tries of 30 s (`air.attempts`, `air.reply_wait_secs`), the same request each time in the next free slot; then "the PSP did not answer over AIR" and the request stays. The next call of the same kind carries on with it (one kept request per PSP and kind).
 - **A reply that fails a check ends the request** and says what was wrong: a network or wire version that is not this wallet's is the same error as over HTTP; a bad signature, another mint's, another request's, or a bad body is "a reply that was refused". A reply older than `air.max_skew_secs` when it is found is dropped and one new request is made in the same call.
 - **The command line asks once per run** (the first answer is kept for the run): with the PSP down, AIR costs 3 x 30 s once, not at the startup check and again at the command. HTTP is checked every time, as before.
-- **HTTP is to be removed** when the AIR integration is done; for this call it is one function (`mint_info::over_http`).
+- **HTTP is to be removed** when the AIR integration is done; for each of these calls it is one small function (`mint_info::over_http` for mint info; `http_keys`, `http_keysets`, `http_window` and `http_claim_keys` for the rest), and the HTTP functions themselves are unchanged.
 - `ecash-wallet config` shows which way the PSP is asked.
 
 ## Wire version
@@ -146,7 +151,7 @@ cargo test --all-features
 cargo fmt --check
 ```
 
-`cargo test --all-features` also runs `tests/air_flow.rs`: an `air_server` started in the test process (on port 5702, which the AIR client always dials, so the port must be free), psp-mint's real AIR listener, and the wallet's `verify_mint` over AIR. That file uses psp-mint's `air_listener`, which no tag has yet, so it is built only with the `air-listener-tests` feature (`--all-features` has it); plain `cargo test` skips it. It needs the patches described under "Setup" and a psp-mint that has the listener, which today means the local-mints script below.
+`cargo test --all-features` also runs `tests/air_flow.rs`: an `air_server` started in the test process (on port 5702, which the AIR client always dials, so the port must be free), psp-mint's real AIR listener, and the wallet's mint info, keys, keysets and rotation over AIR (keys and the rest against a real rotating mint whose HTTP routes run in the process, so the two ways are compared). That file uses psp-mint's `air_listener`, which no tag has yet, so it is built only with the `air-listener-tests` feature (`--all-features` has it); plain `cargo test` skips it. It needs the patches described under "Setup" and a psp-mint that has the listener, which today means the local-mints script below.
 
 The tests run in one process with real mints (psp-mint, esp-mint and fsp-mint are dev-dependencies at their release tags) and no network. What they cover is in [DESIGN.md](DESIGN.md), "Tests". Because the mints are at their tags, a change in a mint is not exercised until the tag moves: before a release in which a mint and the wallet change together, run `sh ~/sandbox-mint/scripts/test-wallet-against-local-mints.sh` (with `SP_LOCAL_AIR` and `SP_LOCAL_AIR_SERVER` set to the AIR and air_server checkouts while the AIR request needs them; the script's header says how), which runs these tests against the esp-mint, psp-mint and fsp-mint folders on this machine without changing any repo (and then fsp-mint's, psp-mint's and esp-mint's tests). The regtest runs in [REGTEST.md](REGTEST.md) are the end-to-end tests with a real Bitcoin node.
 

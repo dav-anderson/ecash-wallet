@@ -32,10 +32,11 @@
 //!
 //! # AIR (`[air]`)
 //!
-//! The first call between the wallet and a mint that does not go over HTTP is
-//! the **PSP's mint info** (what `GET /health` reports: `wire_version` and
-//! `network`), asked by `verify_mint` before anything else is sent to the PSP.
-//! It goes over AIR when the wallet knows how to reach the PSP there, which
+//! The calls between the wallet and a mint that do not go over HTTP are the
+//! **PSP's mint info** (what `GET /health` reports: `wire_version` and
+//! `network`, asked by `verify_mint` before anything else is sent to the PSP) and
+//! its **keys**, **keysets** and **rotation** (`GET /keys`, `/keysets`,
+//! `/rotation`). They go over AIR when the wallet knows how to reach the PSP there, which
 //! takes three settings together: `air.psp_did` (the PSP's DID), `air.server`
 //! (the AIR server's name, its public key) and `air.host` (where to reach it).
 //! With none of the three set (the default) the call is HTTP, as before. Setting
@@ -88,7 +89,7 @@ pub const SPECS: &[Spec] = &[
         env: "ECASH_AIR_PSP_DID",
         default: "",
         units: "service DID (66 hex characters)",
-        what: "The PSP's DID: the 33-byte compressed key of its mint_did_key.json, in hex. With air.server and air.host also set, the PSP's mint info is asked over AIR instead of HTTP. All three or none: setting only some is an error. Empty (the default): HTTP.",
+        what: "The PSP's DID: the 33-byte compressed key of its mint_did_key.json, in hex. With air.server and air.host also set, the PSP's mint info, keys, keysets and rotation are asked over AIR instead of HTTP. All three or none: setting only some is an error. Empty (the default): HTTP.",
     },
     Spec {
         key: "air.server",
@@ -109,7 +110,7 @@ pub const SPECS: &[Spec] = &[
         env: "ECASH_AIR_REPLY_WAIT_SECS",
         default: "30",
         units: "seconds (1 to 600)",
-        what: "How long to wait for the mint's reply to one try of a mint-info request. After that the same request is written again, in the next free mailbox slot.",
+        what: "How long to wait for the mint's reply to one try of a request (mint info, keys, keysets or rotation). After that the same request is written again, in the next free mailbox slot.",
     },
     Spec {
         key: "air.attempts",
@@ -164,7 +165,7 @@ impl Default for AirSettings {
 }
 
 impl AirSettings {
-    /// True when the PSP's mint info is asked over AIR: the DID, the server and
+    /// True when the PSP's mint info, keys, keysets and rotation are asked over AIR: the DID, the server and
     /// the host are all set. ([`Settings::problems`] refuses some but not all.)
     pub fn is_configured(&self) -> bool {
         self.psp_did.is_some() && !self.server.is_empty() && !self.host.is_empty()
@@ -261,7 +262,7 @@ impl Settings {
             return vec![];
         }
         vec![format!(
-            "air.psp_did, air.server and air.host go together (all three ask the PSP's mint info over AIR, none leaves it on HTTP), but {} not set",
+            "air.psp_did, air.server and air.host go together (all three ask the PSP's mint info, keys, keysets and rotation over AIR, none leaves them on HTTP), but {} not set",
             if unset.len() == 1 {
                 format!("{} is", unset[0])
             } else {

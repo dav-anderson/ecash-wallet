@@ -1,15 +1,17 @@
-//! The PSP's read-only calls over AIR: the wallet's side of the calls between a
-//! wallet and a mint that do not go over HTTP. Feature `air`.
+//! The PSP's calls over AIR: the wallet's side of the calls between a wallet and
+//! a mint that do not go over HTTP. Feature `air`.
 //!
 //! The calls are **mint info** (what `GET /health` reports, `wire_version` and
 //! `network`, which `verify_mint` reads before anything else is sent to a mint),
-//! and the PSP's **keys**, **keysets** and **rotation** (`GET /keys`, `/keysets`,
-//! `/rotation`), whose reply bodies are the JSON the HTTP routes return. Over AIR
-//! the wallet writes one small sealed request into a mailbox of the mint's DID on
+//! the PSP's **keys**, **keysets** and **rotation** (`GET /keys`, `/keysets`,
+//! `/rotation`) and the PSP's **rollover** and **check-state** (`POST /rollover`,
+//! `/check-state`), whose reply bodies are the JSON the HTTP routes return. Over
+//! AIR the wallet writes one sealed request into a mailbox of the mint's DID on
 //! a configured AIR server and waits for the mint's signed reply in a cell only
 //! it and the mint can find. The protocol, the checks on the reply and the reasons
 //! are `sp_wire::air_request` and REQUEST-DESIGN.md (sandbox-mint,
-//! `air-sandbox/`); this module is the wallet's part around them:
+//! `air-sandbox/`, sections 14 and 15); this module is the wallet's part around
+//! them:
 //!
 //! - **The request is kept in the wallet file** ([`PendingAirRequest`]) from
 //!   before the first write until it ends: its `request_id` and one-off key `r`
@@ -19,32 +21,40 @@
 //! - **Retries:** `air.attempts` tries (3) of `air.reply_wait_secs` (30) each,
 //!   the same request every time, each try in the next free mailbox slot. Then
 //!   "mint unreachable", and the request stays in the file; the next call of
-//!   the same kind resumes it (one kept request per mint and kind).
-//! - **A request ends** when it is answered and checked, or when a reply comes
-//!   that fails a check (a write-once cell cannot be answered differently, so
-//!   the request is dropped and the error says what was wrong). It does not
-//!   end when the mint did not answer.
+//!   the same kind resumes it. A read is kept once per mint and kind; a call
+//!   with a body (rollover, check-state) once per mint, kind and body (the
+//!   SHA-256 of the body is kept with it), so a second rollover is never
+//!   mistaken for the first.
+//! - **A request ends** when it is answered and checked (an answer or a signed
+//!   refusal), or when a reply comes that fails a check (a write-once cell
+//!   cannot be answered differently, so the request is dropped and the error
+//!   says what was wrong). It does not end when the mint did not answer.
 //! - **A kept request that is answered late is not trusted as current.** If the
 //!   reply found is older than `air.max_skew_secs` the request is dropped and
 //!   one new request is made in the same call: each of these calls is "how is
 //!   the mint now", and a reply from hours ago says nothing about now (above
-//!   all keys: an old reply is how a mint's retired keys would come back).
+//!   all keys: an old reply is how a mint's retired keys would come back). For
+//!   a rollover the new request has the same body, and the mint answers it from
+//!   its stored answer (rollovers are idempotent by request hash), so nothing
+//!   is applied twice.
 //! - **No caching**, like the HTTP calls they replace: every call asks again.
 //!
 //! The call blocks (the wallet is blocking): the AIR client is async, so it runs
 //! on a runtime built for the call, on a thread of its own, which also works
 //! when the caller is inside another runtime.
 //!
-//! The mint's DID is the one in `air.psp_did`; the AIR server and its host are
-//! configuration (upstream item 4 will resolve them from the DID). Over AIR,
-//! only these four read-only calls change: everything else the wallet sends the
-//! PSP (`/melt`, `/rollover`, `/burns`, `/check-state`, `/audit`) is still HTTP.
+//! The mint's DID is the SPI's: `air.psp_did` if set, else the built-in one
+//! ([`crate::config::BUILTIN_SPI_DID`], a PLACEHOLDER until the first SPI
+//! deploy); the AIR server and its host are configuration (upstream item 4
+//! will resolve them from the DID). Over AIR, only these calls change:
+//! everything else the wallet sends the PSP (`/melt`, `/burns`, `/audit`) is
+//! still HTTP, and so is every call to the ESP and the FSPs.
 
 use sp_wire::air_request::ask::{AskConfig, AskError, InFlight, Verified, ask};
 use sp_wire::air_request::client::{self, ServerRef, block_on_new_runtime};
 use sp_wire::air_request::{
-    KIND_KEYS, KIND_KEYSETS, KIND_MINT_INFO, KIND_ROTATION, STATUS_UNAVAILABLE, VerifyError, addr,
-    check_mint_info,
+    KIND_CHECK_STATE, KIND_KEYS, KIND_KEYSETS, KIND_MINT_INFO, KIND_ROLLOVER, KIND_ROTATION,
+    STATUS_UNAVAILABLE, VerifyError, addr, check_mint_info,
 };
 use sp_wire::version::WireMismatch;
 
@@ -69,7 +79,33 @@ fn what(kind: u8) -> &'static str {
         KIND_KEYS => "keys",
         KIND_KEYSETS => "keysets",
         KIND_ROTATION => "rotation",
+        KIND_ROLLOVER => "rollover",
+        KIND_CHECK_STATE => "check-state",
         _ => "a request",
+    }
+}
+
+/// The PSP's DID as messages name it: the hex, and, when it is the built-in
+/// PLACEHOLDER, that fact, so that a failure never leaves the reader thinking a
+/// real SPI was asked.
+fn mint_label(mint_hex: &str) -> String {
+    if mint_hex == crate::config::BUILTIN_SPI_DID {
+        format!(
+            "{mint_hex} (the built-in PLACEHOLDER SPI DID, not a real one: set air.psp_did to the SPI's DID)"
+        )
+    } else {
+        mint_hex.to_string()
+    }
+}
+
+/// The SHA-256 of a request body, hex; empty for no body, so the plain reads
+/// (and a wallet file from before there were bodies) match each other.
+fn body_hash(body: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    if body.is_empty() {
+        String::new()
+    } else {
+        hex::encode(Sha256::digest(body))
     }
 }
 
@@ -85,7 +121,7 @@ fn ask_config(air: &AirSettings) -> Result<AskConfig, WalletError> {
     if air.host.is_empty() {
         return Err(missing("air.host"));
     }
-    let mint = air.psp_did.ok_or_else(|| missing("air.psp_did"))?;
+    let mint = air.psp_did();
     Ok(AskConfig {
         server: ServerRef {
             name: air.server.clone(),
@@ -110,10 +146,14 @@ fn pending_of(flight: &InFlight, cfg: &AskConfig, created_at: u64) -> PendingAir
         r: addr::secret_to_hex(&flight.r),
         slots: flight.slots.clone(),
         created_at,
+        body_hash: body_hash(&flight.body),
     }
 }
 
-fn flight_of(pending: &PendingAirRequest) -> Result<InFlight, WalletError> {
+/// The request kept in `pending`, with the body of the call that is being made
+/// again (the body is not kept in the file: the caller rebuilds it, and the
+/// request was found by its hash).
+fn flight_of(pending: &PendingAirRequest, body: &[u8]) -> Result<InFlight, WalletError> {
     let corrupt = |what: &str| {
         WalletError::Corrupt(format!(
             "an AIR request in the wallet file has {what} (request {})",
@@ -130,6 +170,7 @@ fn flight_of(pending: &PendingAirRequest) -> Result<InFlight, WalletError> {
         request_id,
         r,
         slots: pending.slots.clone(),
+        body: body.to_vec(),
     })
 }
 
@@ -177,8 +218,8 @@ fn run_request(
             Ok(Ended::Stale)
         }
         Err(AskError::Unreachable { attempts, secs }) => Err(WalletError::Mint(format!(
-            "the PSP {} did not answer over AIR: no reply after {attempts} tries of {secs} s. The request is kept in the wallet file, and the next call carries on with it",
-            cfg.mint.to_hex()
+            "the PSP {} did not answer {what} over AIR: no reply after {attempts} tries of {secs} s. The request is kept in the wallet file, and the next call carries on with it",
+            mint_label(&cfg.mint.to_hex())
         ))),
         Err(AskError::Verify(e)) => {
             wallet.end_air_request(&request_id)?;
@@ -197,7 +238,7 @@ fn run_request(
 /// The wallet's error for a reply that failed a check: the same words and
 /// kinds as the HTTP check for the two that `verify_mint` makes.
 fn refusal(mint_hex: &str, what: &str, e: VerifyError) -> WalletError {
-    let mint = format!("the PSP {mint_hex} (over AIR)");
+    let mint = format!("the PSP {} (over AIR)", mint_label(mint_hex));
     match e {
         VerifyError::Network { theirs, ours } => WalletError::Invalid(format!(
             "{mint} is on {theirs}, but this wallet is on {ours}. Nothing was sent. Pass the flag for its network (--regtest, --signet, --testnet; none means mainnet) or use another mint"
@@ -223,24 +264,40 @@ fn refusal(mint_hex: &str, what: &str, e: VerifyError) -> WalletError {
 /// mint's signature, the request, the status and the age are checked; the body
 /// is the mint's and is read by the caller ([`fetch`], [`verify_mint`]).
 ///
-/// Resumes a kept request of this kind for this PSP if there is one. Needs all
-/// of `air.psp_did`, `air.server` and `air.host`.
+/// Resumes a kept request of this kind for this PSP if there is one. Needs
+/// `air.server` and `air.host` (the DID is `air.psp_did` or the built-in one).
 pub fn call(wallet: &mut Wallet, air: &AirSettings, kind: u8) -> Result<Verified, WalletError> {
+    call_with_body(wallet, air, kind, &[])
+}
+
+/// [`call`] for a request with a body (`KIND_ROLLOVER`, `KIND_CHECK_STATE`):
+/// resumes a kept request of this kind **and this body** for this PSP if there
+/// is one, so the same call made again carries on with the same request id and
+/// key (and a different call never takes its place). A reply that is a signed
+/// refusal is returned like an answer: [`Verified::refused`] says which.
+pub fn call_with_body(
+    wallet: &mut Wallet,
+    air: &AirSettings,
+    kind: u8,
+    body: &[u8],
+) -> Result<Verified, WalletError> {
     let cfg = ask_config(air)?;
     let mint = cfg.mint.to_hex();
+    let hash = body_hash(body);
     let kept = wallet
         .air_requests()
         .iter()
-        .find(|r| r.mint == mint && r.kind == kind)
+        .find(|r| r.mint == mint && r.kind == kind && r.body_hash == hash)
         .cloned();
     if let Some(pending) = kept {
-        let flight = flight_of(&pending)?;
+        let flight = flight_of(&pending, body)?;
         match run_request(wallet, &cfg, flight, pending.created_at, true)? {
             Ended::Verified(v) => return Ok(v),
             Ended::Stale => {} // fall through to a new request
         }
     }
-    match run_request(wallet, &cfg, InFlight::of(kind), addr::now_secs(), false)? {
+    let flight = InFlight::with_body(kind, body.to_vec());
+    match run_request(wallet, &cfg, flight, addr::now_secs(), false)? {
         Ended::Verified(v) => Ok(v),
         // Only a kept request is ever dropped as stale.
         Ended::Stale => Err(WalletError::Mint(format!(
@@ -248,6 +305,50 @@ pub fn call(wallet: &mut Wallet, air: &AirSettings, kind: u8) -> Result<Verified
             what(kind)
         ))),
     }
+}
+
+/// The wallet's side of `POST /rollover` and `POST /check-state` over AIR (the
+/// PSP's, `kind` `KIND_ROLLOVER` or `KIND_CHECK_STATE`): `body` is the request
+/// JSON the HTTP call would post, and the answer is the mint's answer JSON.
+/// A signed refusal is the wallet's error for the HTTP `400` of the same
+/// meaning ([`crate::error::mint_refusal`]: `Refused`, or `SpentElsewhere` with
+/// the notes), and `request_too_large` is a plain mint error, as the HTTP `413`
+/// is, so everything that handles a refusal handles this one.
+pub fn post(
+    wallet: &mut Wallet,
+    air: &AirSettings,
+    kind: u8,
+    body: &[u8],
+) -> Result<serde_json::Value, WalletError> {
+    let verified = call_with_body(wallet, air, kind, body)?;
+    let mint = mint_label(&air.psp_did().to_hex());
+    if verified.refused() {
+        return Err(refused_by_mint(verified.body(), what(kind), &mint));
+    }
+    serde_json::from_slice(verified.body()).map_err(|e| {
+        WalletError::Mint(format!(
+            "{} over AIR: the PSP {mint} signed a reply that is not what was asked for: {e}",
+            what(kind)
+        ))
+    })
+}
+
+/// The wallet's error for a signed refusal: the body is the JSON the HTTP route
+/// answers its `4xx` with.
+fn refused_by_mint(body: &[u8], what: &str, mint: &str) -> WalletError {
+    let value: serde_json::Value = serde_json::from_slice(body).unwrap_or_default();
+    let code = value["code"].as_str().unwrap_or("").to_string();
+    let why = value["error"]
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| String::from_utf8_lossy(body).into_owned());
+    if code == sp_wire::codes::REQUEST_TOO_LARGE {
+        // The HTTP 413: not the mint refusing the notes, so nothing is cancelled.
+        return WalletError::Mint(format!(
+            "the PSP {mint} (over AIR) refused {what}: {code}: {why}"
+        ));
+    }
+    crate::error::mint_refusal(&value, &code, &why)
 }
 
 /// [`call`], with the body read as JSON of type `T`: the type the HTTP call
@@ -273,15 +374,15 @@ pub fn fetch<T: serde::de::DeserializeOwned>(
 /// The status the mint reports is not an error here either (a mint that is
 /// unwell still reports its wire version and network).
 ///
-/// Resumes a kept request for this PSP if there is one. Needs all of
-/// `air.psp_did`, `air.server` and `air.host`.
+/// Resumes a kept request for this PSP if there is one. Needs `air.server` and
+/// `air.host` (the DID is `air.psp_did` or the built-in one).
 pub fn verify_mint(
     wallet: &mut Wallet,
     air: &AirSettings,
     expected_network: &str,
 ) -> Result<(), WalletError> {
     let verified = call(wallet, air, KIND_MINT_INFO)?;
-    let mint = air.psp_did.map(|d| d.to_hex()).unwrap_or_default();
+    let mint = air.psp_did().to_hex();
     check_mint_info(verified.body(), sp_wire::WIRE_VERSION, expected_network)
         .map(|_| ())
         .map_err(|e| refusal(&mint, what(KIND_MINT_INFO), e))

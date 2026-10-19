@@ -162,7 +162,19 @@ pub struct PendingAirRequest {
     pub slots: Vec<u32>,
     /// When the request was made, unix seconds.
     pub created_at: u64,
+    /// For a request with a body (5 rollover, 6 check-state): the SHA-256 of the
+    /// body, hex, so that the same call resumes it and another call, with another
+    /// body, does not. Empty for the plain reads, and in a file from before.
+    #[serde(default)]
+    pub body_hash: String,
 }
+
+/// How long a request over AIR is kept in the wallet file if it never ends (the
+/// mint did not answer, and the call that made it was never repeated: say a
+/// rollover that was cancelled meanwhile). After that it is dropped the next
+/// time one is saved. A call that is repeated later just makes a new request,
+/// which the mint answers the same way.
+pub const AIR_REQUEST_KEEP_SECS: u64 = 30 * 24 * 3600;
 
 fn mint_info_kind() -> u8 {
     sp_wire::air_request::KIND_MINT_INFO
@@ -438,6 +450,10 @@ impl Wallet {
         &mut self,
         request: PendingAirRequest,
     ) -> Result<(), WalletError> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         self.update(|d| {
             match d
                 .air_requests
@@ -447,6 +463,8 @@ impl Wallet {
                 Some(kept) => *kept = request,
                 None => d.air_requests.push(request),
             }
+            d.air_requests
+                .retain(|r| r.created_at.saturating_add(AIR_REQUEST_KEEP_SECS) >= now);
             Ok(())
         })
     }

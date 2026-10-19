@@ -34,15 +34,27 @@
 //!
 //! The calls between the wallet and a mint that do not go over HTTP are the
 //! **PSP's mint info** (what `GET /health` reports: `wire_version` and
-//! `network`, asked by `verify_mint` before anything else is sent to the PSP) and
+//! `network`, asked by `verify_mint` before anything else is sent to the PSP),
 //! its **keys**, **keysets** and **rotation** (`GET /keys`, `/keysets`,
-//! `/rotation`). They go over AIR when the wallet knows how to reach the PSP there, which
-//! takes three settings together: `air.psp_did` (the PSP's DID), `air.server`
-//! (the AIR server's name, its public key) and `air.host` (where to reach it).
-//! With none of the three set (the default) the call is HTTP, as before. Setting
-//! only one or two is an error, so a half-written config is not mistaken for
-//! "AIR is off". Every other call stays HTTP. The other `air.*` settings tune
-//! the request and have defaults. See `air.rs` and the README.
+//! `/rotation`) and its **rollover** and **check-state** (`POST /rollover`,
+//! `/check-state`). They go over AIR when the wallet knows where to reach the
+//! SPI: **AIR is configured when `air.server` (the AIR server's name, its public
+//! key) and `air.host` (where to reach it) are both set.** The DID the requests
+//! are sealed to and the replies are signed under is the SPI's: the wallet ships
+//! with it built in ([`BUILTIN_SPI_DID`], which covers the PSP and later the
+//! ESP), and `air.psp_did` overrides it. With neither server nor host set (the
+//! default) the call is HTTP, as before. Setting only one of the two is an
+//! error, and so is setting `air.psp_did` without them, so a half-written config
+//! is not mistaken for "AIR is off". Every other call stays HTTP. The other
+//! `air.*` settings tune the request and have defaults. See `air.rs` and the
+//! README.
+//!
+//! **The built-in DID is a PLACEHOLDER** until the first SPI deploy
+//! (sandbox-mint OPERATIONS.md, step 0, replaces it with the real one). It must
+//! never pass for a real DID silently: whenever AIR is configured and the
+//! built-in DID is the one in use, [`AirSettings::placeholder_warning`] says so,
+//! the command line prints it at every start and in `config`, and the errors of
+//! a call that fails name it.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -51,6 +63,26 @@ use std::path::{Path, PathBuf};
 
 use sp_wire::ServiceDid;
 use sp_wire::storage::{DataKind, StoragePolicy};
+
+/// The SPI's DID, built in: the key the wallet seals its AIR requests to and
+/// checks the replies against, when `air.psp_did` is not set. The SPI is the
+/// service that hosts the PSP now and the ESP later.
+///
+/// **PLACEHOLDER. This is not a real SPI's key.** It is a point with no known
+/// private key, derived so that anyone can see nothing was hidden in it: the
+/// compressed point whose x is `sha256("ecash-wallet placeholder SPI DID v0" ||
+/// [c])` for the first byte `c` (0, 1, 2, ...) that gives an x on the curve
+/// (`c` = 3 here). Nobody can open what is sealed to it and nobody can sign a
+/// reply for it, so nothing sent to it can be read by anyone and no reply from
+/// "it" can ever verify: the failure is safe, and loud (see
+/// [`AirSettings::placeholder_warning`]). The real DID goes in here at the first
+/// SPI deploy (sandbox-mint OPERATIONS.md, "First SPI deploy", step 0), and this
+/// comment goes with it.
+pub const BUILTIN_SPI_DID: &str =
+    "02aea5bd26a26bc83518e74bde96bb36e8cd45ff1cca0a8dcd246b764dae5daf7a";
+
+/// What is said whenever the placeholder DID is the one in use.
+pub const PLACEHOLDER_WARNING: &str = "WARNING: AIR is on, and the SPI's DID is the wallet's built-in PLACEHOLDER (air.psp_did is not set). It is not a real SPI's key: nothing sealed to it can be read and no reply from it can verify. Set air.psp_did to the SPI's DID, or unset air.server and air.host to use HTTP";
 
 /// The name of the file looked for beside the wallet file.
 pub const FILE_NAME: &str = "config.toml";
@@ -89,28 +121,28 @@ pub const SPECS: &[Spec] = &[
         env: "ECASH_AIR_PSP_DID",
         default: "",
         units: "service DID (66 hex characters)",
-        what: "The PSP's DID: the 33-byte compressed key of its mint_did_key.json, in hex. With air.server and air.host also set, the PSP's mint info, keys, keysets and rotation are asked over AIR instead of HTTP. All three or none: setting only some is an error. Empty (the default): HTTP.",
+        what: "The SPI's DID, overriding the one built into the wallet: the 33-byte compressed key of the mint's mint_did_key.json, in hex. Empty (the default): the built-in SPI DID, which is a PLACEHOLDER until the first SPI deploy (the wallet warns whenever it is in use). It only matters with air.server and air.host set, which turn AIR on; setting it without them is an error.",
     },
     Spec {
         key: "air.server",
         env: "ECASH_AIR_SERVER",
         default: "",
         units: "AIR server name (66 hex characters)",
-        what: "The name of the AIR server that carries the request: its public key, the compressed hex AIR prints (66 characters, starting 02 or 03). The wallet checks the server's signed challenge against it, so only the server with this key is accepted. Resolving a mint's DID to its AIR server is not built, so it is configuration for now. All of air.psp_did, air.server and air.host or none.",
+        what: "The name of the AIR server that carries the request: its public key, the compressed hex AIR prints (66 characters, starting 02 or 03). The wallet checks the server's signed challenge against it, so only the server with this key is accepted. Resolving a mint's DID to its AIR server is not built, so it is configuration for now. With air.host, it turns AIR on for the PSP's mint info, keys, keysets, rotation, rollover and check-state; both or neither.",
     },
     Spec {
         key: "air.host",
         env: "ECASH_AIR_HOST",
         default: "",
         units: "host name or IP, no port",
-        what: "Where to reach that AIR server: a host name or an IP with no scheme, no path and no port (the AIR client always dials port 5702 for ws). 127.0.0.1 for a server on this machine. All of air.psp_did, air.server and air.host or none.",
+        what: "Where to reach that AIR server: a host name or an IP with no scheme, no path and no port (the AIR client always dials port 5702 for ws). 127.0.0.1 for a server on this machine. With air.server, it turns AIR on; both or neither.",
     },
     Spec {
         key: "air.reply_wait_secs",
         env: "ECASH_AIR_REPLY_WAIT_SECS",
         default: "30",
         units: "seconds (1 to 600)",
-        what: "How long to wait for the mint's reply to one try of a request (mint info, keys, keysets or rotation). After that the same request is written again, in the next free mailbox slot.",
+        what: "How long to wait for the mint's reply to one try of a request (mint info, keys, keysets, rotation, rollover or check-state). After that the same request is written again, in the next free mailbox slot.",
     },
     Spec {
         key: "air.attempts",
@@ -165,18 +197,37 @@ impl Default for AirSettings {
 }
 
 impl AirSettings {
-    /// True when the PSP's mint info, keys, keysets and rotation are asked over AIR: the DID, the server and
-    /// the host are all set. ([`Settings::problems`] refuses some but not all.)
+    /// True when the PSP's mint info, keys, keysets, rotation, rollover and
+    /// check-state are asked over AIR: the server and the host are both set. (The
+    /// DID is not a condition: it defaults to the built-in one. With neither set
+    /// the calls are HTTP. [`Settings::problems`] refuses one without the other,
+    /// and a DID without either.)
     pub fn is_configured(&self) -> bool {
-        self.psp_did.is_some() && !self.server.is_empty() && !self.host.is_empty()
+        !self.server.is_empty() && !self.host.is_empty()
     }
 
-    /// The names of the three connection settings that are not set.
+    /// The SPI's DID the requests are sealed to: `air.psp_did` if it is set, else
+    /// the built-in one ([`BUILTIN_SPI_DID`], a PLACEHOLDER).
+    pub fn psp_did(&self) -> ServiceDid {
+        self.psp_did.unwrap_or_else(builtin_spi_did)
+    }
+
+    /// True when the DID in use is the built-in placeholder (`air.psp_did` is
+    /// not set, or is set to the placeholder itself).
+    pub fn uses_builtin_did(&self) -> bool {
+        self.psp_did() == builtin_spi_did()
+    }
+
+    /// The warning to show when AIR is on and the DID in use is the
+    /// placeholder, else `None`. The command line prints it at every start; an
+    /// app that embeds the library should show it too.
+    pub fn placeholder_warning(&self) -> Option<&'static str> {
+        (self.is_configured() && self.uses_builtin_did()).then_some(PLACEHOLDER_WARNING)
+    }
+
+    /// The names of the two connection settings that are not set.
     fn unset(&self) -> Vec<&'static str> {
         let mut out = Vec::new();
-        if self.psp_did.is_none() {
-            out.push("air.psp_did");
-        }
         if self.server.is_empty() {
             out.push("air.server");
         }
@@ -254,21 +305,20 @@ impl Settings {
         Ok(())
     }
 
-    /// Mistakes that involve more than one setting: the three connection
-    /// settings go together.
+    /// Mistakes that involve more than one setting: the server and the host go
+    /// together (they turn AIR on), and a DID without them would be ignored.
     pub fn problems(&self) -> Vec<String> {
         let unset = self.air.unset();
-        if unset.is_empty() || unset.len() == 3 {
-            return vec![];
+        match unset.len() {
+            1 => vec![format!(
+                "air.server and air.host go together (both turn AIR on for the PSP's calls, neither leaves them on HTTP), but {} is not set",
+                unset[0]
+            )],
+            2 if self.air.psp_did.is_some() => vec![
+                "air.psp_did is set, but air.server and air.host are not: it only replaces the built-in SPI DID, and AIR is on only when the server and the host are set. Set both, or unset air.psp_did to use HTTP".into(),
+            ],
+            _ => vec![],
         }
-        vec![format!(
-            "air.psp_did, air.server and air.host go together (all three ask the PSP's mint info, keys, keysets and rotation over AIR, none leaves them on HTTP), but {} not set",
-            if unset.len() == 1 {
-                format!("{} is", unset[0])
-            } else {
-                format!("{} are", unset.join(" and "))
-            }
-        )]
     }
 
     /// The policy for a kind of data, if the wallet has a setting for it. A
@@ -286,6 +336,11 @@ impl Settings {
     pub fn storage_service(&self) -> Option<ServiceDid> {
         self.storage_wallet.primary().copied()
     }
+}
+
+/// [`BUILTIN_SPI_DID`] as a [`ServiceDid`].
+fn builtin_spi_did() -> ServiceDid {
+    ServiceDid::parse(BUILTIN_SPI_DID).expect("the built-in SPI DID is a valid DID")
 }
 
 /// A whole number in `min..=max`, read from text.
@@ -601,13 +656,16 @@ mod tests {
     }
 
     #[test]
-    fn air_is_off_by_default_and_on_with_the_did_the_server_and_the_host() {
+    fn air_is_off_by_default_and_on_with_the_server_and_the_host() {
         let d = dir("air-on");
         let l = load(&d, None, &no_env).unwrap();
         assert!(!l.settings.air.is_configured());
         assert_eq!(l.settings.air, AirSettings::default());
         assert_eq!(l.settings.air.reply_wait_secs, 30);
         assert_eq!(l.settings.air.attempts, 3);
+        // Off, so there is nothing to warn about, though the DID is the built-in one.
+        assert!(l.settings.air.uses_builtin_did());
+        assert_eq!(l.settings.air.placeholder_warning(), None);
 
         fs::write(
             d.join(FILE_NAME),
@@ -624,6 +682,10 @@ mod tests {
         assert_eq!(air.host, "127.0.0.1");
         assert_eq!((air.attempts, air.reply_wait_secs), (5, 12));
         assert_eq!(l.sources["air.host"], Source::File);
+        // The DID is the override, and it is not the placeholder: no warning.
+        assert_eq!(air.psp_did().to_hex(), A);
+        assert!(!air.uses_builtin_did());
+        assert_eq!(air.placeholder_warning(), None);
 
         let l = load(&d, None, &env_of(&[("ECASH_AIR_HOST", "air.example.org")])).unwrap();
         assert_eq!(l.settings.air.host, "air.example.org");
@@ -633,18 +695,76 @@ mod tests {
     }
 
     #[test]
+    fn the_server_and_the_host_alone_turn_air_on_with_the_builtin_placeholder_did() {
+        let d = dir("air-builtin");
+        let both = [("ECASH_AIR_HOST", "127.0.0.1"), ("ECASH_AIR_SERVER", B)];
+        let l = load(&d, None, &env_of(&both)).unwrap();
+        let air = &l.settings.air;
+        assert!(air.is_configured());
+        assert_eq!(air.psp_did, None);
+        assert_eq!(air.psp_did().to_hex(), BUILTIN_SPI_DID);
+        assert!(air.uses_builtin_did());
+        // AIR on with the placeholder in use is never silent.
+        let warning = air.placeholder_warning().expect("a warning");
+        assert!(warning.contains("PLACEHOLDER"), "{warning}");
+        // Setting the override to the placeholder itself is the same thing.
+        let same = [
+            ("ECASH_AIR_HOST", "127.0.0.1"),
+            ("ECASH_AIR_SERVER", B),
+            ("ECASH_AIR_PSP_DID", BUILTIN_SPI_DID),
+        ];
+        let l = load(&d, None, &env_of(&same)).unwrap();
+        assert!(l.settings.air.placeholder_warning().is_some());
+        // A real override replaces it.
+        let real = [
+            ("ECASH_AIR_HOST", "127.0.0.1"),
+            ("ECASH_AIR_SERVER", B),
+            ("ECASH_AIR_PSP_DID", A),
+        ];
+        let l = load(&d, None, &env_of(&real)).unwrap();
+        assert_eq!(l.settings.air.psp_did().to_hex(), A);
+        assert_eq!(l.settings.air.placeholder_warning(), None);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn the_builtin_did_is_a_valid_point_and_the_derivation_in_its_comment_holds() {
+        use sha2::{Digest, Sha256};
+        let did = ServiceDid::parse(BUILTIN_SPI_DID).unwrap();
+        // Sealing to it works: it is a point on the curve.
+        sp_wire::seal::parse_public_key(BUILTIN_SPI_DID).unwrap();
+        assert_eq!(did.to_hex(), BUILTIN_SPI_DID);
+        // x = sha256(label || [3]), with an even-y prefix.
+        let mut hasher = Sha256::new();
+        hasher.update(b"ecash-wallet placeholder SPI DID v0");
+        hasher.update([3u8]);
+        assert_eq!(
+            BUILTIN_SPI_DID,
+            format!("02{}", hex::encode(hasher.finalize()))
+        );
+    }
+    #[test]
     fn some_but_not_all_of_the_air_connection_settings_is_an_error() {
         let d = dir("air-partial");
         let p = load(&d, None, &env_of(&[("ECASH_AIR_HOST", "127.0.0.1")])).unwrap_err();
         assert!(
-            p.iter()
-                .any(|x| x.contains("air.psp_did and air.server are not set")),
+            p.iter().any(|x| x.contains("air.server is not set")),
             "{p:?}"
         );
-        let both = [("ECASH_AIR_HOST", "127.0.0.1"), ("ECASH_AIR_SERVER", B)];
-        let p = load(&d, None, &env_of(&both)).unwrap_err();
+        let p = load(&d, None, &env_of(&[("ECASH_AIR_SERVER", B)])).unwrap_err();
+        assert!(p.iter().any(|x| x.contains("air.host is not set")), "{p:?}");
+        // The DID alone would be ignored (AIR needs a server): so it is refused.
+        let p = load(&d, None, &env_of(&[("ECASH_AIR_PSP_DID", A)])).unwrap_err();
         assert!(
-            p.iter().any(|x| x.contains("air.psp_did is not set")),
+            p.iter()
+                .any(|x| x.contains("air.psp_did is set, but air.server and air.host are not")),
+            "{p:?}"
+        );
+        // The DID with only one of the two: the pair is the problem.
+        let one = [("ECASH_AIR_PSP_DID", A), ("ECASH_AIR_HOST", "127.0.0.1")];
+        let p = load(&d, None, &env_of(&one)).unwrap_err();
+        assert!(
+            p.iter().any(|x| x.contains("air.server is not set")),
             "{p:?}"
         );
         // The tuning settings alone are fine: AIR stays off.

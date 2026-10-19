@@ -52,6 +52,34 @@ pub enum WalletError {
     },
 }
 
+/// A `400` from a mint's POST route as the wallet sees it, over HTTP or AIR (a
+/// signed refusal carries the same JSON). `note_spent_elsewhere` with `spent` is
+/// [`WalletError::SpentElsewhere`]. Anything else is [`WalletError::Refused`]
+/// with the code in front of the reason, or the reason alone when the mint sent
+/// no code.
+pub(crate) fn mint_refusal(body: &serde_json::Value, code: &str, why: &str) -> WalletError {
+    let spent: Vec<usize> = body["spent"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_u64())
+                .map(|v| v as usize)
+                .collect()
+        })
+        .unwrap_or_default();
+    if code == sp_wire::codes::NOTE_SPENT_ELSEWHERE && !spent.is_empty() {
+        return WalletError::SpentElsewhere {
+            why: why.to_string(),
+            inputs: spent,
+        };
+    }
+    if code.is_empty() {
+        WalletError::Refused(why.to_string())
+    } else {
+        WalletError::Refused(format!("{code}: {why}"))
+    }
+}
+
 impl fmt::Display for WalletError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

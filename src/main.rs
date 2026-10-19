@@ -161,11 +161,13 @@ regtest/). URLs default to $ECASH_PSP_URL / $ECASH_ESP_URL,
 else http://127.0.0.1:3000 and http://127.0.0.1:3100.
 
 The PSP's wire version and network (what its GET /health says), its keys
-(GET /keys), its keysets (GET /keysets) and its rotation window (GET /rotation)
-are asked over AIR instead of HTTP when config.toml's [air] section (or
-ECASH_AIR_PSP_DID, ECASH_AIR_SERVER and ECASH_AIR_HOST) names the PSP's DID, an
-AIR server and its host. Every other call is HTTP. `config` prints every
-setting.";
+(GET /keys), its keysets (GET /keysets), its rotation window (GET /rotation) and
+its rollover and check-state (POST /rollover, POST /check-state) are asked over
+AIR instead of HTTP when config.toml's [air] section (or ECASH_AIR_SERVER and
+ECASH_AIR_HOST) names an AIR server and its host. The SPI's DID is built in (a
+PLACEHOLDER until the first SPI deploy, and the wallet says so whenever it is in
+use); air.psp_did (ECASH_AIR_PSP_DID) overrides it. Every other call is HTTP.
+`config` prints every setting.";
 
 /// The arguments left after flags are taken out.
 struct Args(Vec<String>);
@@ -1151,7 +1153,7 @@ fn handoff(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
             let [id] = rest.as_slice() else {
                 return Err(WalletError::Invalid("handoff check takes an ID".into()));
             };
-            let standing = http::check_handoff(wallet, id)?;
+            let standing = ecash_wallet::mint_info::check_handoff(wallet, &air_settings(), id)?;
             print_standing(id, &standing);
             Ok(())
         }
@@ -1416,7 +1418,7 @@ fn handoff_import(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError
     // A PSP handoff is swapped now. If the mint cannot be reached the swap
     // stays stored and the notes stay unswapped (in the balance, spendable), and
     // the startup sync sends it.
-    for line in http::complete_import(wallet, &got) {
+    for line in ecash_wallet::mint_info::complete_import(wallet, &air_settings(), &got) {
         println!("{line}");
     }
     if got.kind == HandoffKind::Fsp {
@@ -1711,11 +1713,23 @@ fn config_command(loaded: &config::Loaded, args: Args) -> Result<(), WalletError
     let air = &loaded.settings.air;
     if air.is_configured() {
         println!(
-            "PSP mint info, keys, keysets and rotation: over AIR (air.psp_did, air.server and air.host are set); every other call is HTTP"
+            "PSP mint info, keys, keysets, rotation, rollover and check-state: over AIR (air.server and air.host are set); every other call is HTTP"
         );
+        println!(
+            "SPI DID in use: {} ({})",
+            air.psp_did().to_hex(),
+            if air.uses_builtin_did() {
+                "the built-in PLACEHOLDER"
+            } else {
+                "air.psp_did"
+            }
+        );
+        if let Some(warning) = air.placeholder_warning() {
+            eprintln!("{warning}");
+        }
     } else {
         println!(
-            "PSP mint info, keys, keysets and rotation: over HTTP (air.psp_did, air.server and air.host are not set)"
+            "PSP mint info, keys, keysets, rotation, rollover and check-state: over HTTP (air.server and air.host are not set)"
         );
     }
     Ok(())
@@ -1741,6 +1755,10 @@ fn run(raw: Vec<String>) -> Result<(), WalletError> {
     }
     let settings = loaded.settings;
     let _ = AIR.set(settings.air.clone());
+    // AIR on with the built-in PLACEHOLDER SPI DID must never pass silently.
+    if let Some(warning) = settings.air.placeholder_warning() {
+        eprintln!("{warning}");
+    }
     let mut wallet = Wallet::open(&path)?;
     // A wallet file from before an FSP note's service was kept: fill it in from
     // the mints seen, and leave the rest marked unknown.

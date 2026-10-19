@@ -550,15 +550,27 @@ fn fsp_post<Q: serde::Serialize, R: serde::de::DeserializeOwned>(
     request: &Q,
 ) -> Result<R, WalletError> {
     let url = format!("{}/{route}", base.trim_end_matches('/'));
+    let bytes =
+        serde_json::to_vec(request).map_err(|e| WalletError::Mint(format!("{url}: {e}")))?;
+    let text = fsp_send(base, route, bytes)?;
+    serde_json::from_str(&text).map_err(|e| WalletError::Mint(format!("{url}: {e}")))
+}
+
+/// POST `body` (JSON, already encoded) to `route` of the mint at `base` and
+/// return the text of a success. A `400` is the mint's refusal
+/// ([`fsp_refusal`]); any other status is a [`WalletError::Mint`].
+fn fsp_send(base: &str, route: &str, body: Vec<u8>) -> Result<String, WalletError> {
+    let url = format!("{}/{route}", base.trim_end_matches('/'));
     let response = client()?
         .post(&url)
-        .json(request)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body)
         .send()
         .map_err(|e| WalletError::Mint(format!("{url}: {e}")))?;
     let status = response.status();
     let text = response.text().unwrap_or_default();
     if status.is_success() {
-        return serde_json::from_str(&text).map_err(|e| WalletError::Mint(format!("{url}: {e}")));
+        return Ok(text);
     }
     let body: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
     let code = body["code"].as_str().unwrap_or("").to_string();
@@ -570,32 +582,29 @@ fn fsp_post<Q: serde::Serialize, R: serde::de::DeserializeOwned>(
     }
 }
 
-/// A `400` from a mint's POST route as the wallet sees it. `note_spent_elsewhere`
-/// with `spent` is [`WalletError::SpentElsewhere`]. Anything else is
-/// [`WalletError::Refused`] with the code in front of the reason, or the reason
-/// alone when the mint sent no code.
+/// A `400` from a mint's POST route as the wallet sees it (see
+/// [`crate::error::mint_refusal`], which the AIR path shares).
 fn fsp_refusal(body: &serde_json::Value, code: &str, why: &str) -> WalletError {
-    let spent: Vec<usize> = body["spent"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_u64())
-                .map(|v| v as usize)
-                .collect()
-        })
-        .unwrap_or_default();
-    if code == "note_spent_elsewhere" && !spent.is_empty() {
-        return WalletError::SpentElsewhere {
-            why: why.to_string(),
-            inputs: spent,
-        };
-    }
-    if code.is_empty() {
-        WalletError::Refused(why.to_string())
-    } else {
-        WalletError::Refused(format!("{code}: {why}"))
-    }
+    crate::error::mint_refusal(body, code, why)
 }
+
+/// The HTTP branch of a PSP or ESP POST that [`Post`] stands for: `body` (the
+/// request JSON) to `route` of the mint at `base`, the answer as JSON. Local
+/// calls, and every call when AIR is not configured, are made this way.
+pub fn post_bytes(base: &str, route: &str, body: &[u8]) -> Result<serde_json::Value, WalletError> {
+    let url = format!("{}/{route}", base.trim_end_matches('/'));
+    let text = fsp_send(base, route, body.to_vec())?;
+    serde_json::from_str(&text).map_err(|e| WalletError::Mint(format!("{url}: {e}")))
+}
+
+/// How a POST to the PSP (or ESP) is made: given the wallet (an AIR request is
+/// kept in the wallet file), the mint's URL, the route (`rollover` or
+/// `check-state`) and the request JSON, the mint's answer as JSON, or the
+/// wallet's error for a refusal. The default is [`post_bytes`] (HTTP); for the
+/// PSP over AIR it is `mint_info::psp_post`. A refusal is the same
+/// [`WalletError`] either way, so everything that reads one is the same.
+pub type Post<'a> =
+    &'a mut dyn FnMut(&mut Wallet, &str, &str, &[u8]) -> Result<serde_json::Value, WalletError>;
 
 /// An FSP mint's keysets (`GET /keys`).
 pub fn fetch_fsp_keys(base: &str) -> Result<sp_wire::fsp::KeysResponse, WalletError> {
@@ -883,7 +892,7 @@ pub fn fetch_window(base: &str) -> Result<crate::rotate::Window, WalletError> {
 /// first made to fit what the wallet still holds
 /// ([`Wallet::live_swap`]), and a note the mint says is spent is dropped from
 /// the balance instead of being freed (it was never this wallet's to free).
-fn send_rollover(wallet: &mut Wallet, id: &str) -> Result<String, WalletError> {
+fn send_rollover(wallet: &mut Wallet, id: &str, post: Post<'_>) -> Result<String, WalletError> {
     let mut id = id.to_string();
     let first = wallet
         .pending_rollovers()
@@ -908,7 +917,9 @@ fn send_rollover(wallet: &mut Wallet, id: &str) -> Result<String, WalletError> {
         .cloned()
         .ok_or_else(|| WalletError::Invalid(format!("no rollover {id}")))?;
     let received = p.schedule.starts_with(crate::handoff::SWAP_TAG);
-    let reply: Result<serde_json::Value, WalletError> = fsp_post(&p.url, "rollover", &p.body);
+    let body = serde_json::to_vec(&p.body)
+        .map_err(|e| WalletError::Mint(format!("{}/rollover: {e}", p.url)))?;
+    let reply: Result<serde_json::Value, WalletError> = post(wallet, &p.url, "rollover", &body);
     match reply {
         Ok(v) => {
             let (epoch, keyset, sigs, keys) = match p.kind {
@@ -961,7 +972,10 @@ fn send_rollover(wallet: &mut Wallet, id: &str) -> Result<String, WalletError> {
                 "the mint says {dropped} note(s) received in a handoff were spent already ({why}), so they are not counted any more: whoever reached the mint first has them. Tell the sender"
             );
             if let Some(rest) = rest {
-                text.push_str(&format!(". The rest: {}", send_rollover(wallet, &rest)?));
+                text.push_str(&format!(
+                    ". The rest: {}",
+                    send_rollover(wallet, &rest, &mut *post)?
+                ));
             }
             Ok(text)
         }
@@ -1011,7 +1025,13 @@ pub fn rotation_sync(
     kind: Kind,
     base: &str,
 ) -> Result<Vec<String>, WalletError> {
-    rotation_sync_with(wallet, kind, base, &mut |_| fetch_window(base))
+    rotation_sync_with(
+        wallet,
+        kind,
+        base,
+        &mut |_| fetch_window(base),
+        &mut |_, base, route, body| post_bytes(base, route, body),
+    )
 }
 
 /// How a rotation sync reads the mint's window: given the wallet (a read over
@@ -1020,14 +1040,14 @@ pub fn rotation_sync(
 pub type WindowSource<'a> =
     &'a mut dyn FnMut(&mut Wallet) -> Result<crate::rotate::Window, WalletError>;
 
-/// [`rotation_sync`], with the mint's window read by `window` (over HTTP, or for
-/// the PSP over AIR). Everything else it sends the mint (`POST /rollover`) is
-/// HTTP either way.
+/// [`rotation_sync`], with the mint's window read by `window` and its rollovers
+/// sent by `post` (over HTTP, or for the PSP over AIR).
 pub fn rotation_sync_with(
     wallet: &mut Wallet,
     kind: Kind,
     base: &str,
     window: WindowSource<'_>,
+    post: Post<'_>,
 ) -> Result<Vec<String>, WalletError> {
     let mut log = Vec::new();
     let pending: Vec<String> = wallet
@@ -1037,7 +1057,7 @@ pub fn rotation_sync_with(
         .map(|p| p.id.clone())
         .collect();
     for id in pending {
-        match send_rollover(wallet, &id) {
+        match send_rollover(wallet, &id, &mut *post) {
             Ok(t) => log.push(t),
             Err(e) => log.push(format!(
                 "rollover failed, retried on the next connection: {e}"
@@ -1071,7 +1091,7 @@ pub fn rotation_sync_with(
         return Ok(log);
     }
     for id in wallet.build_rollovers(kind, base, &w, old)? {
-        match send_rollover(wallet, &id) {
+        match send_rollover(wallet, &id, &mut *post) {
             Ok(t) => log.push(t),
             Err(e) => log.push(format!(
                 "rollover failed, retried on the next connection: {e}"
@@ -1093,6 +1113,17 @@ pub fn rotation_sync_with(
 /// makes the notes the receiver's alone: until it goes through, the sender can
 /// still reclaim them.
 pub fn complete_import(wallet: &mut Wallet, imported: &crate::handoff::Imported) -> Vec<String> {
+    complete_import_with(wallet, imported, &mut |_, base, route, body| {
+        post_bytes(base, route, body)
+    })
+}
+
+/// [`complete_import`], with the swap sent by `post` (over HTTP, or over AIR).
+pub fn complete_import_with(
+    wallet: &mut Wallet,
+    imported: &crate::handoff::Imported,
+    post: Post<'_>,
+) -> Vec<String> {
     let mut log = Vec::new();
     for id in &imported.psp_swaps {
         let amount: u128 = wallet
@@ -1101,7 +1132,7 @@ pub fn complete_import(wallet: &mut Wallet, imported: &crate::handoff::Imported)
             .find(|p| &p.id == id)
             .map(|p| p.outputs.iter().map(|o| u128::from(o.amount)).sum())
             .unwrap_or(0);
-        match send_rollover(wallet, id) {
+        match send_rollover(wallet, id, &mut *post) {
             Ok(text) => log.push(text),
             Err(e) => log.push(format!(
                 "the mint could not be reached, so {amount} PSP stays unswapped: it is in your balance and can be spent, and the swap is sent again on the next connection to the mint: {e}"
@@ -1120,6 +1151,18 @@ pub fn check_handoff(
     wallet: &mut Wallet,
     id: &str,
 ) -> Result<crate::handoff::Standing, WalletError> {
+    check_handoff_with(wallet, id, &mut |_, base, route, body| {
+        post_bytes(base, route, body)
+    })
+}
+
+/// [`check_handoff`], with the questions to the mint (`POST /check-state`, and
+/// the swap back if a reclaim is stored) sent by `post`: over HTTP, or over AIR.
+pub fn check_handoff_with(
+    wallet: &mut Wallet,
+    id: &str,
+    post: Post<'_>,
+) -> Result<crate::handoff::Standing, WalletError> {
     use crate::handoff::{HandoffState, Standing};
     let h = wallet
         .handoffs_out()
@@ -1132,7 +1175,7 @@ pub fn check_handoff(
     }
     if let Some(rollover) = &h.reclaim {
         if wallet.pending_rollovers().iter().any(|p| &p.id == rollover) {
-            send_rollover(wallet, rollover)?;
+            send_rollover(wallet, rollover, &mut *post)?;
         }
         let now = wallet.handoff_standing(id)?;
         if now == Standing::Reclaimed {
@@ -1153,7 +1196,12 @@ pub fn check_handoff(
     let req = CheckStateRequest {
         nonces: h.notes.iter().map(|n| n.note.nonce).collect(),
     };
-    let r: CheckStateResponse = fsp_post(&h.mint, "check-state", &req)?;
+    let body = serde_json::to_vec(&req)
+        .map_err(|e| WalletError::Mint(format!("{}/check-state: {e}", h.mint)))?;
+    let answer = post(wallet, &h.mint, "check-state", &body)?;
+    let r: CheckStateResponse = serde_json::from_value(answer).map_err(|e| {
+        WalletError::Mint(format!("{}/check-state: {e}", h.mint.trim_end_matches('/')))
+    })?;
     wallet.settle_handoff(id, &r.spent)
 }
 
@@ -1170,20 +1218,28 @@ pub struct Reclaim {
 /// takes whichever swap reaches it first. If the receiver swapped first, the
 /// handoff is recorded as done and nothing comes back; the standing says so.
 pub fn reclaim_handoff(wallet: &mut Wallet, id: &str) -> Result<Reclaim, WalletError> {
-    reclaim_handoff_with(wallet, id, &mut |_, mint| fetch_window(mint))
+    reclaim_handoff_with(
+        wallet,
+        id,
+        &mut |_, mint| fetch_window(mint),
+        &mut |_, base, route, body| post_bytes(base, route, body),
+    )
 }
 
 /// [`reclaim_handoff`], with the mint's window read by `window` (given the wallet
-/// and the mint's URL): over HTTP, or for the PSP over AIR. The swap itself, and
-/// the question whether the receiver swapped first, are HTTP either way.
+/// and the mint's URL) and the swap and the check sent by `post`: over HTTP, or
+/// for the PSP over AIR.
 pub fn reclaim_handoff_with(
     wallet: &mut Wallet,
     id: &str,
     window: &mut dyn FnMut(&mut Wallet, &str) -> Result<crate::rotate::Window, WalletError>,
+    post: Post<'_>,
 ) -> Result<Reclaim, WalletError> {
     use crate::handoff::Standing;
     let mut log = Vec::new();
-    if let s @ (Standing::Received | Standing::Reclaimed) = check_handoff(wallet, id)? {
+    if let s @ (Standing::Received | Standing::Reclaimed) =
+        check_handoff_with(wallet, id, &mut *post)?
+    {
         return Ok(Reclaim { standing: s, log });
     }
     let h = wallet
@@ -1200,7 +1256,7 @@ pub fn reclaim_handoff_with(
         }
     }
     let rollover = wallet.begin_reclaim(id)?;
-    log.push(send_rollover(wallet, &rollover)?);
-    let standing = check_handoff(wallet, id)?;
+    log.push(send_rollover(wallet, &rollover, &mut *post)?);
+    let standing = check_handoff_with(wallet, id, &mut *post)?;
     Ok(Reclaim { standing, log })
 }

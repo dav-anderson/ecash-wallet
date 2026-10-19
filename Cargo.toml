@@ -7,10 +7,20 @@ license = "MIT"
 description = "Wallet library for PSP, ESP and FSP Service Points, with a thin command line"
 
 [features]
-default = ["http"]
+default = ["http", "air"]
 # The HTTP calls to the mints, used by the command line. The rest of the library
 # does no I/O except its own note file, so an app can send requests its own way.
 http = ["dep:reqwest"]
+# The PSP's mint info over AIR (the first call that does not go over HTTP), when
+# the wallet's `[air]` settings name the PSP's DID, an AIR server and its host.
+# Needs sp-wire's `air-client`, which needs `air_server`; until air_server stops
+# naming `air` by a path outside its repository, that takes the local patches in
+# the README.
+air = ["sp-wire/air-client"]
+# The integration tests that run psp-mint's AIR listener against the wallet. They
+# need a psp-mint that has `air_listener`, which no tag has yet, so they run
+# only when this is on (the local-mints script turns on every feature).
+air-listener-tests = ["air", "http"]
 
 [dependencies]
 # mint-core is pinned to its release tag.
@@ -20,7 +30,7 @@ secp256k1 = { version = "0.30", default-features = false, features = ["global-co
 # Every type the wallet exchanges with the mints, with the `seal` feature for the
 # PSP payload's encryption (which needs the `air` crate, pulled in by sp-wire).
 # The wallet does not depend on the mint crates.
-sp-wire = { git = "https://github.com/dav-anderson/sp-wire.git", tag = "v0.4.0", features = ["seal"] }
+sp-wire = { git = "https://github.com/dav-anderson/sp-wire.git", tag = "v0.4.0", features = ["seal", "air-request"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # The settings file (config.toml).
@@ -39,7 +49,7 @@ psp-mint = { git = "https://github.com/dav-anderson/psp-mint.git", tag = "v0.3.0
 esp-mint = { git = "https://github.com/dav-anderson/esp-mint.git", tag = "v0.5.0" }
 fsp-mint = { git = "https://github.com/dav-anderson/fsp-mint.git", tag = "v0.4.0" }
 axum = "0.8"
-tokio = { version = "1", features = ["rt-multi-thread", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time"] }
 
 [[test]]
 name = "redeem_flow"
@@ -53,6 +63,10 @@ path = "src/lib.rs"
 name = "ecash-wallet"
 path = "src/main.rs"
 required-features = ["http"]
+
+[[test]]
+name = "air_flow"
+required-features = ["air-listener-tests"]
 
 [[test]]
 name = "rotation_flow"
@@ -76,6 +90,12 @@ required-features = ["http"]
 # from a local checkout that has it:
 # [patch."https://github.com/ramp-stack/air"]
 # air = { path = "../air" }
+#
+# The `air` feature needs sp-wire's `air-client`, which needs air_server. It names
+# `air` as `path = "../air"`, so the checkout must sit beside the `air` above
+# (the air patch path must be `<air_server>/../air`):
+# [patch."https://github.com/ramp-stack/air_server"]
+# air_server = { path = "../air_server" }
 #
 # [patch."https://github.com/dav-anderson/mint-core.git"]
 # mint-types = { path = "../mint-core-v0.1.3/crates/mint-types" }

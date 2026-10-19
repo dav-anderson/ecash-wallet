@@ -141,6 +141,24 @@ pub struct Handover {
     pub notes: Vec<HandedNote>,
 }
 
+/// A mint-info request sent over AIR and not yet answered (see `air.rs`). The
+/// wallet keeps the pair that can read the reply, `request_id` and the one-off
+/// key `r`, until the request ends, so that a reply that came while the wallet
+/// was not looking can still be read.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingAirRequest {
+    /// 32 random bytes, hex.
+    pub request_id: String,
+    /// The mint's DID the request was written for, hex.
+    pub mint: String,
+    /// The one-off secret key `r`, hex. Used for this request only.
+    pub r: String,
+    /// The mailbox slots the request was written to, in order.
+    pub slots: Vec<u32>,
+    /// When the request was made, unix seconds.
+    pub created_at: u64,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct WalletData {
     /// A stand-in reply DID for the command line, made on first use. An app
@@ -247,6 +265,10 @@ pub struct WalletData {
     /// Handoffs this wallet has imported, so that none is imported twice.
     #[serde(default)]
     pub handoffs_in: Vec<crate::handoff::IncomingHandoff>,
+    /// Mint-info requests over AIR that have not ended (see `air.rs`). Local to
+    /// this copy of the wallet: a merge keeps this copy's.
+    #[serde(default)]
+    pub air_requests: Vec<PendingAirRequest>,
 }
 
 impl WalletData {
@@ -395,6 +417,37 @@ impl Wallet {
     /// Ids of the notes flagged because the ESP mint rejected their proof.
     pub fn bad_proof_notes(&self) -> &[String] {
         &self.data.bad_proof
+    }
+
+    /// The mint-info requests over AIR that have not ended, oldest first.
+    pub fn air_requests(&self) -> &[PendingAirRequest] {
+        &self.data.air_requests
+    }
+
+    /// Keep a mint-info request (new, or with more slots than before) and save.
+    pub(crate) fn save_air_request(
+        &mut self,
+        request: PendingAirRequest,
+    ) -> Result<(), WalletError> {
+        self.update(|d| {
+            match d
+                .air_requests
+                .iter_mut()
+                .find(|r| r.request_id == request.request_id)
+            {
+                Some(kept) => *kept = request,
+                None => d.air_requests.push(request),
+            }
+            Ok(())
+        })
+    }
+
+    /// Forget a mint-info request that has ended (answered, or refused for good).
+    pub(crate) fn end_air_request(&mut self, request_id: &str) -> Result<(), WalletError> {
+        self.update(|d| {
+            d.air_requests.retain(|r| r.request_id != request_id);
+            Ok(())
+        })
     }
 
     /// The handovers this wallet has made, oldest first.

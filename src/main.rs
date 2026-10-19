@@ -6,7 +6,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use ecash_wallet::config::{self, Settings};
+use ecash_wallet::config::{self, AirSettings, Settings};
 use ecash_wallet::esp::ExchangeBuild;
 use ecash_wallet::psp::parse_signatures;
 use ecash_wallet::redeem::{EntryOutcome, RedeemOutcome, RedemptionState};
@@ -158,7 +158,12 @@ The wallet file is --wallet, else $ECASH_WALLET_FILE, else
 ~/.ecash-wallet/<network>/wallet.json (main, regtest, signet, testnet; an old
 ~/.ecash-wallet/wallet.json is refused until `ecash-wallet migrate` moves it to
 regtest/). URLs default to $ECASH_PSP_URL / $ECASH_ESP_URL,
-else http://127.0.0.1:3000 and http://127.0.0.1:3100.";
+else http://127.0.0.1:3000 and http://127.0.0.1:3100.
+
+The PSP's wire version and network (what its GET /health says) are asked over
+AIR instead of HTTP when config.toml's [air] section (or ECASH_AIR_PSP_DID,
+ECASH_AIR_SERVER and ECASH_AIR_HOST) names the PSP's DID, an AIR server and its
+host. Every other call is HTTP. `config` prints every setting.";
 
 /// The arguments left after flags are taken out.
 struct Args(Vec<String>);
@@ -277,8 +282,48 @@ fn take_network(args: &mut Args) -> Result<&'static str, WalletError> {
     Ok(found.unwrap_or("main"))
 }
 
+/// The `[air]` settings of this run, set once in `run`. Empty (AIR off) until then.
+static AIR: std::sync::OnceLock<AirSettings> = std::sync::OnceLock::new();
+
+/// What the first check of the PSP in this run came to, with the URL it was for:
+/// the PSP is checked at startup and again by the command, and with AIR a dead
+/// mint costs `air.attempts` tries of `air.reply_wait_secs` each time, so the
+/// answer is kept for the run. (HTTP is checked every time, as before.)
+static PSP_CHECKED: std::sync::Mutex<Option<(String, Result<(), String>)>> =
+    std::sync::Mutex::new(None);
+
+/// Check the PSP's wire version and network before anything else is sent to it:
+/// over AIR when `[air]` is configured (see `ecash_wallet::mint_info`), else
+/// over HTTP.
+fn verify_psp(wallet: &mut Wallet, base: &str) -> Result<(), WalletError> {
+    let air = AIR.get().cloned().unwrap_or_default();
+    if !air.is_configured() {
+        return ecash_wallet::mint_info::verify_psp(wallet, &air, base, network());
+    }
+    let mut checked = PSP_CHECKED.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((url, result)) = checked.as_ref() {
+        if url == base {
+            return result.clone().map_err(WalletError::Mint);
+        }
+    }
+    let result = ecash_wallet::mint_info::verify_psp(wallet, &air, base, network());
+    *checked = Some((
+        base.to_string(),
+        result.as_ref().map(|_| ()).map_err(|e| e.to_string()),
+    ));
+    result
+}
+
+/// The PSP's URL, after checking it (`verify_psp`).
+fn psp_base(wallet: &mut Wallet, flag: Option<String>) -> Result<String, WalletError> {
+    let base = url(flag, "ECASH_PSP_URL", DEFAULT_PSP_URL);
+    verify_psp(wallet, &base)?;
+    Ok(base)
+}
+
 /// A mint's URL, after checking (`GET /health`) that the mint is on this
-/// run's network. Nothing is sent to a mint on another network.
+/// run's network. Nothing is sent to a mint on another network. (Not for the
+/// PSP, whose check can go over AIR: see `psp_base`.)
 fn mint_url(flag: Option<String>, var: &str, default: &str) -> Result<String, WalletError> {
     let base = url(flag, var, default);
     http::verify_mint(&base, network())?;
@@ -290,7 +335,7 @@ fn buy_psp(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
         .flag("--mint-key")?
         .ok_or_else(|| WalletError::Invalid("--mint-key HEX is required".into()))?;
     if let Some(base) = args.flag("--psp-url")? {
-        http::verify_mint(&base, network())?;
+        verify_psp(wallet, &base)?;
         let w = http::fetch_window(&base)?;
         wallet.note_live_keysets(&base, &w)?;
         http::sync_psp_limits(wallet, &base)?;
@@ -317,7 +362,7 @@ fn buy_psp(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
 }
 
 fn claim_psp(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
-    let base = mint_url(args.flag("--psp-url")?, "ECASH_PSP_URL", DEFAULT_PSP_URL)?;
+    let base = psp_base(wallet, args.flag("--psp-url")?)?;
     let file = args.flag("--file")?;
     let pairs = args.rest();
     let text = match (file, pairs.is_empty()) {
@@ -1226,7 +1271,7 @@ fn handoff_export_psp(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletE
     let recipient = sp_wire::seal::parse_public_key(&to)
         .map_err(|e| WalletError::Invalid(format!("--to: {e}")))?;
     let ids = wallet.select_psp_handoff(psp)?;
-    let mint = mint_url(psp_url, "ECASH_PSP_URL", DEFAULT_PSP_URL)?;
+    let mint = psp_base(wallet, psp_url)?;
     let made = wallet.export_psp_handoff(&ids, &mint, &recipient)?;
     handoff_deliver(&made, out)
 }
@@ -1426,7 +1471,12 @@ fn startup_rotation_sync(wallet: &mut Wallet) {
         if !holds {
             continue;
         }
-        let Ok(base) = mint_url(None, var, default) else {
+        let checked = if kind == ecash_wallet::Kind::Psp {
+            psp_base(wallet, None)
+        } else {
+            mint_url(None, var, default)
+        };
+        let Ok(base) = checked else {
             continue;
         };
         match http::rotation_sync(wallet, kind, &base) {
@@ -1649,7 +1699,15 @@ fn config_command(loaded: &config::Loaded, args: Args) -> Result<(), WalletError
         ),
         None => println!("storage service for FSP fees: none (storage.wallet is empty)"),
     }
-    println!("Setting only: nothing reads or writes the AIR yet.");
+    println!("Storage settings only: nothing reads or writes the AIR for storage yet.");
+    let air = &loaded.settings.air;
+    if air.is_configured() {
+        println!(
+            "PSP mint info: over AIR (air.psp_did, air.server and air.host are set); every other call is HTTP"
+        );
+    } else {
+        println!("PSP mint info: over HTTP (air.psp_did, air.server and air.host are not set)");
+    }
     Ok(())
 }
 
@@ -1672,6 +1730,7 @@ fn run(raw: Vec<String>) -> Result<(), WalletError> {
         return config_command(&loaded, args);
     }
     let settings = loaded.settings;
+    let _ = AIR.set(settings.air.clone());
     let mut wallet = Wallet::open(&path)?;
     // A wallet file from before an FSP note's service was kept: fill it in from
     // the mints seen, and leave the rest marked unknown.

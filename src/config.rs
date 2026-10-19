@@ -29,6 +29,19 @@
 //! default `--service` of the `fsp` commands.
 //!
 //! The planned behaviour is in the mints' DESIGN.md files ("Storage policy").
+//!
+//! # AIR (`[air]`)
+//!
+//! The first call between the wallet and a mint that does not go over HTTP is
+//! the **PSP's mint info** (what `GET /health` reports: `wire_version` and
+//! `network`), asked by `verify_mint` before anything else is sent to the PSP.
+//! It goes over AIR when the wallet knows how to reach the PSP there, which
+//! takes three settings together: `air.psp_did` (the PSP's DID), `air.server`
+//! (the AIR server's name, its public key) and `air.host` (where to reach it).
+//! With none of the three set (the default) the call is HTTP, as before. Setting
+//! only one or two is an error, so a half-written config is not mistaken for
+//! "AIR is off". Every other call stays HTTP. The other `air.*` settings tune
+//! the request and have defaults. See `air.rs` and the README.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -70,12 +83,114 @@ pub const SPECS: &[Spec] = &[
         units: "service DIDs (66 hex characters)",
         what: "Which AIR services will keep the app's own data, in the same form as storage.wallet. The wallet only checks and reports it; it is for the app that embeds the library. Setting only for now.",
     },
+    Spec {
+        key: "air.psp_did",
+        env: "ECASH_AIR_PSP_DID",
+        default: "",
+        units: "service DID (66 hex characters)",
+        what: "The PSP's DID: the 33-byte compressed key of its mint_did_key.json, in hex. With air.server and air.host also set, the PSP's mint info is asked over AIR instead of HTTP. All three or none: setting only some is an error. Empty (the default): HTTP.",
+    },
+    Spec {
+        key: "air.server",
+        env: "ECASH_AIR_SERVER",
+        default: "",
+        units: "AIR server name (66 hex characters)",
+        what: "The name of the AIR server that carries the request: its public key, the compressed hex AIR prints (66 characters, starting 02 or 03). The wallet checks the server's signed challenge against it, so only the server with this key is accepted. Resolving a mint's DID to its AIR server is not built, so it is configuration for now. All of air.psp_did, air.server and air.host or none.",
+    },
+    Spec {
+        key: "air.host",
+        env: "ECASH_AIR_HOST",
+        default: "",
+        units: "host name or IP, no port",
+        what: "Where to reach that AIR server: a host name or an IP with no scheme, no path and no port (the AIR client always dials port 5702 for ws). 127.0.0.1 for a server on this machine. All of air.psp_did, air.server and air.host or none.",
+    },
+    Spec {
+        key: "air.reply_wait_secs",
+        env: "ECASH_AIR_REPLY_WAIT_SECS",
+        default: "30",
+        units: "seconds (1 to 600)",
+        what: "How long to wait for the mint's reply to one try of a mint-info request. After that the same request is written again, in the next free mailbox slot.",
+    },
+    Spec {
+        key: "air.attempts",
+        env: "ECASH_AIR_ATTEMPTS",
+        default: "3",
+        units: "tries (1 to 10)",
+        what: "How many tries one call makes before it gives up with \"mint unreachable\". The request is kept in the wallet file, so the next call carries on with the same one and picks up a late reply.",
+    },
+    Spec {
+        key: "air.max_skew_secs",
+        env: "ECASH_AIR_MAX_SKEW_SECS",
+        default: "300",
+        units: "seconds (1 to 86400)",
+        what: "How far the reply's issued_at (the mint's clock) may be from this wallet's clock before the reply is refused as stale. A reply that is older than this when it is read (a request kept from days ago) is dropped and the call starts a new request.",
+    },
+    Spec {
+        key: "air.timeout_secs",
+        env: "ECASH_AIR_TIMEOUT_SECS",
+        default: "10",
+        units: "seconds (1 to 600)",
+        what: "How long the AIR server may take to answer one Create or Read before that step fails.",
+    },
 ];
+
+/// The `[air]` settings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AirSettings {
+    /// The PSP's DID, if set.
+    pub psp_did: Option<ServiceDid>,
+    /// The AIR server's name (its public key), or empty.
+    pub server: String,
+    /// The AIR server's host or IP, or empty.
+    pub host: String,
+    pub reply_wait_secs: u64,
+    pub attempts: u32,
+    pub max_skew_secs: u64,
+    pub timeout_secs: u64,
+}
+
+impl Default for AirSettings {
+    fn default() -> Self {
+        AirSettings {
+            psp_did: None,
+            server: String::new(),
+            host: String::new(),
+            reply_wait_secs: 30,
+            attempts: 3,
+            max_skew_secs: 300,
+            timeout_secs: 10,
+        }
+    }
+}
+
+impl AirSettings {
+    /// True when the PSP's mint info is asked over AIR: the DID, the server and
+    /// the host are all set. ([`Settings::problems`] refuses some but not all.)
+    pub fn is_configured(&self) -> bool {
+        self.psp_did.is_some() && !self.server.is_empty() && !self.host.is_empty()
+    }
+
+    /// The names of the three connection settings that are not set.
+    fn unset(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if self.psp_did.is_none() {
+            out.push("air.psp_did");
+        }
+        if self.server.is_empty() {
+            out.push("air.server");
+        }
+        if self.host.is_empty() {
+            out.push("air.host");
+        }
+        out
+    }
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Settings {
     pub storage_wallet: StoragePolicy,
     pub storage_app: StoragePolicy,
+    pub air: AirSettings,
 }
 
 impl Settings {
@@ -84,6 +199,13 @@ impl Settings {
         Some(match key {
             "storage.wallet" => self.storage_wallet.to_config_string(),
             "storage.app" => self.storage_app.to_config_string(),
+            "air.psp_did" => self.air.psp_did.map(|d| d.to_hex()).unwrap_or_default(),
+            "air.server" => self.air.server.clone(),
+            "air.host" => self.air.host.clone(),
+            "air.reply_wait_secs" => self.air.reply_wait_secs.to_string(),
+            "air.attempts" => self.air.attempts.to_string(),
+            "air.max_skew_secs" => self.air.max_skew_secs.to_string(),
+            "air.timeout_secs" => self.air.timeout_secs.to_string(),
             _ => return None,
         })
     }
@@ -96,9 +218,56 @@ impl Settings {
         match key {
             "storage.wallet" => self.storage_wallet = policy(value)?,
             "storage.app" => self.storage_app = policy(value)?,
+            "air.psp_did" => {
+                let text = value.trim();
+                self.air.psp_did = if text.is_empty() {
+                    None
+                } else {
+                    Some(ServiceDid::parse(text).map_err(|e| format!("{key} = `{value}`: {e}"))?)
+                };
+            }
+            "air.server" => {
+                let text = value.trim();
+                if !text.is_empty() {
+                    sp_wire::seal::parse_public_key(text).map_err(|e| {
+                        format!(
+                            "{key} = `{value}` is not an AIR server name (a public key, 66 hex characters): {e}"
+                        )
+                    })?;
+                }
+                self.air.server = text.to_string();
+            }
+            "air.host" => {
+                let text = value.trim();
+                if let Some(why) = sp_wire::air_request::host_problem(text) {
+                    return Err(format!("{key} = `{value}` {why}"));
+                }
+                self.air.host = text.to_string();
+            }
+            "air.reply_wait_secs" => self.air.reply_wait_secs = number(key, value, 1, 600)?,
+            "air.attempts" => self.air.attempts = number(key, value, 1, 10)? as u32,
+            "air.max_skew_secs" => self.air.max_skew_secs = number(key, value, 1, 86_400)?,
+            "air.timeout_secs" => self.air.timeout_secs = number(key, value, 1, 600)?,
             other => return Err(format!("unknown setting `{other}`")),
         }
         Ok(())
+    }
+
+    /// Mistakes that involve more than one setting: the three connection
+    /// settings go together.
+    pub fn problems(&self) -> Vec<String> {
+        let unset = self.air.unset();
+        if unset.is_empty() || unset.len() == 3 {
+            return vec![];
+        }
+        vec![format!(
+            "air.psp_did, air.server and air.host go together (all three ask the PSP's mint info over AIR, none leaves it on HTTP), but {} not set",
+            if unset.len() == 1 {
+                format!("{} is", unset[0])
+            } else {
+                format!("{} are", unset.join(" and "))
+            }
+        )]
     }
 
     /// The policy for a kind of data, if the wallet has a setting for it. A
@@ -115,6 +284,16 @@ impl Settings {
     /// `storage.wallet`. `None` when that list is empty (local only).
     pub fn storage_service(&self) -> Option<ServiceDid> {
         self.storage_wallet.primary().copied()
+    }
+}
+
+/// A whole number in `min..=max`, read from text.
+fn number(key: &str, value: &str, min: u64, max: u64) -> Result<u64, String> {
+    match value.trim().parse::<u64>() {
+        Ok(n) if (min..=max).contains(&n) => Ok(n),
+        _ => Err(format!(
+            "{key} = `{value}` must be a whole number from {min} to {max}"
+        )),
     }
 }
 
@@ -182,6 +361,7 @@ fn parse_file(text: &str) -> Result<Vec<(String, String)>, Vec<String>> {
             }
             match value {
                 toml::Value::String(s) => pairs.push((key, s.clone())),
+                toml::Value::Integer(n) => pairs.push((key, n.to_string())),
                 toml::Value::Array(items) => {
                     let ids: Vec<&str> = items.iter().filter_map(|v| v.as_str()).collect();
                     if ids.len() == items.len() {
@@ -259,6 +439,9 @@ pub fn load(
                 Err(e) => problems.push(format!("environment variable {}: {e}", spec.env)),
             }
         }
+    }
+    if problems.is_empty() {
+        problems.extend(settings.problems());
     }
     if problems.is_empty() {
         Ok(Loaded {
@@ -414,6 +597,109 @@ mod tests {
         let p = load(&d, None, &env_of(&[("ECASH_STORAGE_WALLET", gap.as_str())])).unwrap_err();
         assert!(p.iter().any(|x| x.contains("entry 2")), "{p:?}");
         fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn air_is_off_by_default_and_on_with_the_did_the_server_and_the_host() {
+        let d = dir("air-on");
+        let l = load(&d, None, &no_env).unwrap();
+        assert!(!l.settings.air.is_configured());
+        assert_eq!(l.settings.air, AirSettings::default());
+        assert_eq!(l.settings.air.reply_wait_secs, 30);
+        assert_eq!(l.settings.air.attempts, 3);
+
+        fs::write(
+            d.join(FILE_NAME),
+            format!(
+                "[air]\npsp_did = \"{A}\"\nserver = \"{B}\"\nhost = \"127.0.0.1\"\nattempts = 5\nreply_wait_secs = 12\n"
+            ),
+        )
+        .unwrap();
+        let l = load(&d, None, &no_env).unwrap();
+        let air = &l.settings.air;
+        assert!(air.is_configured());
+        assert_eq!(air.psp_did.unwrap().to_hex(), A);
+        assert_eq!(air.server, B);
+        assert_eq!(air.host, "127.0.0.1");
+        assert_eq!((air.attempts, air.reply_wait_secs), (5, 12));
+        assert_eq!(l.sources["air.host"], Source::File);
+
+        let l = load(&d, None, &env_of(&[("ECASH_AIR_HOST", "air.example.org")])).unwrap();
+        assert_eq!(l.settings.air.host, "air.example.org");
+        assert_eq!(l.sources["air.host"], Source::Env("ECASH_AIR_HOST"));
+        assert_eq!(l.sources["air.server"], Source::File);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn some_but_not_all_of_the_air_connection_settings_is_an_error() {
+        let d = dir("air-partial");
+        let p = load(&d, None, &env_of(&[("ECASH_AIR_HOST", "127.0.0.1")])).unwrap_err();
+        assert!(
+            p.iter()
+                .any(|x| x.contains("air.psp_did and air.server are not set")),
+            "{p:?}"
+        );
+        let both = [("ECASH_AIR_HOST", "127.0.0.1"), ("ECASH_AIR_SERVER", B)];
+        let p = load(&d, None, &env_of(&both)).unwrap_err();
+        assert!(
+            p.iter().any(|x| x.contains("air.psp_did is not set")),
+            "{p:?}"
+        );
+        // The tuning settings alone are fine: AIR stays off.
+        let l = load(&d, None, &env_of(&[("ECASH_AIR_ATTEMPTS", "2")])).unwrap();
+        assert!(!l.settings.air.is_configured());
+        assert_eq!(l.settings.air.attempts, 2);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn every_air_mistake_is_refused_naming_the_setting() {
+        let d = dir("air-bad");
+        let bad = [
+            ("ECASH_AIR_SERVER", "zz", "air.server"),
+            ("ECASH_AIR_PSP_DID", "zz", "air.psp_did"),
+            ("ECASH_AIR_PSP_DID", &A[2..], "air.psp_did"),
+            ("ECASH_AIR_HOST", "ws://127.0.0.1", "air.host"),
+            ("ECASH_AIR_HOST", "127.0.0.1:5702", "air.host"),
+            ("ECASH_AIR_HOST", "a b", "air.host"),
+            ("ECASH_AIR_ATTEMPTS", "0", "air.attempts"),
+            ("ECASH_AIR_ATTEMPTS", "11", "air.attempts"),
+            ("ECASH_AIR_REPLY_WAIT_SECS", "0", "air.reply_wait_secs"),
+            ("ECASH_AIR_REPLY_WAIT_SECS", "soon", "air.reply_wait_secs"),
+            ("ECASH_AIR_MAX_SKEW_SECS", "86401", "air.max_skew_secs"),
+            ("ECASH_AIR_TIMEOUT_SECS", "-1", "air.timeout_secs"),
+        ];
+        for (var, value, setting) in bad {
+            let p = load(&d, None, &env_of(&[(var, value)])).unwrap_err();
+            assert!(
+                p.iter().any(|x| x.contains(var) && x.contains(setting)),
+                "{var}={value}: {p:?}"
+            );
+        }
+        // A bad value in the file names the setting. (An unknown key is a
+        // problem with the file itself, found before any value is applied, so it
+        // is checked on its own.)
+        fs::write(d.join(FILE_NAME), "[air]\nattempts = \"many\"\n").unwrap();
+        let p = load(&d, None, &no_env).unwrap_err();
+        assert!(p.iter().any(|x| x.contains("air.attempts")), "{p:?}");
+        fs::write(d.join(FILE_NAME), "[air]\nnope = 1\n").unwrap();
+        let p = load(&d, None, &no_env).unwrap_err();
+        assert!(
+            p.iter().any(|x| x.contains("unknown setting `air.nope`")),
+            "{p:?}"
+        );
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn every_spec_has_its_own_variable() {
+        let mut seen = std::collections::HashSet::new();
+        for s in SPECS {
+            assert!(s.env.starts_with("ECASH_"), "{}", s.env);
+            assert!(seen.insert(s.env), "{} used twice", s.env);
+            assert!(seen.insert(s.key), "{} used twice", s.key);
+        }
     }
 
     #[test]

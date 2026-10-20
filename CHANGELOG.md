@@ -4,6 +4,8 @@ ecash-wallet 0.1.2 builds on `sp-wire` 0.2.0 (wire version 2) and the 0.1.2 mint
 
 ## 0.6.0 (unreleased)
 
+**AIR 3.0.0 (unreleased).** Comments and docs follow sp-wire's move to air 3.0.0 (`ff41c09`) and air_server 1.0.0 (`ec6ac1f`); no code changes; the README's setup text names the new pin. The local AIR checkouts for a build are now on the branch `air3-export-secretkey` (3.0.0 plus the `SecretKey` export), and air_server is at 1.0.0.
+
 **Wire version 3: the service ID is the 33-byte AIR DID.** Builds on `sp-wire` 0.5.0 (`WIRE_VERSION` 3). `Cargo.toml` still names `sp-wire` and the three mints (dev-dependencies) by their old tags, which move when the new releases are tagged; until then the integration tests run against local copies (`scripts/test-wallet-against-local-mints.sh` in sandbox-mint). No migration and no dual format.
 
 - **A service is `sp_wire::ServiceDid` everywhere:** `--service` takes the 66-character DID (the old 64-character form is refused with a message that says to use the DID); the stored terms, the pending exchange, transfer and redemption, the hand-over, the FSP mint map and the balance's per-service totals hold the DID (the map keys are its 66 hex characters). `Settings::storage_service()` returns a `ServiceDid`.

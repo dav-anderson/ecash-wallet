@@ -10,13 +10,18 @@ use std::time::Duration;
 use mint_types::Amount;
 use secp256k1::PublicKey;
 use sp_wire::esp::exchange::{ExchangeRequest, ExchangeResponse};
-use sp_wire::esp::redeem::{RedeemResponse, Totals};
+use sp_wire::esp::redeem::RedeemResponse;
 use sp_wire::esp::transfer::{TransferRequest, TransferResponse};
 use sp_wire::keys::{CheckStateRequest, CheckStateResponse, KeysResponse};
 
 use crate::Wallet;
 use crate::error::WalletError;
 use crate::redeem::RedeemFees;
+// The readers of the ESP's replies (and refusals) do no I/O, so they are not in
+// this module: AIR uses them without the `http` feature. They stay here by name.
+pub use crate::esp_replies::{
+    exchange_refusal, parse_esp_limits, parse_redeem_fees, redeem_refusal,
+};
 use crate::store::Kind;
 
 fn client() -> Result<reqwest::blocking::Client, WalletError> {
@@ -133,22 +138,6 @@ pub fn sync_esp_limits(wallet: &mut Wallet, base: &str) -> Result<(), WalletErro
     Ok(())
 }
 
-/// The `exchange.max_items` and `transfer.max_items` of a `GET /fees` body.
-pub fn parse_esp_limits(text: &str) -> Result<crate::store::EspLimits, String> {
-    let body: serde_json::Value =
-        serde_json::from_str(text).map_err(|e| format!("not JSON: {e}"))?;
-    let read = |part: &str| -> Result<usize, String> {
-        body[part]["max_items"]
-            .as_u64()
-            .map(|n| n as usize)
-            .ok_or_else(|| format!("no {part}.max_items"))
-    };
-    Ok(crate::store::EspLimits {
-        exchange_max_items: Some(read("exchange")?),
-        transfer_max_items: Some(read("transfer")?),
-    })
-}
-
 /// The keys to unblind a PSP settlement's signatures with: those of the
 /// keyset the PSP printed (`keyset <id>`), read from `GET /keysets`, never
 /// assumed to be the current set. Older output names none and was signed
@@ -222,30 +211,6 @@ pub fn send_exchange(
     )))
 }
 
-/// Read the body of a `400` from `/exchange`. The ESP mint adds `code` and
-/// `spent` when PSP notes in the request were spent by a different request. That
-/// is [`WalletError::SpentElsewhere`]. Any other refusal, or a body that does not
-/// say so, is [`WalletError::Refused`].
-pub fn exchange_refusal(text: &str) -> WalletError {
-    #[derive(serde::Deserialize)]
-    struct Body {
-        error: Option<String>,
-        code: Option<String>,
-        spent: Option<Vec<usize>>,
-    }
-    match serde_json::from_str::<Body>(text) {
-        Ok(Body {
-            error,
-            code: Some(code),
-            spent: Some(spent),
-        }) if code == "note_spent_elsewhere" && !spent.is_empty() => WalletError::SpentElsewhere {
-            why: error.unwrap_or_else(|| text.to_string()),
-            inputs: spent,
-        },
-        _ => WalletError::Refused(text.to_string()),
-    }
-}
-
 /// Send a transfer to the ESP mint (`POST /transfer`).
 ///
 /// A `400` is [`WalletError::Refused`]: nothing was burned, and the pending
@@ -297,43 +262,6 @@ pub fn fetch_redeem_fees(base: &str) -> Result<RedeemFees, WalletError> {
     parse_redeem_fees(&text).map_err(|why| WalletError::Mint(format!("{url}: {why}")))
 }
 
-/// Read the `redeem` part of a `GET /fees` body. The rate is a decimal string,
-/// like every `u128` the mint sends.
-pub fn parse_redeem_fees(text: &str) -> Result<RedeemFees, String> {
-    let body: serde_json::Value =
-        serde_json::from_str(text).map_err(|e| format!("not JSON: {e}"))?;
-    let redeem = &body["redeem"];
-    let fee_per_byte = redeem["fee_per_byte"]
-        .as_str()
-        .and_then(|s| s.parse::<u128>().ok())
-        .ok_or("no redeem.fee_per_byte")?;
-    let max_request_bytes = redeem["max_request_bytes"]
-        .as_u64()
-        .ok_or("no redeem.max_request_bytes")?;
-    let max_memo_bytes = redeem["max_memo_bytes"]
-        .as_u64()
-        .ok_or("no redeem.max_memo_bytes")? as usize;
-    let size = &redeem["size"];
-    let expected = [
-        ("fixed", sp_wire::esp::redeem::FIXED_BYTES),
-        ("per_input", sp_wire::esp::redeem::INPUT_BYTES),
-        ("per_output", sp_wire::esp::redeem::OUTPUT_BYTES),
-    ];
-    for (name, bytes) in expected {
-        if size[name].as_u64() != Some(bytes) {
-            return Err(format!(
-                "the mint sizes redemptions with {name} = {}, but this wallet builds them with {bytes}. Update the wallet",
-                size[name]
-            ));
-        }
-    }
-    Ok(RedeemFees {
-        fee_per_byte,
-        max_request_bytes,
-        max_memo_bytes,
-    })
-}
-
 /// Send a redemption to the ESP mint (`POST /redeem`): the canonical encoding,
 /// as built by `Wallet::build_redemption`.
 ///
@@ -370,32 +298,6 @@ fn client_for(bytes: usize) -> Result<reqwest::blocking::Client, WalletError> {
         .timeout(Duration::from_secs(30 + (bytes as u64 >> 20)))
         .build()
         .map_err(|e| WalletError::Mint(format!("could not make an HTTP client: {e}")))
-}
-
-/// Read the body of a refused redemption: `code`, `error`, and, for
-/// `refund_required` and `outputs_over_limit`, `totals`.
-pub fn redeem_refusal(text: &str) -> WalletError {
-    #[derive(serde::Deserialize)]
-    struct Body {
-        error: Option<String>,
-        code: Option<String>,
-        totals: Option<Totals>,
-        notes: Option<Vec<sp_wire::esp::redeem::NoteResult>>,
-    }
-    match serde_json::from_str::<Body>(text) {
-        Ok(body) => WalletError::RedeemRefused {
-            code: body.code.unwrap_or_else(|| "unknown".into()),
-            why: body.error.unwrap_or_else(|| text.to_string()),
-            totals: body.totals.map(Box::new),
-            notes: body.notes.unwrap_or_default(),
-        },
-        Err(_) => WalletError::RedeemRefused {
-            code: "unknown".into(),
-            why: text.to_string(),
-            totals: None,
-            notes: Vec::new(),
-        },
-    }
 }
 
 #[cfg(test)]
@@ -474,10 +376,10 @@ mod tests {
 
     #[test]
     fn the_fees_body_is_read_and_a_different_size_formula_is_refused() {
-        let body = r#"{"redeem":{"fee_per_byte":"1000000","max_request_bytes":67108864,"max_memo_bytes":256,"size":{"fixed":120,"per_input":187,"per_output":82,"plus":"the memo's length in bytes"}}}"#;
+        let body = r#"{"redeem":{"fee_per_byte":"1000000","max_request_bytes":15728640,"max_memo_bytes":256,"size":{"fixed":120,"per_input":187,"per_output":82,"plus":"the memo's length in bytes"}}}"#;
         let fees = parse_redeem_fees(body).unwrap();
         assert_eq!(fees.fee_per_byte, 1_000_000);
-        assert_eq!(fees.max_request_bytes, 64 << 20);
+        assert_eq!(fees.max_request_bytes, 15 << 20);
         assert_eq!(fees.max_memo_bytes, 256);
         let changed = body.replace("\"per_input\":187", "\"per_input\":188");
         assert!(

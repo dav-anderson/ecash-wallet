@@ -37,24 +37,30 @@
 //! `network`, asked by `verify_mint` before anything else is sent to the PSP),
 //! its **keys**, **keysets** and **rotation** (`GET /keys`, `/keysets`,
 //! `/rotation`) and its **rollover** and **check-state** (`POST /rollover`,
-//! `/check-state`). They go over AIR when the wallet knows where to reach the
-//! SPI: **AIR is configured when `air.server` (the AIR server's name, its public
-//! key) and `air.host` (where to reach it) are both set.** The DID the requests
-//! are sealed to and the replies are signed under is the SPI's: the wallet ships
-//! with it built in ([`BUILTIN_SPI_DID`], which covers the PSP and later the
-//! ESP), and `air.psp_did` overrides it. With neither server nor host set (the
-//! default) the call is HTTP, as before. Setting only one of the two is an
-//! error, and so is setting `air.psp_did` without them, so a half-written config
-//! is not mistaken for "AIR is off". Every other call stays HTTP. The other
+//! `/check-state`), and the **ESP's** mint info, keysets, rotation, fees,
+//! rollover, exchange, transfer and redeem (`GET /health`, `/keysets`,
+//! `/rotation`, `/fees`; `POST /rollover`, `/exchange`, `/transfer`, `/redeem`).
+//! They go over AIR when the wallet knows where to reach the SPI: **AIR is
+//! configured when `air.server` (the AIR server's name, its public key) and
+//! `air.host` (where to reach it) are both set**, for the PSP and the ESP alike
+//! (one local AIR service carries both). **The PSP and the ESP each have their
+//! own DID** (their own `mint_did_key.json`): the requests to a mint are sealed
+//! to its DID and its replies are signed under it. The wallet ships with both
+//! built in ([`BUILTIN_SPI_DID`] for the PSP, [`BUILTIN_ESP_DID`] for the ESP),
+//! and `air.psp_did` and `air.esp_did` override them. With neither server nor
+//! host set (the default) the call is HTTP, as before. Setting only one of the
+//! two is an error, and so is setting a DID without them, so a half-written
+//! config is not mistaken for "AIR is off". Every other call stays HTTP (the
+//! ESP's `/audit` is the operator's, and the FSP's calls are HTTP). The other
 //! `air.*` settings tune the request and have defaults. See `air.rs` and the
 //! README.
 //!
-//! **The built-in DID is a PLACEHOLDER** until the first SPI deploy
-//! (sandbox-mint OPERATIONS.md, step 0, replaces it with the real one). It must
-//! never pass for a real DID silently: whenever AIR is configured and the
-//! built-in DID is the one in use, [`AirSettings::placeholder_warning`] says so,
-//! the command line prints it at every start and in `config`, and the errors of
-//! a call that fails name it.
+//! **Both built-in DIDs are PLACEHOLDERS** until the first SPI deploy
+//! (sandbox-mint OPERATIONS.md, step 0, replaces them with the real ones). They
+//! must never pass for real DIDs silently: whenever AIR is configured and a
+//! built-in DID is the one in use, [`AirSettings::placeholder_warnings`] says
+//! so (one warning for each), the command line prints them at every start and
+//! in `config`, and the errors of a call that fails name it.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -64,9 +70,10 @@ use std::path::{Path, PathBuf};
 use sp_wire::ServiceDid;
 use sp_wire::storage::{DataKind, StoragePolicy};
 
-/// The SPI's DID, built in: the key the wallet seals its AIR requests to and
-/// checks the replies against, when `air.psp_did` is not set. The SPI is the
-/// service that hosts the PSP now and the ESP later.
+/// The PSP's DID, built in: the key the wallet seals its AIR requests to the
+/// PSP to and checks the PSP's replies against, when `air.psp_did` is not set.
+/// (The SPI hosts the PSP and the ESP, and each has its own DID: the ESP's is
+/// [`BUILTIN_ESP_DID`].)
 ///
 /// **PLACEHOLDER. This is not a real SPI's key.** It is a point with no known
 /// private key, derived so that anyone can see nothing was hidden in it: the
@@ -81,8 +88,27 @@ use sp_wire::storage::{DataKind, StoragePolicy};
 pub const BUILTIN_SPI_DID: &str =
     "02aea5bd26a26bc83518e74bde96bb36e8cd45ff1cca0a8dcd246b764dae5daf7a";
 
+/// The ESP's DID, built in: the key the wallet seals its AIR requests to the ESP
+/// to and checks the ESP's replies against, when `air.esp_did` is not set. The
+/// ESP has its own DID, not the PSP's (its own `mint_did_key.json`, printed by
+/// `esp-mint pubkey`), so both mints can share one AIR service.
+///
+/// **PLACEHOLDER. This is not a real ESP's key.** Derived as
+/// [`BUILTIN_SPI_DID`] is, with another label: the compressed point whose x is
+/// `sha256("ecash-wallet placeholder ESP DID v0" || [c])` for the first byte `c`
+/// that gives an x on the curve (`c` = 0 here). Nobody knows its private key, so
+/// nothing sent to it can be read and no reply from "it" can verify: the failure
+/// is safe, and loud (see [`AirSettings::placeholder_warnings`]). The real DID
+/// goes in here at the first SPI deploy (sandbox-mint OPERATIONS.md, "First SPI
+/// deploy", step 0), and this comment goes with it.
+pub const BUILTIN_ESP_DID: &str =
+    "020b8daca33f2c1677c8a79978610f935126afcf787731c70561756bb35a574801";
+
 /// What is said whenever the placeholder DID is the one in use.
-pub const PLACEHOLDER_WARNING: &str = "WARNING: AIR is on, and the SPI's DID is the wallet's built-in PLACEHOLDER (air.psp_did is not set). It is not a real SPI's key: nothing sealed to it can be read and no reply from it can verify. Set air.psp_did to the SPI's DID, or unset air.server and air.host to use HTTP";
+pub const PLACEHOLDER_WARNING: &str = "WARNING: AIR is on, and the PSP's DID is the wallet's built-in PLACEHOLDER (air.psp_did is not set). It is not a real SPI's key: nothing sealed to it can be read and no reply from it can verify. Set air.psp_did to the PSP's DID, or unset air.server and air.host to use HTTP";
+
+/// What is said whenever the placeholder ESP DID is the one in use.
+pub const ESP_PLACEHOLDER_WARNING: &str = "WARNING: AIR is on, and the ESP's DID is the wallet's built-in PLACEHOLDER (air.esp_did is not set). It is not a real SPI's key: nothing sealed to it can be read and no reply from it can verify. Set air.esp_did to the ESP's DID (esp-mint pubkey), or unset air.server and air.host to use HTTP";
 
 /// The name of the file looked for beside the wallet file.
 pub const FILE_NAME: &str = "config.toml";
@@ -124,11 +150,18 @@ pub const SPECS: &[Spec] = &[
         what: "The SPI's DID, overriding the one built into the wallet: the 33-byte compressed key of the mint's mint_did_key.json, in hex. Empty (the default): the built-in SPI DID, which is a PLACEHOLDER until the first SPI deploy (the wallet warns whenever it is in use). It only matters with air.server and air.host set, which turn AIR on; setting it without them is an error.",
     },
     Spec {
+        key: "air.esp_did",
+        env: "ECASH_AIR_ESP_DID",
+        default: "",
+        units: "service DID (66 hex characters)",
+        what: "The ESP's DID, overriding the one built into the wallet: the 33-byte compressed key of esp-mint's mint_did_key.json (`esp-mint pubkey` prints it), in hex. It is not the PSP's: the two mints have their own DIDs and can share one AIR server. Empty (the default): the built-in ESP DID, which is a PLACEHOLDER until the first SPI deploy (the wallet warns whenever it is in use). It only matters with air.server and air.host set, which turn AIR on; setting it without them is an error.",
+    },
+    Spec {
         key: "air.server",
         env: "ECASH_AIR_SERVER",
         default: "",
         units: "AIR server name (66 hex characters)",
-        what: "The name of the AIR server that carries the request: its public key, the compressed hex AIR prints (66 characters, starting 02 or 03). The wallet checks the server's signed challenge against it, so only the server with this key is accepted. Resolving a mint's DID to its AIR server is not built, so it is configuration for now. With air.host, it turns AIR on for the PSP's mint info, keys, keysets, rotation, rollover and check-state; both or neither.",
+        what: "The name of the AIR server that carries the request: its public key, the compressed hex AIR prints (66 characters, starting 02 or 03). The wallet checks the server's signed challenge against it, so only the server with this key is accepted. Resolving a mint's DID to its AIR server is not built, so it is configuration for now. With air.host, it turns AIR on for the PSP's mint info, keys, keysets, rotation, rollover and check-state and the ESP's mint info, keysets, rotation, fees, rollover, exchange, transfer and redeem (both mints can use the same server: their DIDs differ); both or neither.",
     },
     Spec {
         key: "air.host",
@@ -167,11 +200,57 @@ pub const SPECS: &[Spec] = &[
     },
 ];
 
+/// Which mint a call is for. A kind of AIR request names a call, not a mint, so
+/// the same kind goes to either, sealed to that mint's DID.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Party {
+    /// The PSP (`air.psp_did`, else [`BUILTIN_SPI_DID`]).
+    Psp,
+    /// The ESP (`air.esp_did`, else [`BUILTIN_ESP_DID`]).
+    Esp,
+}
+
+impl Party {
+    /// What messages call it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Party::Psp => "PSP",
+            Party::Esp => "ESP",
+        }
+    }
+
+    /// The DID the requests to it are sealed to and its replies are checked under.
+    pub fn did(self, air: &AirSettings) -> ServiceDid {
+        match self {
+            Party::Psp => air.psp_did(),
+            Party::Esp => air.esp_did(),
+        }
+    }
+
+    /// The setting that overrides its built-in DID.
+    pub fn setting(self) -> &'static str {
+        match self {
+            Party::Psp => "air.psp_did",
+            Party::Esp => "air.esp_did",
+        }
+    }
+
+    /// Its built-in PLACEHOLDER DID, hex.
+    pub fn builtin(self) -> &'static str {
+        match self {
+            Party::Psp => BUILTIN_SPI_DID,
+            Party::Esp => BUILTIN_ESP_DID,
+        }
+    }
+}
+
 /// The `[air]` settings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AirSettings {
     /// The PSP's DID, if set.
     pub psp_did: Option<ServiceDid>,
+    /// The ESP's DID, if set.
+    pub esp_did: Option<ServiceDid>,
     /// The AIR server's name (its public key), or empty.
     pub server: String,
     /// The AIR server's host or IP, or empty.
@@ -186,6 +265,7 @@ impl Default for AirSettings {
     fn default() -> Self {
         AirSettings {
             psp_did: None,
+            esp_did: None,
             server: String::new(),
             host: String::new(),
             reply_wait_secs: 30,
@@ -197,32 +277,60 @@ impl Default for AirSettings {
 }
 
 impl AirSettings {
-    /// True when the PSP's mint info, keys, keysets, rotation, rollover and
-    /// check-state are asked over AIR: the server and the host are both set. (The
-    /// DID is not a condition: it defaults to the built-in one. With neither set
-    /// the calls are HTTP. [`Settings::problems`] refuses one without the other,
-    /// and a DID without either.)
+    /// True when the PSP's and the ESP's calls that have an AIR form are asked
+    /// over AIR: the server and the host are both set. (The DIDs are not a
+    /// condition: they default to the built-in ones. With neither set the calls
+    /// are HTTP. [`Settings::problems`] refuses one without the other, and a DID
+    /// without either.)
     pub fn is_configured(&self) -> bool {
         !self.server.is_empty() && !self.host.is_empty()
     }
 
-    /// The SPI's DID the requests are sealed to: `air.psp_did` if it is set, else
+    /// The PSP's DID the requests are sealed to: `air.psp_did` if it is set, else
     /// the built-in one ([`BUILTIN_SPI_DID`], a PLACEHOLDER).
     pub fn psp_did(&self) -> ServiceDid {
         self.psp_did.unwrap_or_else(builtin_spi_did)
     }
 
-    /// True when the DID in use is the built-in placeholder (`air.psp_did` is
-    /// not set, or is set to the placeholder itself).
+    /// The ESP's DID the requests are sealed to: `air.esp_did` if it is set, else
+    /// the built-in one ([`BUILTIN_ESP_DID`], a PLACEHOLDER).
+    pub fn esp_did(&self) -> ServiceDid {
+        self.esp_did.unwrap_or_else(builtin_esp_did)
+    }
+
+    /// True when the PSP's DID in use is the built-in placeholder (`air.psp_did`
+    /// is not set, or is set to the placeholder itself).
     pub fn uses_builtin_did(&self) -> bool {
         self.psp_did() == builtin_spi_did()
     }
 
-    /// The warning to show when AIR is on and the DID in use is the
-    /// placeholder, else `None`. The command line prints it at every start; an
-    /// app that embeds the library should show it too.
+    /// True when the ESP's DID in use is the built-in placeholder (`air.esp_did`
+    /// is not set, or is set to the placeholder itself).
+    pub fn uses_builtin_esp_did(&self) -> bool {
+        self.esp_did() == builtin_esp_did()
+    }
+
+    /// The warning to show when AIR is on and the PSP's DID in use is the
+    /// placeholder, else `None`. (The ESP's is [`Self::esp_placeholder_warning`];
+    /// [`Self::placeholder_warnings`] has both.)
     pub fn placeholder_warning(&self) -> Option<&'static str> {
         (self.is_configured() && self.uses_builtin_did()).then_some(PLACEHOLDER_WARNING)
+    }
+
+    /// The warning to show when AIR is on and the ESP's DID in use is the
+    /// placeholder, else `None`.
+    pub fn esp_placeholder_warning(&self) -> Option<&'static str> {
+        (self.is_configured() && self.uses_builtin_esp_did()).then_some(ESP_PLACEHOLDER_WARNING)
+    }
+
+    /// Every warning to show: one for each placeholder DID in use while AIR is
+    /// on. The command line prints them at every start; an app that embeds the
+    /// library should show them too.
+    pub fn placeholder_warnings(&self) -> Vec<&'static str> {
+        [self.placeholder_warning(), self.esp_placeholder_warning()]
+            .into_iter()
+            .flatten()
+            .collect()
     }
 
     /// The names of the two connection settings that are not set.
@@ -252,6 +360,7 @@ impl Settings {
             "storage.wallet" => self.storage_wallet.to_config_string(),
             "storage.app" => self.storage_app.to_config_string(),
             "air.psp_did" => self.air.psp_did.map(|d| d.to_hex()).unwrap_or_default(),
+            "air.esp_did" => self.air.esp_did.map(|d| d.to_hex()).unwrap_or_default(),
             "air.server" => self.air.server.clone(),
             "air.host" => self.air.host.clone(),
             "air.reply_wait_secs" => self.air.reply_wait_secs.to_string(),
@@ -273,6 +382,14 @@ impl Settings {
             "air.psp_did" => {
                 let text = value.trim();
                 self.air.psp_did = if text.is_empty() {
+                    None
+                } else {
+                    Some(ServiceDid::parse(text).map_err(|e| format!("{key} = `{value}`: {e}"))?)
+                };
+            }
+            "air.esp_did" => {
+                let text = value.trim();
+                self.air.esp_did = if text.is_empty() {
                     None
                 } else {
                     Some(ServiceDid::parse(text).map_err(|e| format!("{key} = `{value}`: {e}"))?)
@@ -311,12 +428,19 @@ impl Settings {
         let unset = self.air.unset();
         match unset.len() {
             1 => vec![format!(
-                "air.server and air.host go together (both turn AIR on for the PSP's calls, neither leaves them on HTTP), but {} is not set",
+                "air.server and air.host go together (both turn AIR on for the PSP's and the ESP's calls, neither leaves them on HTTP), but {} is not set",
                 unset[0]
             )],
-            2 if self.air.psp_did.is_some() => vec![
-                "air.psp_did is set, but air.server and air.host are not: it only replaces the built-in SPI DID, and AIR is on only when the server and the host are set. Set both, or unset air.psp_did to use HTTP".into(),
-            ],
+            2 => {
+                let mut out = Vec::new();
+                if self.air.psp_did.is_some() {
+                    out.push("air.psp_did is set, but air.server and air.host are not: it only replaces the built-in PSP DID, and AIR is on only when the server and the host are set. Set both, or unset air.psp_did to use HTTP".to_string());
+                }
+                if self.air.esp_did.is_some() {
+                    out.push("air.esp_did is set, but air.server and air.host are not: it only replaces the built-in ESP DID, and AIR is on only when the server and the host are set. Set both, or unset air.esp_did to use HTTP".to_string());
+                }
+                out
+            }
             _ => vec![],
         }
     }
@@ -341,6 +465,11 @@ impl Settings {
 /// [`BUILTIN_SPI_DID`] as a [`ServiceDid`].
 fn builtin_spi_did() -> ServiceDid {
     ServiceDid::parse(BUILTIN_SPI_DID).expect("the built-in SPI DID is a valid DID")
+}
+
+/// [`BUILTIN_ESP_DID`] as a [`ServiceDid`].
+fn builtin_esp_did() -> ServiceDid {
+    ServiceDid::parse(BUILTIN_ESP_DID).expect("the built-in ESP DID is a valid DID")
 }
 
 /// A whole number in `min..=max`, read from text.
@@ -743,6 +872,114 @@ mod tests {
             format!("02{}", hex::encode(hasher.finalize()))
         );
     }
+    #[test]
+    fn the_builtin_esp_did_is_a_valid_point_other_than_the_psps_and_its_derivation_holds() {
+        use sha2::{Digest, Sha256};
+        let did = ServiceDid::parse(BUILTIN_ESP_DID).unwrap();
+        sp_wire::seal::parse_public_key(BUILTIN_ESP_DID).unwrap();
+        assert_eq!(did.to_hex(), BUILTIN_ESP_DID);
+        assert_ne!(BUILTIN_ESP_DID, BUILTIN_SPI_DID);
+        // x = sha256(label || [0]), with an even-y prefix; 0 is the first counter
+        // that lands on the curve (the PSP's needed 3).
+        let mut hasher = Sha256::new();
+        hasher.update(b"ecash-wallet placeholder ESP DID v0");
+        hasher.update([0u8]);
+        assert_eq!(
+            BUILTIN_ESP_DID,
+            format!("02{}", hex::encode(hasher.finalize()))
+        );
+    }
+
+    #[test]
+    fn the_esp_has_its_own_did_setting_and_its_own_placeholder_warning() {
+        let d = dir("air-esp-did");
+        let both = [("ECASH_AIR_HOST", "127.0.0.1"), ("ECASH_AIR_SERVER", B)];
+        // Neither DID set: both placeholders are in use, two warnings.
+        let l = load(&d, None, &env_of(&both)).unwrap();
+        let air = &l.settings.air;
+        assert_eq!(air.esp_did, None);
+        assert_eq!(air.esp_did().to_hex(), BUILTIN_ESP_DID);
+        assert!(air.uses_builtin_esp_did());
+        assert_ne!(air.esp_did(), air.psp_did());
+        let warnings = air.placeholder_warnings();
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings[0].contains("PSP") && warnings[0].contains("air.psp_did"));
+        assert!(warnings[1].contains("ESP") && warnings[1].contains("air.esp_did"));
+        assert!(warnings.iter().all(|w| w.contains("PLACEHOLDER")));
+
+        // A real ESP DID alone quiets only the ESP's warning, and the other way round.
+        let esp_only = [both[0], both[1], ("ECASH_AIR_ESP_DID", A)];
+        let l = load(&d, None, &env_of(&esp_only)).unwrap();
+        let air = &l.settings.air;
+        assert_eq!(air.esp_did().to_hex(), A);
+        assert!(!air.uses_builtin_esp_did());
+        assert_eq!(air.esp_placeholder_warning(), None);
+        assert_eq!(air.placeholder_warnings(), vec![PLACEHOLDER_WARNING]);
+        assert_eq!(l.sources["air.esp_did"], Source::Env("ECASH_AIR_ESP_DID"));
+        let psp_only = [both[0], both[1], ("ECASH_AIR_PSP_DID", A)];
+        let l = load(&d, None, &env_of(&psp_only)).unwrap();
+        assert_eq!(
+            l.settings.air.placeholder_warnings(),
+            vec![ESP_PLACEHOLDER_WARNING]
+        );
+        // Both real: no warning. (The same DID twice is odd, but it is the user's.)
+        let real = [
+            both[0],
+            both[1],
+            ("ECASH_AIR_PSP_DID", A),
+            ("ECASH_AIR_ESP_DID", A),
+        ];
+        let l = load(&d, None, &env_of(&real)).unwrap();
+        assert!(l.settings.air.placeholder_warnings().is_empty());
+        // Setting the ESP's DID to the placeholder itself is still the placeholder.
+        let same = [both[0], both[1], ("ECASH_AIR_ESP_DID", BUILTIN_ESP_DID)];
+        let l = load(&d, None, &env_of(&same)).unwrap();
+        assert!(l.settings.air.esp_placeholder_warning().is_some());
+        // With AIR off nothing is said.
+        let l = load(&d, None, &env_of(&[])).unwrap();
+        assert!(l.settings.air.placeholder_warnings().is_empty());
+
+        // From the file.
+        fs::write(
+            d.join(FILE_NAME),
+            format!("[air]\nesp_did = \"{A}\"\nserver = \"{B}\"\nhost = \"127.0.0.1\"\n"),
+        )
+        .unwrap();
+        let l = load(&d, None, &env_of(&[])).unwrap();
+        assert_eq!(l.settings.air.esp_did.unwrap().to_hex(), A);
+        assert_eq!(l.sources["air.esp_did"], Source::File);
+        assert_eq!(l.settings.get("air.esp_did").unwrap(), A);
+
+        // A DID that is not one is refused.
+        let p = load(&d, None, &env_of(&[("ECASH_AIR_ESP_DID", "zz")])).unwrap_err();
+        assert!(p.iter().any(|x| x.contains("air.esp_did")), "{p:?}");
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn an_esp_did_without_the_server_and_the_host_is_an_error_like_the_psps() {
+        let d = dir("air-esp-did-alone");
+        let p = load(&d, None, &env_of(&[("ECASH_AIR_ESP_DID", A)])).unwrap_err();
+        assert!(
+            p.iter()
+                .any(|x| x.contains("air.esp_did is set, but air.server and air.host are not")),
+            "{p:?}"
+        );
+        // Both DIDs alone: two problems, one each.
+        let both = [("ECASH_AIR_ESP_DID", A), ("ECASH_AIR_PSP_DID", A)];
+        let p = load(&d, None, &env_of(&both)).unwrap_err();
+        assert!(p.iter().any(|x| x.contains("air.esp_did is set")), "{p:?}");
+        assert!(p.iter().any(|x| x.contains("air.psp_did is set")), "{p:?}");
+        // With one of the pair the pair is the problem.
+        let one = [("ECASH_AIR_ESP_DID", A), ("ECASH_AIR_HOST", "127.0.0.1")];
+        let p = load(&d, None, &env_of(&one)).unwrap_err();
+        assert!(
+            p.iter().any(|x| x.contains("air.server is not set")),
+            "{p:?}"
+        );
+        fs::remove_dir_all(&d).unwrap();
+    }
+
     #[test]
     fn some_but_not_all_of_the_air_connection_settings_is_an_error() {
         let d = dir("air-partial");

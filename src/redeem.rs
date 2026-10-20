@@ -23,7 +23,7 @@
 //!    only needed when the accepted notes do not cover the fee; the wallet adds
 //!    them when the mint says so (below).
 //! 4. **Split.** A redemption larger than the mint's ceiling on one request
-//!    (`redeem.max_request_bytes`, 64 MiB by default, from `GET /fees`) is split
+//!    (`redeem.max_request_bytes`, 15 MiB by default so that a request fits one AIR message, from `GET /fees`) is split
 //!    into several requests, each under the ceiling with room for its outputs.
 //!    Each pays its own fee and gets its own queue entry.
 //! 5. **Crash safety.** Each request is stored by its request hash with its
@@ -71,9 +71,10 @@ const DEFAULT_FEE_PER_BYTE: u128 = 0;
 /// 2^64 splits into at most this many powers of two.
 pub const MAX_OUTPUTS_PER_TERMS: usize = 64;
 
-/// The request ceiling to assume (64 MiB) until `/fees` has been read. Also the
-/// mint's default, not wire format.
-const DEFAULT_MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
+/// The request ceiling to assume (15 MiB) until `/fees` has been read. Also the
+/// mint's default (AIR's message cap of 16 MiB less room for the envelope), not
+/// wire format.
+const DEFAULT_MAX_REQUEST_BYTES: usize = 15 * 1024 * 1024;
 
 /// The fee for a request of `size` encoded bytes at `fee_per_byte`: the size
 /// times the rate, the way the mint charges it.

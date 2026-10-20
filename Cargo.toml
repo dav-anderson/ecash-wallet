@@ -11,14 +11,15 @@ default = ["http", "air"]
 # The HTTP calls to the mints, used by the command line. The rest of the library
 # does no I/O except its own note file, so an app can send requests its own way.
 http = ["dep:reqwest"]
-# The PSP's mint info over AIR (the first call that does not go over HTTP), when
+# The PSP's and the ESP's calls over AIR (mint info first, now also keys, keysets,
+# rotation, rollover, check-state, fees, exchange, transfer and redeem), when
 # the wallet's `[air]` settings name the PSP's DID, an AIR server and its host.
 # Needs sp-wire's `air-client`, which needs `air_server`; until air_server stops
 # naming `air` by a path outside its repository, that takes the local patches in
 # the README.
 air = ["sp-wire/air-client"]
-# The integration tests that run psp-mint's AIR listener against the wallet. They
-# need a psp-mint that has `air_listener`, which no tag has yet, so they run
+# The integration tests that run psp-mint's and esp-mint's AIR listeners against
+# the wallet. They need a psp-mint and an esp-mint that have `air_listener`, which no tag has yet, so they run
 # only when this is on (the local-mints script turns on every feature).
 air-listener-tests = ["air", "http"]
 
@@ -66,6 +67,10 @@ required-features = ["http"]
 
 [[test]]
 name = "air_flow"
+required-features = ["air-listener-tests"]
+
+[[test]]
+name = "esp_air_flow"
 required-features = ["air-listener-tests"]
 
 [[test]]

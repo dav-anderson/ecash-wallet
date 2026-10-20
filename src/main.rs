@@ -6,7 +6,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use ecash_wallet::config::{self, AirSettings, Settings};
+use ecash_wallet::config::{self, AirSettings};
 use ecash_wallet::esp::ExchangeBuild;
 use ecash_wallet::psp::parse_signatures;
 use ecash_wallet::redeem::{EntryOutcome, RedeemOutcome, RedemptionState};
@@ -125,16 +125,17 @@ ecash-wallet [--wallet FILE] [--config FILE] [--regtest|--signet|--testnet] <com
       declined ones give the reissued notes back with the operator's reason.
   config
       Print the settings in use and where each came from: the storage policy
-      (storage.wallet and storage.app, each an ordered list of service IDs,
-      first is the primary), from config.toml beside the wallet file (or
-      --config FILE, or $ECASH_CONFIG) and $ECASH_STORAGE_WALLET and
-      $ECASH_STORAGE_APP. Nothing reads or writes the AIR yet.
-  fsp issue [--service DID] [--esp UNITS | --psp N] [--fsp-url URL]
+      (storage.wallet, the AIR services that back up the wallet, and
+      storage.app, each an ordered list of service IDs, first preferred),
+      from config.toml beside the wallet file (or --config FILE, or
+      $ECASH_CONFIG) and $ECASH_STORAGE_WALLET and $ECASH_STORAGE_APP.
+      Nothing reads or writes the AIR yet.
+  fsp issue --service DID [--esp UNITS | --psp N] [--fsp-url URL]
       Hand ESP for a service to its FSP mint for FSP, 1:1 less its issue fee.
       All of the service's ESP by default, any day, mature or not.
-  fsp pay [--service DID] --units N [--memo TEXT] [--fsp-url URL]
+  fsp pay --service DID --units N [--memo TEXT] [--fsp-url URL]
       Pay N FSP units to the service, with change.
-  fsp sync [--service DID] [--fsp-url URL]
+  fsp sync --service DID [--fsp-url URL]
       What runs on its own: finish pending FSP requests, read the mint's keys,
       and swap FSP on the previous keyset to the current one.
   fsp-window --service DID [--fsp-url URL]
@@ -146,9 +147,9 @@ ecash-wallet [--wallet FILE] [--config FILE] [--regtest|--signet|--testnet] <com
       Move a wallet file from before the networks had their own folders,
       ~/.ecash-wallet/wallet.json, into regtest/.
 
-  Without --service, the fsp commands use the storage service: the primary of
-  storage.wallet. Fees for storage are paid to it, not to whichever service
-  the wallet holds FSP for. With storage.wallet empty, --service is needed.
+  The fsp commands always need --service: there is no default. storage.wallet
+  lists the AIR services that back up the wallet; it is not the service FSP is
+  paid to.
 
   At startup, and every time it talks to an FSP mint, the wallet checks that
   mint's keys and rolls FSP on the previous keyset over to the current one.
@@ -983,7 +984,7 @@ fn later_failure_line(first: &mut Option<WalletError>, e: WalletError) -> Option
     None
 }
 
-fn balance(wallet: &Wallet, settings: &Settings, args: Args) -> Result<(), WalletError> {
+fn balance(wallet: &Wallet, args: Args) -> Result<(), WalletError> {
     args.done()?;
     let b = wallet.balance();
     println!("psp  {}", b.psp);
@@ -1003,17 +1004,6 @@ fn balance(wallet: &Wallet, settings: &Settings, args: Args) -> Result<(), Walle
             };
             println!("         {units} on keyset {keyset} ({role})");
         }
-    }
-    match settings.storage_service() {
-        Some(service) => {
-            let key = hex::encode(service.serialize());
-            let held = b.fsp_by_service.get(&key).copied().unwrap_or(0);
-            println!(
-                "       storage service {key}: {held} FSP held for it ({})",
-                settings.storage_wallet.describe()
-            );
-        }
-        None => println!("       storage: {}", settings.storage_wallet.describe()),
     }
     let (unknown, unknown_units) = wallet.fsp_unknown_service();
     if unknown > 0 {
@@ -1550,29 +1540,27 @@ fn sync_and_log(wallet: &mut Wallet, service: ServiceDid, url: &str) {
     }
 }
 
-fn fsp(wallet: &mut Wallet, settings: &Settings, mut args: Args) -> Result<(), WalletError> {
+/// The service of an `fsp` command: `--service DID`, always given. There is no
+/// default: `storage.wallet` lists the wallet's backups, not the service FSP is
+/// paid to.
+fn fsp_service(args: &mut Args) -> Result<ServiceDid, WalletError> {
+    match args.flag("--service")? {
+        Some(text) => service_did(&text),
+        None => Err(WalletError::Invalid(
+            "the fsp commands need --service DID (the service whose FSP this is); there is no default"
+                .into(),
+        )),
+    }
+}
+
+fn fsp(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
     if args.0.is_empty() {
         return Err(WalletError::Invalid(
             "fsp needs issue, pay or sync. Run with --help".into(),
         ));
     }
     let what = args.0.remove(0);
-    let service = match args.flag("--service")? {
-        Some(text) => service_did(&text)?,
-        None => {
-            let service = settings.storage_service().ok_or_else(|| {
-                WalletError::Invalid(
-                    "--service DID is needed (storage.wallet is empty, so there is no storage service to default to)"
-                        .into(),
-                )
-            })?;
-            eprintln!(
-                "using the storage service {} (the primary of storage.wallet)",
-                hex::encode(service.serialize())
-            );
-            service
-        }
-    };
+    let service = fsp_service(&mut args)?;
     let flag = args.flag("--fsp-url")?;
     let base = fsp_url(wallet, &service, flag)?;
     // Every connection: pending requests, keys, rollover.
@@ -1727,13 +1715,6 @@ fn config_command(loaded: &config::Loaded, args: Args) -> Result<(), WalletError
         loaded.settings.storage_wallet.describe()
     );
     println!("storage.app: {}", loaded.settings.storage_app.describe());
-    match loaded.settings.storage_service() {
-        Some(service) => println!(
-            "storage service for FSP fees: {} (the primary of storage.wallet)",
-            hex::encode(service.serialize())
-        ),
-        None => println!("storage service for FSP fees: none (storage.wallet is empty)"),
-    }
     println!("Storage settings only: nothing reads or writes the AIR for storage yet.");
     let air = &loaded.settings.air;
     if air.is_configured() {
@@ -1805,7 +1786,7 @@ fn run(raw: Vec<String>) -> Result<(), WalletError> {
     startup_fsp_sync(&mut wallet);
     startup_rotation_sync(&mut wallet);
     match command.as_str() {
-        "fsp" => fsp(&mut wallet, &settings, args),
+        "fsp" => fsp(&mut wallet, args),
         "fsp-window" => fsp_window(&mut wallet, args),
         "esp-schedule" => esp_schedule(&wallet, args),
         "buy-psp" => buy_psp(&mut wallet, args),
@@ -1815,7 +1796,7 @@ fn run(raw: Vec<String>) -> Result<(), WalletError> {
         "receive" => receive(&mut wallet, args),
         "transfer" => transfer(&mut wallet, args),
         "redeem" => redeem(&mut wallet, args),
-        "balance" => balance(&wallet, &settings, args),
+        "balance" => balance(&wallet, args),
         "send-psp" | "receive-psp" | "sent" => Err(WalletError::Invalid(format!(
             "`{command}` was removed. A PSP handoff replaces it: `handoff export-psp --to DID --psp N` to give PSP, `handoff import` to take it, `handoff check ID` and `handoff reclaim ID` for what `sent --check` and `sent --reclaim` did. Tokens in an old wallet file are PSP handoffs now (see `handoff list`)"
         ))),
@@ -1858,5 +1839,29 @@ mod tests {
             Some("error: two".to_string())
         );
         assert!(matches!(&first, Some(WalletError::Mint(m)) if m == "one"));
+    }
+
+    #[test]
+    fn an_fsp_command_without_service_is_refused() {
+        let mut args = Args(vec!["--units".into(), "5".into()]);
+        match fsp_service(&mut args) {
+            Err(WalletError::Invalid(m)) => assert!(m.contains("--service"), "{m}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        // the other flags are left for the command
+        assert_eq!(args.0, vec!["--units".to_string(), "5".to_string()]);
+    }
+
+    #[test]
+    fn an_fsp_command_takes_the_service_it_is_given() {
+        let did = config::BUILTIN_SPI_DID.to_string();
+        let mut args = Args(vec![
+            "--service".into(),
+            did.clone(),
+            "--units".into(),
+            "5".into(),
+        ]);
+        assert_eq!(fsp_service(&mut args).unwrap().to_hex(), did);
+        assert_eq!(args.0, vec!["--units".to_string(), "5".to_string()]);
     }
 }

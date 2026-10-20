@@ -10,23 +10,23 @@
 //! # Storage policy
 //!
 //! One setting per kind of data the wallet keeps, each an ordered list of AIR
-//! service IDs (index 0 the primary; see [`sp_wire::storage`]):
+//! service IDs (see [`sp_wire::storage`]):
 //!
-//! - `storage.wallet`: where the wallet file (notes, keys, requests in flight)
-//!   is kept.
+//! - `storage.wallet`: the AIR services that back up the wallet state (notes,
+//!   keys, requests in flight), and nothing else. The wallet should always keep a
+//!   copy on the AIR: index 0 is the preferred service for that copy and the rest
+//!   are further backups, in order. The local file stays the primary ledger. Two
+//!   backup services are plenty; the limit is 8.
 //! - `storage.app`: where the app's own data is kept.
 //!
-//! One entry is valid and means one service plus a local backup copy; an empty
-//! list (the default) means local only. **This is configuration and validation
-//! only: nothing reads or writes the AIR yet**, and the wallet file is still the
-//! local file.
+//! One entry is valid and means one service plus the local copy; an empty list
+//! (the default) means local only. **This is configuration and validation only:
+//! nothing reads or writes the AIR yet**, and the wallet file is still the local
+//! file.
 //!
-//! The one thing the wallet does with the list today: **the service FSP fees for
-//! storage are paid to is the primary of `storage.wallet`**
-//! ([`Settings::storage_service`]), never whichever service the wallet happens to
-//! hold FSP for. With the list empty there is no storage service, and the
-//! wallet says so rather than choosing one. The command line uses it as the
-//! default `--service` of the `fsp` commands.
+//! `storage.wallet` is **not** the service FSP fees are paid to. The `fsp`
+//! commands take `--service` and have no default. The service for FSP top-up
+//! will be a setting of its own (planned, not built).
 //!
 //! The planned behaviour is in the mints' DESIGN.md files ("Storage policy").
 //!
@@ -133,7 +133,7 @@ pub const SPECS: &[Spec] = &[
         env: "ECASH_STORAGE_WALLET",
         default: "",
         units: "service DIDs (66 hex characters)",
-        what: "Which AIR services will keep the wallet file, as an ordered list of service IDs: index 0 is the primary and the rest are secondaries, in the order they would be promoted. A service ID is the service's AIR DID, a 33-byte compressed key in hex (66 characters, starting 02 or 03); the old 32-byte x-only form is refused. In the environment the IDs are separated by commas; in the file it is an array of strings or one such string. One entry: that service holds the wallet and the wallet keeps a local backup copy. Empty (the default): local only. At most 8, no duplicates. The primary is also the service that FSP fees for storage are paid to. Setting only for now: nothing reads or writes the AIR yet.",
+        what: "The AIR services that back up the wallet state, and nothing else, as an ordered list of service IDs: the wallet should always keep a copy on the AIR, index 0 is the preferred service for that copy and the rest are further backups, in order. A service ID is the service's AIR DID, a 33-byte compressed key in hex (66 characters, starting 02 or 03); the old 32-byte x-only form is refused. In the environment the IDs are separated by commas; in the file it is an array of strings or one such string. One entry: that service holds a copy beside the local ledger. Empty (the default): local only. At most 8, no duplicates; two backup services are plenty. FSP fees are not paid to these services: the fsp commands need --service. Setting only for now: nothing reads or writes the AIR yet.",
     },
     Spec {
         key: "storage.app",
@@ -454,12 +454,6 @@ impl Settings {
             DataKind::MintState => None,
         }
     }
-
-    /// The service that FSP fees for storage are paid to: the primary of
-    /// `storage.wallet`. `None` when that list is empty (local only).
-    pub fn storage_service(&self) -> Option<ServiceDid> {
-        self.storage_wallet.primary().copied()
-    }
 }
 
 /// [`BUILTIN_SPI_DID`] as a [`ServiceDid`].
@@ -672,7 +666,6 @@ mod tests {
         assert_eq!(l.settings, Settings::default());
         assert!(l.file.is_none() && l.sources.is_empty());
         assert!(l.settings.storage_wallet.is_local_only());
-        assert_eq!(l.settings.storage_service(), None);
         for s in SPECS {
             assert_eq!(
                 l.settings.get(s.key).as_deref(),
@@ -703,8 +696,6 @@ mod tests {
         assert_eq!(s.storage_wallet.secondaries().len(), 1);
         assert_eq!(s.storage_app.to_config_string(), B);
         assert_eq!(l.sources["storage.wallet"], Source::File);
-        // The storage service is the wallet policy's primary, not the app's.
-        assert_eq!(s.storage_service().unwrap().to_hex(), A);
         assert_eq!(
             s.policy(DataKind::App).unwrap().to_config_string(),
             B.to_string()
@@ -1067,7 +1058,6 @@ mod tests {
         let l = load(&d, None, &no_env).unwrap();
         assert!(l.settings.storage_wallet.is_local_only());
         assert!(l.settings.storage_app.is_local_only());
-        assert_eq!(l.settings.storage_service(), None);
         fs::remove_dir_all(&d).unwrap();
     }
 }

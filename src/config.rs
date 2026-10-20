@@ -31,14 +31,16 @@
 //!
 //! # AIR (`[air]`)
 //!
-//! The wallet reaches the PSP and the ESP over AIR and only over AIR. The calls
+//! The wallet reaches the PSP, the ESP and the FSP mints over AIR and only over
+//! AIR. The calls
 //! are the **PSP's mint info** (what `/health` reports: `wire_version` and
 //! `network`, asked by `verify_psp` before anything else is sent to the PSP),
 //! its **keys**, **keysets** and **rotation** and its **rollover** and
 //! **check-state**, and the **ESP's** mint info, keysets, rotation, fees,
-//! rollover, exchange, transfer and redeem. **They need `air.server` (the AIR
-//! server's name, its public key) and `air.host` (where to reach it)**, for the
-//! PSP and the ESP alike (one local AIR service carries both); a call made
+//! rollover, exchange, transfer and redeem, and an **FSP mint's** mint info,
+//! keys, rotation, fees, issue and spend. **The PSP's and the ESP's need
+//! `air.server` (the AIR server's name, its public key) and `air.host` (where to
+//! reach it)**, for the two alike (one local AIR service carries both); a call made
 //! without them fails with an error that names the missing setting
 //! ([`AirSettings::require`]). **The PSP and the ESP each have their own DID**
 //! (their own `mint_did_key.json`): the requests to a mint are sealed to its DID
@@ -46,9 +48,15 @@
 //! ([`BUILTIN_SPI_DID`] for the PSP, [`BUILTIN_ESP_DID`] for the ESP), and
 //! `air.psp_did` and `air.esp_did` override them. Setting only one of the server
 //! and the host is an error, and so is setting a DID without them, so a
-//! half-written config is not mistaken for a complete one. The only calls left
-//! on HTTP are the FSP mints' (`fsp ...`). The other `air.*` settings tune the
-//! request and have defaults. See `air.rs` and the README.
+//! half-written config is not mistaken for a complete one. **An FSP mint is a
+//! service's own, so each service has its own entry** in `air.fsp`: the service's
+//! DID, the AIR server its mint listens on and where that is, written
+//! `<service DID>@<AIR server key>@<host>` ([`FspAir`]). An `fsp` command for a
+//! service with no entry is refused, naming the setting
+//! ([`AirSettings::fsp_for`]). Like `air.server` and `air.host`, the entry is to
+//! be replaced by DID resolution (upstream item 4). No call is made over HTTP. The
+//! other `air.*` settings tune the request and have defaults. See `air.rs` and
+//! the README.
 //!
 //! **Both built-in DIDs are PLACEHOLDERS** until the first SPI deploy
 //! (sandbox-mint OPERATIONS.md, step 0, replaces them with the real ones). They
@@ -166,11 +174,18 @@ pub const SPECS: &[Spec] = &[
         what: "Where to reach that AIR server: a host name or an IP with no scheme, no path and no port (the AIR client always dials port 5702 for ws). 127.0.0.1 for a server on this machine. Required with air.server, for the same calls; both or neither.",
     },
     Spec {
+        key: "air.fsp",
+        env: "ECASH_AIR_FSP",
+        default: "",
+        units: "entries service DID@AIR server@host",
+        what: "Where each service's FSP mint is reached over AIR, as a list of entries `<service DID>@<AIR server name>@<host>`: the service's DID (66 hex characters, the mint's `service.did`, which its replies are signed under and the requests to it are sealed to), the name of the AIR server its listener is on (a public key, 66 hex characters) and where that server is (a host name or IP, no scheme, no path, no port). `fsp-mint serve` prints its entry when it starts. The `fsp` commands need one for the service they name, and refuse without it, naming this setting. In the environment the entries are separated by commas; in the file it is an array of strings or one string. At most one entry for a service; no duplicates. Resolving a DID to its AIR server is not built, so this is configuration for now, and is to be replaced by DID resolution. Empty (the default): no FSP mint can be reached.",
+    },
+    Spec {
         key: "air.reply_wait_secs",
         env: "ECASH_AIR_REPLY_WAIT_SECS",
         default: "30",
         units: "seconds (1 to 600)",
-        what: "How long to wait for the mint's reply to one try of a request (mint info, keys, keysets, rotation, rollover or check-state). After that the same request is written again, in the next free mailbox slot.",
+        what: "How long to wait for the mint's reply to one try of a request (mint info, keys, keysets, rotation, fees, rollover, check-state, exchange, transfer, redeem, FSP issue or FSP spend). After that the same request is written again, in the next free mailbox slot.",
     },
     Spec {
         key: "air.attempts",
@@ -203,6 +218,9 @@ pub enum Party {
     Psp,
     /// The ESP (`air.esp_did`, else [`BUILTIN_ESP_DID`]).
     Esp,
+    /// The FSP mint of a service: the service's DID, at the AIR server of its
+    /// `air.fsp` entry.
+    Fsp(ServiceDid),
 }
 
 impl Party {
@@ -211,6 +229,7 @@ impl Party {
         match self {
             Party::Psp => "PSP",
             Party::Esp => "ESP",
+            Party::Fsp(_) => "FSP mint",
         }
     }
 
@@ -219,6 +238,7 @@ impl Party {
         match self {
             Party::Psp => air.psp_did(),
             Party::Esp => air.esp_did(),
+            Party::Fsp(service) => service,
         }
     }
 
@@ -227,15 +247,89 @@ impl Party {
         match self {
             Party::Psp => "air.psp_did",
             Party::Esp => "air.esp_did",
+            Party::Fsp(_) => "air.fsp",
         }
     }
 
-    /// Its built-in PLACEHOLDER DID, hex.
+    /// Its built-in PLACEHOLDER DID, hex (an FSP mint has none: its service's DID
+    /// is in its `air.fsp` entry, or there is no way to reach it).
     pub fn builtin(self) -> &'static str {
         match self {
             Party::Psp => BUILTIN_SPI_DID,
             Party::Esp => BUILTIN_ESP_DID,
+            Party::Fsp(_) => "",
         }
+    }
+
+    /// The AIR server (its name and its host) the calls to it go through: the
+    /// PSP's and the ESP's are `air.server` and `air.host`, an FSP mint's are the
+    /// ones in its service's `air.fsp` entry. An error that names the missing
+    /// setting when there are none.
+    pub fn address(self, air: &AirSettings) -> Result<(String, String), String> {
+        match self {
+            Party::Psp | Party::Esp => {
+                air.require()?;
+                Ok((air.server.clone(), air.host.clone()))
+            }
+            Party::Fsp(service) => {
+                let entry = air.fsp_for(service)?;
+                Ok((entry.server.clone(), entry.host.clone()))
+            }
+        }
+    }
+}
+
+/// Where one service's FSP mint is reached over AIR: one entry of `air.fsp`,
+/// written `<service DID>@<AIR server key>@<host>`. To be replaced by DID
+/// resolution (upstream item 4): until then the wallet is told.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FspAir {
+    /// The service's DID: what the requests are sealed to and the replies are
+    /// signed under (the mint's `service.did`).
+    pub service: ServiceDid,
+    /// The name of the AIR server the mint's listener is on (a public key).
+    pub server: String,
+    /// Where that server is: a host name or IP, no port.
+    pub host: String,
+}
+
+impl FspAir {
+    /// Read one entry, `<service DID>@<AIR server key>@<host>`, checking each part
+    /// the way `air.server` and `air.host` are checked.
+    pub fn parse(text: &str) -> Result<FspAir, String> {
+        let parts: Vec<&str> = text.trim().split('@').collect();
+        let [service, server, host] = parts.as_slice() else {
+            return Err(format!(
+                "`{}` is not an entry of the form <service DID>@<AIR server key>@<host>",
+                text.trim()
+            ));
+        };
+        let service = ServiceDid::parse(service.trim())
+            .map_err(|e| format!("`{}`: the service DID is not valid: {e}", text.trim()))?;
+        let server = server.trim();
+        sp_wire::seal::parse_public_key(server).map_err(|e| {
+            format!(
+                "`{}`: the AIR server name is not a public key (66 hex characters): {e}",
+                text.trim()
+            )
+        })?;
+        let host = host.trim();
+        if host.is_empty() {
+            return Err(format!("`{}`: the host is empty", text.trim()));
+        }
+        if let Some(why) = sp_wire::air_request::host_problem(host) {
+            return Err(format!("`{}`: the host {why}", text.trim()));
+        }
+        Ok(FspAir {
+            service,
+            server: server.to_string(),
+            host: host.to_string(),
+        })
+    }
+
+    /// The entry as it is written.
+    pub fn to_config_string(&self) -> String {
+        format!("{}@{}@{}", self.service.to_hex(), self.server, self.host)
     }
 }
 
@@ -250,6 +344,8 @@ pub struct AirSettings {
     pub server: String,
     /// The AIR server's host or IP, or empty.
     pub host: String,
+    /// Where each service's FSP mint is (`air.fsp`), one entry per service.
+    pub fsp: Vec<FspAir>,
     pub reply_wait_secs: u64,
     pub attempts: u32,
     pub max_skew_secs: u64,
@@ -263,6 +359,7 @@ impl Default for AirSettings {
             esp_did: None,
             server: String::new(),
             host: String::new(),
+            fsp: Vec::new(),
             reply_wait_secs: 30,
             attempts: 3,
             max_skew_secs: 300,
@@ -302,6 +399,18 @@ impl AirSettings {
                 .collect::<Vec<_>>()
                 .join(" and ")
         ))
+    }
+
+    /// The `air.fsp` entry of a service, or an error that names the setting and
+    /// says what to put in it.
+    pub fn fsp_for(&self, service: ServiceDid) -> Result<&FspAir, String> {
+        self.fsp.iter().find(|e| e.service == service).ok_or_else(|| {
+            format!(
+                "no air.fsp entry for the FSP mint of service {}. FSP mints are reached over AIR only, so the wallet needs the service's DID, the AIR server its mint listens on and where that is. Add `{}@<AIR server key>@<host>` to air.fsp (config.toml, [air] fsp = [\"...\"], or ECASH_AIR_FSP); `fsp-mint serve` prints the whole entry when it starts",
+                service.to_hex(),
+                service.to_hex()
+            )
+        })
     }
 
     /// The PSP's DID the requests are sealed to: `air.psp_did` if it is set, else
@@ -381,6 +490,13 @@ impl Settings {
             "air.esp_did" => self.air.esp_did.map(|d| d.to_hex()).unwrap_or_default(),
             "air.server" => self.air.server.clone(),
             "air.host" => self.air.host.clone(),
+            "air.fsp" => self
+                .air
+                .fsp
+                .iter()
+                .map(FspAir::to_config_string)
+                .collect::<Vec<_>>()
+                .join(","),
             "air.reply_wait_secs" => self.air.reply_wait_secs.to_string(),
             "air.attempts" => self.air.attempts.to_string(),
             "air.max_skew_secs" => self.air.max_skew_secs.to_string(),
@@ -430,6 +546,20 @@ impl Settings {
                     return Err(format!("{key} = `{value}` {why}"));
                 }
                 self.air.host = text.to_string();
+            }
+            "air.fsp" => {
+                let mut entries: Vec<FspAir> = Vec::new();
+                for item in value.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                    let entry = FspAir::parse(item).map_err(|e| format!("{key}: {e}"))?;
+                    if entries.iter().any(|e| e.service == entry.service) {
+                        return Err(format!(
+                            "{key} names the FSP mint of service {} twice: one entry for each service",
+                            entry.service.to_hex()
+                        ));
+                    }
+                    entries.push(entry);
+                }
+                self.air.fsp = entries;
             }
             "air.reply_wait_secs" => self.air.reply_wait_secs = number(key, value, 1, 600)?,
             "air.attempts" => self.air.attempts = number(key, value, 1, 10)? as u32,
@@ -565,7 +695,7 @@ fn parse_file(text: &str) -> Result<Vec<(String, String)>, Vec<String>> {
                         pairs.push((key, ids.join(",")));
                     } else {
                         problems.push(format!(
-                            "{key} must be a list of strings (service IDs), not {items:?}"
+                            "{key} must be a list of strings (service IDs, or air.fsp entries), not {items:?}"
                         ));
                     }
                 }
@@ -1104,5 +1234,126 @@ mod tests {
         assert!(l.settings.storage_wallet.is_local_only());
         assert!(l.settings.storage_app.is_local_only());
         fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// The `air.fsp` entry of service `A`, on AIR server `B`.
+    fn entry_a() -> String {
+        format!("{A}@{B}@127.0.0.1")
+    }
+
+    #[test]
+    fn air_fsp_entries_come_from_the_file_and_the_environment_with_their_sources() {
+        let d = dir("fsp-entries");
+        fs::write(
+            d.join(FILE_NAME),
+            format!(
+                "[air]\nfsp = [\"{}\", \"{B}@{A}@air.example.org\"]\n",
+                entry_a()
+            ),
+        )
+        .unwrap();
+        let l = load(&d, None, &no_env).unwrap();
+        let air = &l.settings.air;
+        assert_eq!(air.fsp.len(), 2);
+        assert_eq!(l.sources["air.fsp"], Source::File);
+        let one = air.fsp_for(ServiceDid::parse(A).unwrap()).unwrap();
+        assert_eq!((one.server.as_str(), one.host.as_str()), (B, "127.0.0.1"));
+        let two = air.fsp_for(ServiceDid::parse(B).unwrap()).unwrap();
+        assert_eq!(
+            (two.server.as_str(), two.host.as_str()),
+            (A, "air.example.org")
+        );
+        // A single string is one entry, and the environment replaces the file's list.
+        fs::write(
+            d.join(FILE_NAME),
+            format!("[air]\nfsp = \"{}\"\n", entry_a()),
+        )
+        .unwrap();
+        assert_eq!(load(&d, None, &no_env).unwrap().settings.air.fsp.len(), 1);
+        let other = format!("{B}@{A}@127.0.0.1");
+        let env = env_of(&[("ECASH_AIR_FSP", other.as_str())]);
+        let l = load(&d, None, &env).unwrap();
+        assert_eq!(l.settings.air.fsp.len(), 1);
+        assert_eq!(l.settings.air.fsp[0].service.to_hex(), B);
+        assert_eq!(l.sources["air.fsp"], Source::Env("ECASH_AIR_FSP"));
+        // Two entries in the environment, comma separated; the value reads back.
+        let both = format!("{}, {B}@{A}@127.0.0.1", entry_a());
+        let l = load(&d, None, &env_of(&[("ECASH_AIR_FSP", both.as_str())])).unwrap();
+        assert_eq!(
+            l.settings.get("air.fsp").unwrap(),
+            format!("{},{B}@{A}@127.0.0.1", entry_a())
+        );
+        // The FSP entries need neither air.server nor air.host.
+        assert!(!l.settings.air.is_configured());
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn air_fsp_is_checked_like_air_server_and_air_host_and_has_no_duplicates() {
+        let mut s = Settings::default();
+        for (bad, says) in [
+            (A.to_string(), "<service DID>@<AIR server key>@<host>"),
+            (format!("{A}@{B}"), "<service DID>@<AIR server key>@<host>"),
+            (
+                format!("{A}@{B}@h@x"),
+                "<service DID>@<AIR server key>@<host>",
+            ),
+            (format!("zz@{B}@127.0.0.1"), "service DID is not valid"),
+            (format!("{A}@zz@127.0.0.1"), "not a public key"),
+            (format!("{A}@{B}@"), "the host is empty"),
+            (format!("{A}@{B}@127.0.0.1:5702"), "the host"),
+            (format!("{A}@{B}@ws://127.0.0.1"), "the host"),
+        ] {
+            let e = s.set("air.fsp", &bad).unwrap_err();
+            assert!(e.contains("air.fsp") && e.contains(says), "{bad}: {e}");
+        }
+        assert!(s.air.fsp.is_empty(), "a bad value changes nothing");
+        // One entry for each service: the same service twice is refused, even on
+        // another server.
+        let twice = format!("{},{A}@{A}@10.0.0.9", entry_a());
+        let e = s.set("air.fsp", &twice).unwrap_err();
+        assert!(e.contains("twice") && e.contains(A), "{e}");
+        // Empty clears.
+        s.set("air.fsp", &entry_a()).unwrap();
+        assert_eq!(s.air.fsp.len(), 1);
+        s.set("air.fsp", "").unwrap();
+        assert!(s.air.fsp.is_empty());
+        // The load lists the problem with where it came from.
+        let d = dir("fsp-bad");
+        let p = load(&d, None, &env_of(&[("ECASH_AIR_FSP", "nonsense")])).unwrap_err();
+        assert!(
+            p.iter()
+                .any(|x| x.contains("ECASH_AIR_FSP") && x.contains("air.fsp")),
+            "{p:?}"
+        );
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn a_service_with_no_air_fsp_entry_is_refused_naming_the_setting() {
+        let mut air = AirSettings::default();
+        let service = ServiceDid::parse(A).unwrap();
+        // Even with the PSP's and the ESP's server set: that is not the FSP's.
+        air.server = B.to_string();
+        air.host = "127.0.0.1".into();
+        let e = air.fsp_for(service).unwrap_err();
+        assert!(
+            e.contains("air.fsp") && e.contains("ECASH_AIR_FSP") && e.contains(A),
+            "{e}"
+        );
+        let e = Party::Fsp(service).address(&air).unwrap_err();
+        assert!(e.contains("air.fsp"), "{e}");
+        // The PSP and the ESP still go through air.server and air.host.
+        let psp = Party::Psp.address(&air).unwrap();
+        assert_eq!(psp, (B.to_string(), "127.0.0.1".to_string()));
+        // With the entry, the FSP mint's address is the entry's, and its DID the service's.
+        air.fsp
+            .push(FspAir::parse(&format!("{A}@{A}@10.0.0.9")).unwrap());
+        assert_eq!(
+            Party::Fsp(service).address(&air).unwrap(),
+            (A.to_string(), "10.0.0.9".to_string())
+        );
+        assert_eq!(Party::Fsp(service).did(&air), service);
+        assert_eq!(Party::Fsp(service).setting(), "air.fsp");
     }
 }

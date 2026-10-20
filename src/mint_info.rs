@@ -1,5 +1,5 @@
-//! The wallet's calls to the PSP and the ESP. They are made over AIR and only
-//! over AIR: there is no HTTP form of any of them. This is the one place that
+//! The wallet's calls to the PSP, the ESP and the FSP mints. They are made over
+//! AIR and only over AIR: there is no HTTP form of any of them. This is the one place that
 //! says which call goes to which mint, so the library's callers (the command
 //! line, an app, the tests) all get the same rule.
 //!
@@ -16,25 +16,34 @@
 //! that spend: [`send_exchange`], [`send_transfer`] and [`send_redeem`]. The ESP
 //! has no keys call (its keys arrive in the replies).
 //!
-//! **They need `air.server` and `air.host`** ([`AirSettings::require`]; the DIDs
-//! are `air.psp_did` and `air.esp_did`, or the built-in ones, PLACEHOLDERS until
-//! the first SPI deploy). A call made without them fails with an error that
-//! names the missing setting. The PSP and the ESP share the AIR server and have
-//! their own DIDs. What is left on HTTP is the FSP mints' calls ([`crate::http`],
-//! feature `http`). Nothing is cached here: every call asks again.
+//! **An FSP mint's** are its mint info ([`verify_fsp`]), keys ([`fsp_keys`]),
+//! rotation ([`fsp_rotation`], [`fsp_window`]), fees ([`fsp_fees`]) and its two
+//! POSTs, issue and spend ([`send_fsp_issue`], [`send_fsp_spend`]), and the calls
+//! built on them: [`settle_fsp`] and [`fsp_sync`]. An FSP mint is a service's own:
+//! its DID is the service's, and the AIR server it is reached through is the
+//! service's `air.fsp` entry.
+//!
+//! **The PSP's and the ESP's need `air.server` and `air.host`**
+//! ([`AirSettings::require`]; the DIDs are `air.psp_did` and `air.esp_did`, or the
+//! built-in ones, PLACEHOLDERS until the first SPI deploy). **An FSP mint's need
+//! the `air.fsp` entry of its service** ([`AirSettings::fsp_for`]). A call made
+//! without them fails with an error that names the missing setting. The PSP and
+//! the ESP share the AIR server and have their own DIDs. The wallet makes no HTTP
+//! call. Nothing is cached here: every call asks again.
 //!
 //! **`base` names a mint in the wallet's records** (its live keysets, its swap
 //! times, the mint a handoff names); it is never dialled. The PSP and the ESP are
 //! each one mint, found by their DID, so a record of either is found by its
-//! kind.
+//! kind. An FSP mint's record is the service's DID in hex.
 
 use std::collections::BTreeMap;
 
 use mint_types::Amount;
 use secp256k1::PublicKey;
+use sp_wire::ServiceDid;
 use sp_wire::air_request::{
-    KIND_CHECK_STATE, KIND_EXCHANGE, KIND_FEES, KIND_KEYS, KIND_KEYSETS, KIND_REDEEM,
-    KIND_ROLLOVER, KIND_ROTATION, KIND_TRANSFER,
+    KIND_CHECK_STATE, KIND_EXCHANGE, KIND_FEES, KIND_FSP_ISSUE, KIND_FSP_SPEND, KIND_KEYS,
+    KIND_KEYSETS, KIND_REDEEM, KIND_ROLLOVER, KIND_ROTATION, KIND_TRANSFER,
 };
 use sp_wire::esp::exchange::{ExchangeRequest, ExchangeResponse};
 use sp_wire::esp::redeem::RedeemResponse;
@@ -275,6 +284,218 @@ pub fn send_redeem(
     )
 }
 
+// ---------------------------------------------------------------- an FSP mint
+
+/// Check a service's FSP mint's wire version and network before anything else is
+/// sent to it, over AIR (to the service's DID, through its `air.fsp` entry).
+/// `expected_network` is `main`, `regtest`, `signet` or `testnet`.
+pub fn verify_fsp(
+    wallet: &mut Wallet,
+    air: &AirSettings,
+    service: ServiceDid,
+    expected_network: &str,
+) -> Result<(), WalletError> {
+    crate::air::verify_mint(wallet, air, Party::Fsp(service), expected_network)
+}
+
+/// A service's FSP mint's keysets: a signed reply over AIR.
+pub fn fsp_keys(
+    wallet: &mut Wallet,
+    air: &AirSettings,
+    service: ServiceDid,
+) -> Result<sp_wire::fsp::KeysResponse, WalletError> {
+    crate::air::fetch(wallet, air, Party::Fsp(service), KIND_KEYS)
+}
+
+/// A service's FSP mint's rotation schedule: a signed reply over AIR.
+pub fn fsp_rotation(
+    wallet: &mut Wallet,
+    air: &AirSettings,
+    service: ServiceDid,
+) -> Result<sp_wire::fsp::RotationResponse, WalletError> {
+    crate::air::fetch(wallet, air, Party::Fsp(service), KIND_ROTATION)
+}
+
+/// [`fsp_rotation`], as the FSP sync needs it.
+pub fn fsp_window(
+    wallet: &mut Wallet,
+    air: &AirSettings,
+    service: ServiceDid,
+) -> Result<Window, WalletError> {
+    fsp_rotation(wallet, air, service).map(Into::into)
+}
+
+/// A service's FSP mint's fees and limits: a signed reply over AIR.
+pub fn fsp_fees(
+    wallet: &mut Wallet,
+    air: &AirSettings,
+    service: ServiceDid,
+) -> Result<sp_wire::fsp::FeesResponse, WalletError> {
+    crate::air::fetch(wallet, air, Party::Fsp(service), KIND_FEES)
+}
+
+/// A POST to an FSP mint over AIR: `request` as JSON, the answer read as `R`. A
+/// signed `400` is the wallet's error for a refusal of the request
+/// ([`crate::error::mint_refusal`]: `Refused`, or `SpentElsewhere` with the notes);
+/// every other refusal and a signed "cannot answer now" (the mint's `5xx`, its ESP
+/// mint not answering included) is a plain [`WalletError::Mint`], so a pending
+/// request stays pending and the retry gets the mint's stored answer.
+fn fsp_post<Q: serde::Serialize, R: serde::de::DeserializeOwned>(
+    wallet: &mut Wallet,
+    air: &AirSettings,
+    service: ServiceDid,
+    kind: u8,
+    request: &Q,
+) -> Result<R, WalletError> {
+    let body = serde_json::to_vec(request)
+        .map_err(|e| WalletError::Mint(format!("the FSP request could not be encoded: {e}")))?;
+    let value = crate::air::post(wallet, air, Party::Fsp(service), kind, &body)?;
+    serde_json::from_value(value).map_err(|e| {
+        WalletError::Mint(format!(
+            "the FSP mint of service {} signed a reply that is not what was asked for: {e}",
+            service.to_hex()
+        ))
+    })
+}
+
+/// An issue: ESP in, FSP out, at a service's FSP mint over AIR.
+pub fn send_fsp_issue(
+    wallet: &mut Wallet,
+    air: &AirSettings,
+    service: ServiceDid,
+    request: &sp_wire::fsp::IssueRequest,
+) -> Result<sp_wire::fsp::IssueResponse, WalletError> {
+    fsp_post(wallet, air, service, KIND_FSP_ISSUE, request)
+}
+
+/// A spend (a swap with change) at a service's FSP mint over AIR.
+pub fn send_fsp_spend(
+    wallet: &mut Wallet,
+    air: &AirSettings,
+    service: ServiceDid,
+    request: &sp_wire::fsp::SpendRequest,
+) -> Result<sp_wire::fsp::SpendResponse, WalletError> {
+    fsp_post(wallet, air, service, KIND_FSP_SPEND, request)
+}
+
+/// Send one pending FSP request (again) and settle it. A `400` cancels it
+/// (nothing happened at the mint); anything else leaves it pending.
+pub fn settle_fsp(wallet: &mut Wallet, air: &AirSettings, id: &str) -> Result<String, WalletError> {
+    let p = wallet
+        .pending_fsp()
+        .iter()
+        .find(|p| p.id == id)
+        .cloned()
+        .ok_or_else(|| WalletError::Unknown(format!("no pending FSP request {id}")))?;
+    let sent = match &p.op {
+        crate::fsp::FspOp::Issue { request, .. } => send_fsp_issue(wallet, air, p.service, request)
+            .and_then(|r| {
+                let o = wallet.finish_fsp_issue(id, &r)?;
+                let mut text = format!("issued {} FSP (fee {})", o.fsp, o.fee);
+                for r in &o.refused {
+                    text.push_str(&format!("; not issued, ESP freed: {r}"));
+                }
+                Ok(text)
+            }),
+        crate::fsp::FspOp::Spend { request, .. } => {
+            let rollover = request.pay == 0;
+            send_fsp_spend(wallet, air, p.service, request).and_then(|r| {
+                let paid = wallet.finish_fsp_spend(id, &r)?;
+                Ok(if rollover {
+                    "rolled over to the current keyset".to_string()
+                } else {
+                    format!("paid {paid} FSP")
+                })
+            })
+        }
+    };
+    if let Err(WalletError::Refused(_)) = &sent {
+        wallet.cancel_fsp(id)?;
+    }
+    sent
+}
+
+/// What happened when the wallet checked an FSP mint.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct FspSync {
+    /// Lines for the log: requests finished, rollovers, failures.
+    pub log: Vec<String>,
+    /// FSP units lost because their keyset was deleted.
+    pub lost: u128,
+}
+
+/// Run every time the wallet talks to a service's FSP mint, and at startup:
+/// finish the requests left pending (a crash or a lost reply), read the keys,
+/// record FSP on deleted keysets as lost, and swap FSP on the previous keyset
+/// to the current one. Nothing here asks the user. A failure is logged and
+/// left pending, so the next connection tries again. The mint is the service's
+/// (its DID, at its `air.fsp` entry).
+pub fn fsp_sync(
+    wallet: &mut Wallet,
+    air: &AirSettings,
+    service: ServiceDid,
+) -> Result<FspSync, WalletError> {
+    let mut out = FspSync::default();
+    let keys = fsp_keys(wallet, air, service)?;
+    out.lost = wallet.note_fsp_keys(service, &keys)?;
+    if out.lost > 0 {
+        out.log.push(format!(
+            "{} FSP units were on a keyset the mint has deleted and are lost",
+            out.lost
+        ));
+    }
+    let ids: Vec<String> = wallet
+        .pending_fsp()
+        .iter()
+        .filter(|p| p.service == service)
+        .map(|p| p.id.clone())
+        .collect();
+    for id in ids {
+        match settle_fsp(wallet, air, &id) {
+            Ok(text) => out.log.push(format!("pending {id}: {text}")),
+            Err(e) => out.log.push(format!(
+                "pending {id} not finished, retried on the next connection: {e}"
+            )),
+        }
+    }
+    // Staggered: one random swap time per rotation, kept in the wallet file
+    // until the swap is done (see `rotate.rs`). Never logged. The mint's record
+    // is the service's DID.
+    let record = crate::fsp::record_of(service);
+    if let Ok(w) = fsp_window(wallet, air, service) {
+        let has_old = w.previous_epoch.is_some()
+            && wallet
+                .fsp_mints()
+                .get(&record)
+                .and_then(|m| m.previous.clone())
+                .is_some_and(|prev| {
+                    wallet.notes().iter().any(|n| {
+                        n.kind == crate::Kind::Fsp
+                            && n.reserved_by.is_none()
+                            && wallet.fsp_keyset(n) == Some(&prev)
+                    })
+                });
+        wallet.drop_fsp_schedule(&record, &w.current_id, has_old)?;
+        if has_old && w.now < wallet.swap_time(crate::Kind::Fsp, &record, &w)? {
+            out.log.push(
+                "FSP will be rolled over to the current keyset, staggered after the rotation"
+                    .into(),
+            );
+            return Ok(out);
+        }
+    }
+    if let Some(request) = wallet.build_fsp_rollover(service)? {
+        let id = request.hash();
+        match settle_fsp(wallet, air, &id) {
+            Ok(text) => out.log.push(format!("rollover {id}: {text}")),
+            Err(e) => out.log.push(format!(
+                "rollover {id} failed, retried on the next connection: {e}"
+            )),
+        }
+    }
+    Ok(out)
+}
+
 // ---------------------------------------------------------------- rollover and handoffs
 
 /// Send one stored rollover and settle it. A refusal that burned nothing
@@ -420,7 +641,7 @@ fn send_rollover(wallet: &mut Wallet, id: &str, post: Post<'_>) -> Result<String
 /// The window is read, and the rollovers are sent, over AIR to the DID of the
 /// mint `kind` names. `base` names the mint in the wallet's records (its live
 /// keysets, its swap times); it is not dialled. The FSP's notes are not rolled
-/// over here but by [`crate::http::fsp_sync`].
+/// over here but by [`fsp_sync`].
 pub fn rotation_sync(
     wallet: &mut Wallet,
     air: &AirSettings,

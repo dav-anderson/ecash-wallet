@@ -1,12 +1,13 @@
 //! The AIR plumbing the wallet's integration tests share: a real `air_server` in
-//! this process (`sp_wire::air_request::local_server`), psp-mint's and esp-mint's
-//! own AIR listeners on it, and the `AirSettings` (or fsp-mint `air.*` settings)
-//! that point a wallet (or fsp-mint) at them.
+//! this process (`sp_wire::air_request::local_server`), psp-mint's, esp-mint's
+//! and fsp-mint's own AIR listeners on it, and the `AirSettings` (or fsp-mint
+//! `air.*` settings) that point a wallet (or fsp-mint) at them.
 //!
-//! The PSP and the ESP are reached over AIR only, so a test that used to serve a
-//! mint's HTTP routes runs its AIR listener instead (`air_flow.rs` and
-//! `esp_air_flow.rs` carry their own copies of this, with the finer controls
-//! those tests need).
+//! The PSP, the ESP and the FSP mints are reached over AIR only, so a test that
+//! used to serve a mint's HTTP routes runs its AIR listener instead (`air_flow.rs`
+//! and `esp_air_flow.rs` carry their own copies of this, with the finer controls
+//! those tests need). fsp-mint's listener answers on the same shared server as the
+//! ESP mint's, as a service's own mint does: the DIDs differ, so the mailboxes do.
 //!
 //! The AIR client always dials port 5702 (upstream item 12), so these tests need
 //! that port free; `local_server::start` says so when it is not. One server
@@ -19,16 +20,19 @@
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
-use ecash_wallet::config::AirSettings;
+use ecash_wallet::config::{AirSettings, FspAir};
 use esp_mint::server::EspState;
+use fsp_mint::server::FspState;
 use mint_server::state::AppState;
+use rand::rngs::OsRng;
+use secp256k1::{Keypair, SECP256K1, SecretKey};
 use sp_wire::ServiceDid;
-use sp_wire::air_request::addr;
 use sp_wire::air_request::client::ServerRef;
-use sp_wire::air_request::local_server;
+use sp_wire::air_request::{KIND_FSP_SPEND, Served, addr, local_server};
 use sp_wire::seal::SecretKey as DidKey;
 
 /// One test at a time on the shared AIR server.
@@ -176,10 +180,13 @@ impl EspAt {
         }
     }
 
-    /// The `air.*` settings that point fsp-mint at this ESP mint.
+    /// The `air.*` settings that point fsp-mint at this ESP mint (`air.esp_*`),
+    /// and its own listener at the same AIR server (`air.server`, `air.host`).
     pub fn fsp_settings(&self, wait_secs: &str, attempts: &str) -> Vec<(&'static str, String)> {
         vec![
             ("air.esp_did", self.did.to_hex()),
+            ("air.esp_server", self.server.name.clone()),
+            ("air.esp_host", self.server.host.clone()),
             ("air.server", self.server.name.clone()),
             ("air.host", self.server.host.clone()),
             ("air.reply_wait_secs", wait_secs.to_string()),
@@ -270,6 +277,113 @@ impl PspAt {
             psp_did: Some(self.did),
             server: self.server.name.clone(),
             host: self.server.host.clone(),
+            reply_wait_secs: wait_secs,
+            attempts,
+            ..AirSettings::default()
+        }
+    }
+}
+
+// ---------------------------------------------------------------- the FSP
+
+thread_local! {
+    /// This test's service key. A test runs on a thread of its own, and a
+    /// service's mailboxes on the shared AIR server are its DID's, so a key shared
+    /// by tests would have each one's fsp-mint listener read the earlier tests'
+    /// requests.
+    static SERVICE_SECRET: [u8; 32] = SecretKey::new(&mut OsRng).secret_bytes();
+}
+
+/// The key pair of this test's service: the DID of its FSP mint, and what the
+/// FSP mint's notes are issued under.
+pub fn service_keypair() -> Keypair {
+    let b = SERVICE_SECRET.with(|b| *b);
+    Keypair::from_secret_key(SECP256K1, &SecretKey::from_slice(&b).unwrap())
+}
+
+/// This test's service.
+pub fn service() -> ServiceDid {
+    ServiceDid::from(service_keypair().public_key())
+}
+
+/// The same key as the AIR key fsp-mint's listener answers under, made from the
+/// hex of `service_key.hex` as `fsp-mint serve` makes it.
+pub fn service_air_key() -> DidKey {
+    let b = SERVICE_SECRET.with(|b| *b);
+    addr::secret_from_hex(&hex::encode(b)).unwrap()
+}
+
+/// A service's fsp-mint as its callers reach it: its DID (the service's) and its
+/// own AIR listener on the shared server, answering through `air_served`, the
+/// `serve` fsp-mint runs. Dropping it stops the listener, so it must drop before
+/// the [`EspAt`] that holds the turn on the server.
+pub struct FspAt {
+    _listener: Listener,
+    pub did: ServiceDid,
+    pub state: Arc<FspState>,
+    server: ServerRef,
+    fail_spend: Arc<AtomicBool>,
+}
+
+impl FspAt {
+    /// Start the listener for `state` on `server` (the turn on it is held by the
+    /// caller). `data` is a folder of the test's own (the listener's state goes in
+    /// it).
+    pub fn new(server: &ServerRef, state: Arc<FspState>, data: &Path) -> FspAt {
+        std::fs::create_dir_all(data).unwrap();
+        let key = service_air_key();
+        let did = addr::key_to_did(&key.public_key());
+        assert!(did == service(), "the AIR key is the service's DID key");
+        let fail_spend = Arc::new(AtomicBool::new(false));
+        let settings = fsp_mint::air_listener::Settings {
+            server: server.clone(),
+            held_reads: 16,
+            timeout_secs: 10,
+            state_dir: data.to_path_buf(),
+        };
+        let (answering, failing) = (Arc::clone(&state), Arc::clone(&fail_spend));
+        let listener = spawn(move |stopped| {
+            let serve: Arc<fsp_mint::air_listener::Serve> =
+                Arc::new(move |kind: u8, body: &[u8]| {
+                    // A mint that cannot answer a spend now: a signed "cannot
+                    // answer now", and nothing is spent.
+                    if kind == KIND_FSP_SPEND && failing.load(Ordering::SeqCst) {
+                        return Some(Served::Unavailable);
+                    }
+                    fsp_mint::server::air_served(&answering, kind, body)
+                });
+            runtime().block_on(fsp_mint::air_listener::run(
+                &settings,
+                &key,
+                &serve,
+                async move {
+                    let _ = stopped.await;
+                },
+            ))
+        });
+        FspAt {
+            _listener: listener,
+            did,
+            state,
+            server: server.clone(),
+            fail_spend,
+        }
+    }
+
+    /// Make the mint unable to answer spends (`true`) or able again (`false`).
+    pub fn fail_spend(&self, on: bool) {
+        self.fail_spend.store(on, Ordering::SeqCst);
+    }
+
+    /// The wallet's `[air]` settings pointing at this FSP mint: the one `air.fsp`
+    /// entry of its service. Neither the PSP's nor the ESP's.
+    pub fn air(&self, wait_secs: u64, attempts: u32) -> AirSettings {
+        AirSettings {
+            fsp: vec![FspAir {
+                service: self.did,
+                server: self.server.name.clone(),
+                host: self.server.host.clone(),
+            }],
             reply_wait_secs: wait_secs,
             attempts,
             ..AirSettings::default()

@@ -12,7 +12,7 @@ use ecash_wallet::psp::parse_signatures;
 use ecash_wallet::redeem::{EntryOutcome, RedeemOutcome, RedemptionState};
 use ecash_wallet::store::{Handover, parse_did};
 use ecash_wallet::transfer::TransferBuild;
-use ecash_wallet::{Wallet, WalletError, http};
+use ecash_wallet::{Wallet, WalletError};
 use secp256k1::SecretKey;
 use sp_wire::ServiceDid;
 use sp_wire::seal::SecretKey as DidSecretKey;
@@ -31,8 +31,9 @@ ecash-wallet [--wallet FILE] [--config FILE] [--regtest|--signet|--testnet] <com
   The network defaults to mainnet (--mainnet may be given; at most one network
   flag). Before talking to a mint the wallet asks it which network it is on
   and refuses if it is another. The PSP and the ESP are asked over AIR, so
-  every command that talks to either needs air.server and air.host (see the
-  end of this text).
+  every command that talks to either needs air.server and air.host, and the
+  FSP mints too are asked over AIR, so every fsp command needs the air.fsp
+  entry of its service (see the end of this text).
 
   buy-psp --mint-key HEX [--reply-did HEX] [--sync] AMOUNT...
       Make the encrypted payload for a PSP purchase and print it as hex, for
@@ -137,16 +138,16 @@ ecash-wallet [--wallet FILE] [--config FILE] [--regtest|--signet|--testnet] <com
       from config.toml beside the wallet file (or --config FILE, or
       $ECASH_CONFIG) and $ECASH_STORAGE_WALLET and $ECASH_STORAGE_APP.
       Nothing reads or writes the AIR yet.
-  fsp issue --service DID [--esp UNITS | --psp N] [--fsp-url URL]
+  fsp issue --service DID [--esp UNITS | --psp N]
       Hand ESP for a service to its FSP mint for FSP, 1:1 less its issue fee.
       All of the service's ESP by default, any day, mature or not.
-  fsp pay --service DID --units N [--memo TEXT] [--fsp-url URL]
+  fsp pay --service DID --units N [--memo TEXT]
       Pay N FSP units to the service, with change.
-  fsp sync --service DID [--fsp-url URL]
+  fsp sync --service DID
       What runs on its own: finish pending FSP requests, read the mint's keys,
       and swap FSP on the previous keyset to the current one.
-  fsp-window --service DID [--fsp-url URL]
-      The FSP mint's rotation schedule (GET /rotation): current and previous
+  fsp-window --service DID
+      The FSP mint's rotation schedule (its rotation call): current and previous
       keysets with their start and retire times, and the next rotation.
   esp-schedule [--by YYYY-MM-DD]
       When this wallet's ESP is redeemable: now, by DATE, and by month.
@@ -175,8 +176,11 @@ without them a command that talks to the PSP or the ESP fails, saying which
 setting is missing. The PSP and the ESP each have their own DID, built in
 (PLACEHOLDERS until the first SPI deploy, and the wallet says so whenever one is
 in use); air.psp_did (ECASH_AIR_PSP_DID) and air.esp_did (ECASH_AIR_ESP_DID)
-override them. The FSP's calls are HTTP, to the FSP mint (--fsp-url, else the one
-used before, else $ECASH_FSP_URL). `config` prints every setting.";
+override them. The FSP mints are reached over AIR too: a service's mint is the
+service's DID, on the AIR server of its air.fsp entry (ECASH_AIR_FSP), written
+<service DID>@<AIR server key>@<host>, one entry for each service (`fsp-mint
+serve` prints its entry). An fsp command for a service with no entry is refused,
+naming air.fsp. No call the wallet makes is HTTP. `config` prints every setting.";
 
 /// The arguments left after flags are taken out.
 struct Args(Vec<String>);
@@ -271,11 +275,6 @@ fn migrate_wallet() -> Result<(), WalletError> {
     Ok(())
 }
 
-fn url(flag: Option<String>, var: &str, default: &str) -> String {
-    flag.or_else(|| env::var(var).ok())
-        .unwrap_or_else(|| default.to_string())
-}
-
 /// The network this run is on: `--regtest`, `--signet` or `--testnet`, else
 /// mainnet. Set once in `run`.
 static NETWORK: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
@@ -333,6 +332,9 @@ fn verify_mint_of(wallet: &mut Wallet, party: config::Party) -> Result<(), Walle
     let result = match party {
         config::Party::Psp => ecash_wallet::mint_info::verify_psp(wallet, &air, network()),
         config::Party::Esp => ecash_wallet::mint_info::verify_esp(wallet, &air, network()),
+        config::Party::Fsp(service) => {
+            ecash_wallet::mint_info::verify_fsp(wallet, &air, service, network())
+        }
     };
     checked.push((
         party,
@@ -353,15 +355,6 @@ fn psp_base(wallet: &mut Wallet) -> Result<&'static str, WalletError> {
 fn esp_base(wallet: &mut Wallet) -> Result<&'static str, WalletError> {
     verify_mint_of(wallet, config::Party::Esp)?;
     Ok(ESP_RECORD)
-}
-
-/// An FSP mint's URL, after checking (`GET /health`) that the mint is on this
-/// run's network. Nothing is sent to a mint on another network. (The PSP and the
-/// ESP are checked over AIR: see `psp_base`, `esp_base`.)
-fn mint_url(flag: Option<String>, var: &str, default: &str) -> Result<String, WalletError> {
-    let base = url(flag, var, default);
-    http::verify_mint(&base, network())?;
-    Ok(base)
 }
 
 fn buy_psp(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
@@ -1419,12 +1412,8 @@ fn handoff_import(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError
     // Read the FSP mints' keys: this checks the notes against live key sets,
     // moves those on a retired set to the lost record, and fills in what was
     // unknown.
-    for (service, url) in &got.fsp_mints {
-        let known = wallet
-            .fsp_mints()
-            .get(&hex::encode(service.serialize()))
-            .map(|m| m.url.clone());
-        sync_and_log(wallet, *service, &known.unwrap_or_else(|| url.clone()));
+    for service in &got.fsp_mints {
+        sync_and_log(wallet, *service);
     }
     // A PSP handoff is swapped now. If the mint cannot be reached the swap
     // stays stored and the notes stay unswapped (in the balance, spendable), and
@@ -1454,27 +1443,11 @@ fn merge_command(wallet: &mut Wallet, args: Args) -> Result<(), WalletError> {
     Ok(())
 }
 
-const DEFAULT_FSP_URL: &str = "http://127.0.0.1:3200";
-
 fn today() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() / 86_400)
         .unwrap_or(0)
-}
-
-/// The FSP mint for a service: the flag, else the one used before, else
-/// `$ECASH_FSP_URL`, else the default. Checked for the network first.
-fn fsp_url(
-    wallet: &Wallet,
-    service: &ServiceDid,
-    flag: Option<String>,
-) -> Result<String, WalletError> {
-    let known = wallet
-        .fsp_mints()
-        .get(&hex::encode(service.serialize()))
-        .map(|m| m.url.clone());
-    mint_url(flag.or(known), "ECASH_FSP_URL", DEFAULT_FSP_URL)
 }
 
 /// Check every FSP mint this wallet has used. Nothing is asked; problems are
@@ -1514,29 +1487,29 @@ fn startup_rotation_sync(wallet: &mut Wallet) {
 }
 
 fn startup_fsp_sync(wallet: &mut Wallet) {
-    let mints: Vec<(String, String)> = wallet
-        .fsp_mints()
-        .iter()
-        .map(|(s, m)| (s.clone(), m.url.clone()))
-        .collect();
-    for (service, url) in mints {
+    let services: Vec<String> = wallet.fsp_mints().keys().cloned().collect();
+    for service in services {
         let Ok(key) = service_did(&service) else {
             continue;
         };
-        sync_and_log(wallet, key, &url);
+        sync_and_log(wallet, key);
     }
 }
 
-fn sync_and_log(wallet: &mut Wallet, service: ServiceDid, url: &str) {
-    let result =
-        http::verify_mint(url, network()).and_then(|_| http::fsp_sync(wallet, service, url));
+/// Check a service's FSP mint (its network and wire version first, over AIR) and
+/// run the FSP sync, logging what it did. A failure, a service with no `air.fsp`
+/// entry included, is logged and tried again next time.
+fn sync_and_log(wallet: &mut Wallet, service: ServiceDid) {
+    let air = air_settings();
+    let result = verify_mint_of(wallet, config::Party::Fsp(service))
+        .and_then(|_| ecash_wallet::mint_info::fsp_sync(wallet, &air, service));
     match result {
         Ok(sync) => {
             for line in sync.log {
-                eprintln!("fsp {url}: {line}");
+                eprintln!("fsp {service}: {line}");
             }
         }
-        Err(e) => eprintln!("fsp {url}: not checked, tried again next time: {e}"),
+        Err(e) => eprintln!("fsp {service}: not checked, tried again next time: {e}"),
     }
 }
 
@@ -1561,12 +1534,15 @@ fn fsp(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
     }
     let what = args.0.remove(0);
     let service = fsp_service(&mut args)?;
-    let flag = args.flag("--fsp-url")?;
-    let base = fsp_url(wallet, &service, flag)?;
+    // The service's mint is reached through its air.fsp entry: without one the
+    // command is refused here, naming the setting, before anything is sent.
+    let air = air_settings();
+    air.fsp_for(service).map_err(WalletError::Invalid)?;
+    verify_mint_of(wallet, config::Party::Fsp(service))?;
     // Every connection: pending requests, keys, rollover.
-    let sync = http::fsp_sync(wallet, service, &base)?;
+    let sync = ecash_wallet::mint_info::fsp_sync(wallet, &air, service)?;
     for line in sync.log {
-        eprintln!("fsp {base}: {line}");
+        eprintln!("fsp {service}: {line}");
     }
     match what.as_str() {
         "sync" => {
@@ -1581,7 +1557,7 @@ fn fsp(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
                 _ => return Err(WalletError::Invalid("give --esp or --psp, not both".into())),
             };
             args.done()?;
-            let fees = http::fetch_fsp_fees(&base)?;
+            let fees = ecash_wallet::mint_info::fsp_fees(wallet, &air, service)?;
             // Notes from before keysets were recorded name the ESP mint's
             // live set; best effort, the Issuer refuses a missing one.
             if let Ok(esp) = esp_base(wallet) {
@@ -1594,7 +1570,10 @@ fn fsp(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
             let request = wallet.build_fsp_issue(service, units, fees.issue_fee_per_byte)?;
             let id = request.hash();
             println!("issue {id}: {} group(s)", request.groups.len());
-            println!("{}", http::settle_fsp(wallet, &base, &id)?);
+            println!(
+                "{}",
+                ecash_wallet::mint_info::settle_fsp(wallet, &air, &id)?
+            );
             Ok(())
         }
         "pay" => {
@@ -1609,7 +1588,10 @@ fn fsp(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
             let request = wallet.build_fsp_spend(service, units, &memo)?;
             let id = request.hash();
             println!("spend {id}");
-            println!("{}", http::settle_fsp(wallet, &base, &id)?);
+            println!(
+                "{}",
+                ecash_wallet::mint_info::settle_fsp(wallet, &air, &id)?
+            );
             Ok(())
         }
         other => Err(WalletError::Invalid(format!(
@@ -1624,11 +1606,11 @@ fn fsp_window(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
             .flag("--service")?
             .ok_or_else(|| WalletError::Invalid("--service DID is needed".into()))?,
     )?;
-    let flag = args.flag("--fsp-url")?;
     args.done()?;
-    let base = fsp_url(wallet, &service, flag)?;
-    sync_and_log(wallet, service, &base);
-    let w = http::fetch_fsp_rotation(&base)?;
+    let air = air_settings();
+    air.fsp_for(service).map_err(WalletError::Invalid)?;
+    sync_and_log(wallet, service);
+    let w = ecash_wallet::mint_info::fsp_rotation(wallet, &air, service)?;
     let when = |t: Option<u64>| match t {
         Some(t) => format!("{} (day {})", t, t / 86_400),
         None => "not set yet".into(),
@@ -1718,7 +1700,11 @@ fn config_command(loaded: &config::Loaded, args: Args) -> Result<(), WalletError
     println!("Storage settings only: nothing reads or writes the AIR for storage yet.");
     let air = &loaded.settings.air;
     println!(
-        "PSP and ESP calls (mint info, keys, keysets, rotation, fees, rollover, check-state, exchange, transfer, redeem): over AIR only; the FSP's calls are HTTP"
+        "PSP and ESP calls (mint info, keys, keysets, rotation, fees, rollover, check-state, exchange, transfer, redeem): over AIR only, through air.server and air.host"
+    );
+    println!(
+        "FSP mint calls (mint info, keys, rotation, fees, issue, spend): over AIR only, through the air.fsp entry of the service ({} entries)",
+        air.fsp.len()
     );
     if let Err(why) = air.require() {
         println!("WARNING: {why}");

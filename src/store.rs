@@ -247,7 +247,9 @@ pub struct WalletData {
     #[serde(default)]
     pub esp_live_keysets: BTreeMap<String, (String, Option<String>)>,
     /// The time each pending rollover may be sent, by
-    /// `<kind>|<mint url>|<new keyset id>`. Removed in the same write that
+    /// `<kind>|<mint record>|<new keyset id>` (the record is the PSP's or the ESP's
+    /// name in the wallet's records, or the service's DID in hex for an FSP mint).
+    /// Removed in the same write that
     /// records the rolled-over notes, and when the old set retires. No
     /// history is kept.
     #[serde(default)]

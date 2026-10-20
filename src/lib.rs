@@ -31,11 +31,11 @@
 //!   the local one.
 //! - [`rotate`]: the automatic, staggered rollover of PSP and ESP (and the
 //!   swap schedule FSP shares) when a mint rotates its keys.
-//! - [`http`] (feature `http`): the calls to the FSP mints, the only HTTP the
-//!   wallet makes.
-//! - [`mint_info`]: the PSP's and the ESP's calls (mint info, keys, keysets,
-//!   rotation, fees, rollover, check-state, exchange, transfer and redeem), made
-//!   over AIR and only over AIR, and the rollover and handoff steps built on them.
+//! - [`mint_info`]: the PSP's, the ESP's and the FSP mints' calls (mint info,
+//!   keys, keysets, rotation, fees, rollover, check-state, exchange, transfer,
+//!   redeem, FSP issue and FSP spend), made over AIR and only over AIR (the
+//!   wallet makes no HTTP call), and the rollover, handoff and FSP sync steps
+//!   built on them.
 //! - [`air`]: the AIR request and reply under those calls.
 //! - [`esp_replies`]: how the ESP's fees reply and its refusals are read.
 
@@ -48,8 +48,6 @@ pub mod esp;
 pub mod esp_replies;
 pub mod fsp;
 pub mod handoff;
-#[cfg(feature = "http")]
-pub mod http;
 pub mod legacy;
 pub mod merge;
 pub mod mint_info;

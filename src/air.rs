@@ -1,13 +1,15 @@
-//! The PSP's and the ESP's calls over AIR: the wallet's side of the calls
-//! between a wallet and the SPI's mints. They are the only way the wallet
-//! reaches the PSP and the ESP.
+//! The PSP's, the ESP's and the FSP mints' calls over AIR: the wallet's side of
+//! the calls between a wallet and the mints. They are the only way the wallet
+//! reaches any mint.
 //!
 //! The PSP's calls are **mint info** (what the mint's health report says,
 //! `wire_version` and `network`, which `verify_mint` reads before anything else
 //! is sent to a mint), **keys**, **keysets** and **rotation** and **rollover**
 //! and **check-state**. The ESP's are mint info, **keysets**, **rotation**,
 //! **fees**, **rollover**, **exchange**, **transfer** and **redeem**; the ESP has
-//! no keys call (the keys arrive in the replies). The reply bodies are JSON
+//! no keys call (the keys arrive in the replies). An **FSP mint's** are mint info,
+//! **keys**, **rotation**, **fees** and its two POSTs, **FSP issue** and **FSP
+//! spend**. The reply bodies are JSON
 //! (for a redemption, the request body is the binary encoding). Over AIR the
 //! wallet writes one sealed request into a mailbox of the mint's DID on a configured
 //! AIR server and waits for the mint's signed reply in a cell only it and the
@@ -18,7 +20,9 @@
 //! - **A kind names a call, not a mint.** The same kind goes to the PSP's DID or
 //!   the ESP's, and each answers in its own shape. [`Party`] says which mint a
 //!   call is for: its DID (`air.psp_did` or `air.esp_did`, else the built-in
-//!   PLACEHOLDER), and the words of its messages.
+//!   PLACEHOLDER; an FSP mint's is its service's), the AIR server it is reached
+//!   through (`air.server` and `air.host`, or the `air.fsp` entry of the
+//!   service), and the words of its messages.
 //! - **The request is kept in the wallet file** ([`PendingAirRequest`]) from
 //!   before the first write until it ends: its `request_id` and one-off key `r`
 //!   are all that is needed to read the reply, so a reply that arrives while the
@@ -64,20 +68,21 @@
 //!
 //! The mints' DIDs: `air.psp_did` and `air.esp_did` if set, else the built-in
 //! ones ([`crate::config::BUILTIN_SPI_DID`], [`crate::config::BUILTIN_ESP_DID`],
-//! PLACEHOLDERS until the first SPI deploy); the AIR server and its host are
-//! configuration (upstream item 4 will resolve them from the DID) and are the
-//! same for both mints. Without them every call here fails with an error that
-//! names the missing setting ([`crate::config::AirSettings::require`]). What the
-//! wallet never sends the PSP or the ESP at all is `/melt`, `/burns` and
-//! `/audit`: those are local to the SPI. The calls to the FSPs are HTTP
-//! (`crate::http`).
+//! PLACEHOLDERS until the first SPI deploy); an FSP mint's is its service's DID.
+//! The AIR server and its host are configuration (upstream item 4 will resolve
+//! them from the DID): `air.server` and `air.host` for the PSP and the ESP (the
+//! same for both), and for an FSP mint the `air.fsp` entry of its service. Without
+//! them every call here fails with an error that names the missing setting
+//! ([`crate::config::Party::address`]). What the wallet never sends a mint at all
+//! is `/melt`, `/burns` and `/audit`: those are local to the operator. The wallet
+//! makes no HTTP call.
 
 use sp_wire::air_request::ask::{AskConfig, AskError, InFlight, Verified, ask};
 use sp_wire::air_request::client::{self, ServerRef, block_on_new_runtime};
 use sp_wire::air_request::{
-    KIND_CHECK_STATE, KIND_EXCHANGE, KIND_FEES, KIND_KEYS, KIND_KEYSETS, KIND_MINT_INFO,
-    KIND_REDEEM, KIND_ROLLOVER, KIND_ROTATION, KIND_TRANSFER, STATUS_UNAVAILABLE, VerifyError,
-    addr, check_mint_info,
+    KIND_CHECK_STATE, KIND_EXCHANGE, KIND_FEES, KIND_FSP_ISSUE, KIND_FSP_SPEND, KIND_KEYS,
+    KIND_KEYSETS, KIND_MINT_INFO, KIND_REDEEM, KIND_ROLLOVER, KIND_ROTATION, KIND_TRANSFER,
+    STATUS_UNAVAILABLE, VerifyError, addr, check_mint_info,
 };
 use sp_wire::version::WireMismatch;
 
@@ -109,6 +114,8 @@ fn what(kind: u8) -> &'static str {
         KIND_EXCHANGE => "exchange",
         KIND_TRANSFER => "transfer",
         KIND_REDEEM => "redemption",
+        KIND_FSP_ISSUE => "FSP issue",
+        KIND_FSP_SPEND => "FSP spend",
         _ => "a request",
     }
 }
@@ -118,7 +125,12 @@ fn what(kind: u8) -> &'static str {
 fn changes_state(kind: u8) -> bool {
     matches!(
         kind,
-        KIND_ROLLOVER | KIND_EXCHANGE | KIND_TRANSFER | KIND_REDEEM
+        KIND_ROLLOVER
+            | KIND_EXCHANGE
+            | KIND_TRANSFER
+            | KIND_REDEEM
+            | KIND_FSP_ISSUE
+            | KIND_FSP_SPEND
     )
 }
 
@@ -149,13 +161,10 @@ fn body_hash(body: &[u8]) -> String {
 }
 
 fn ask_config(air: &AirSettings, party: Party) -> Result<AskConfig, WalletError> {
-    air.require().map_err(WalletError::Invalid)?;
+    let (name, host) = party.address(air).map_err(WalletError::Invalid)?;
     let mint = party.did(air);
     Ok(AskConfig {
-        server: ServerRef {
-            name: air.server.clone(),
-            host: air.host.clone(),
-        },
+        server: ServerRef { name, host },
         mint,
         // Only `ask_mint_info` reads these two; `verify_mint` checks them itself.
         wire_version: sp_wire::WIRE_VERSION,

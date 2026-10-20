@@ -10,7 +10,8 @@
 //! behind the fsp-mint of the FSP test, whose Issuer is the real `AirIssuer`. The
 //! AIR client always dials port 5702, so these tests need that port free, and they
 //! take turns on the one shared server; they are built only with the
-//! `air-listener-tests` feature. The wallet's own calls to the FSP mint are HTTP.
+//! `air-listener-tests` feature. The wallet reaches the FSP mint over AIR too: fsp-mint
+//! answers on its own real listener, and the wallet's `air.fsp` entry points at it.
 
 mod common;
 
@@ -18,15 +19,16 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use axum::Router;
 use ecash_wallet::config::AirSettings;
 use ecash_wallet::handoff::{
     FSP_PREFIX, FSP_WARNING, HandoffKind, HandoffState, PSP_PREFIX, PSP_WARNING, Standing,
 };
 use ecash_wallet::legacy::{SentState, SentToken};
-use ecash_wallet::mint_info::{check_handoff, complete_import, reclaim_handoff, rotation_sync};
+use ecash_wallet::mint_info::{
+    check_handoff, complete_import, fsp_sync, reclaim_handoff, rotation_sync, settle_fsp,
+};
 use ecash_wallet::store::{HandedNote, Handover, StoredNote, WalletData};
-use ecash_wallet::{Kind, Wallet, http};
+use ecash_wallet::{Kind, Wallet};
 use esp_mint::exchange::{Burn, Psp};
 use esp_mint::responses::Responses;
 use esp_mint::server::EspState;
@@ -37,12 +39,10 @@ use fsp_mint::spend::Spender;
 use mint_server::state::AppState;
 use mint_types::{Amount, BlindNonce, MintInput, MintOutput, Nonce, Note};
 use rand::rngs::OsRng;
-use secp256k1::{Keypair, SECP256K1, SecretKey};
-use sp_wire::ServiceDid;
+use secp256k1::{Keypair, SECP256K1};
 use sp_wire::seal::SecretKey as DidSecretKey;
-use tokio::runtime::Runtime;
 
-use common::{EspAt, PspAt};
+use common::{EspAt, FspAt, PspAt, service, service_keypair};
 
 /// What the wallet's records call the PSP (the mint a handoff names). Nothing
 /// dials it: the PSP is reached by DID.
@@ -61,15 +61,6 @@ fn scratch(name: &str) -> PathBuf {
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
     d
-}
-
-fn serve(rt: &Runtime, app: Router) -> String {
-    let l = rt
-        .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
-        .unwrap();
-    let a = l.local_addr().unwrap();
-    rt.spawn(async move { axum::serve(l, app).await.unwrap() });
-    format!("http://{a}")
 }
 
 // ---- PSP ---------------------------------------------------------------------------
@@ -616,14 +607,6 @@ fn a_cancelled_psp_handoff_returns_the_notes() {
 
 // ---- FSP ---------------------------------------------------------------------------
 
-fn service() -> ServiceDid {
-    let mut b = [0u8; 32];
-    b[31] = 1;
-    ServiceDid::from(
-        Keypair::from_secret_key(SECP256K1, &SecretKey::from_slice(&b).unwrap()).public_key(),
-    )
-}
-
 struct NoPsp;
 impl Psp for NoPsp {
     fn melt(&self, _: &[MintInput], _: &str) -> Result<Amount, String> {
@@ -636,12 +619,15 @@ impl Psp for NoPsp {
 
 struct FspMints {
     esp: Arc<EspState>,
-    fsp_url: String,
-    /// The ESP mint's AIR listener and the turn on the shared AIR server. Last.
+    /// The wallets' `[air]` settings: the `air.fsp` entry of the service.
+    air: AirSettings,
+    /// fsp-mint's AIR listener. It drops before the ESP mint's, which holds the
+    /// turn on the shared AIR server and is last.
+    _fsp: FspAt,
     _esp_at: EspAt,
 }
 
-fn start_fsp(rt: &Runtime, dir: &Path) -> FspMints {
+fn start_fsp(dir: &Path) -> FspMints {
     let (logic, master) = esp_mint::mint::open(&dir.join("esp")).unwrap();
     let responses = Responses::open(&dir.join("esp").join("responses.json")).unwrap();
     let esp = Arc::new(EspState {
@@ -666,24 +652,24 @@ fn start_fsp(rt: &Runtime, dir: &Path) -> FspMints {
     cfg.set("rotation.activation_hours", "120").unwrap();
     cfg.set("rotation.period_hours", "240").unwrap();
     cfg.validate().unwrap();
+    cfg.require_air().unwrap();
     std::fs::create_dir_all(dir.join("fsp")).unwrap();
     fsp_mint::keysets::record_first_issue(&dir.join("fsp"), NOW).unwrap();
-    let service_keypair = {
-        let mut b = [0u8; 32];
-        b[31] = 1;
-        Keypair::from_secret_key(SECP256K1, &SecretKey::from_slice(&b).unwrap())
-    };
     let state = Arc::new(FspState {
         spender: Spender::open(&dir.join("fsp"), cfg.rotation(), 1024, NOW).unwrap(),
         issues: Mutex::new(Issues::open(&dir.join("fsp")).unwrap()),
         issuer: Box::new(fsp_mint::esp_air::AirIssuer::new(&cfg).unwrap()),
-        service_keypair: Some(service_keypair),
+        service_keypair: Some(service_keypair()),
         clock: Box::new(|| NOW),
         config: cfg,
     });
+    // The listener keeps its state in a folder of its own, outside `dir`.
+    let fsp = FspAt::new(&esp_at.server, state, &scratch("airstate-fsp"));
+    let air = fsp.air(60, 2);
     FspMints {
         esp,
-        fsp_url: serve(rt, fsp_mint::server::router(state)),
+        air,
+        _fsp: fsp,
         _esp_at: esp_at,
     }
 }
@@ -742,13 +728,12 @@ fn fsp_total(w: &Wallet) -> u128 {
 
 #[test]
 fn an_fsp_handoff_carries_the_did_key_and_the_notes_work_at_the_fsp_mint() {
-    let rt = Runtime::new().unwrap();
     let dir = scratch("fsp");
-    let m = start_fsp(&rt, &dir);
+    let m = start_fsp(&dir);
     let mut a = fsp_wallet(&dir, &m, "a", &[8, 4, 1]);
-    http::fsp_sync(&mut a, service(), &m.fsp_url).unwrap();
+    fsp_sync(&mut a, &m.air, service()).unwrap();
     let req = a.build_fsp_issue(service(), None, 0).unwrap();
-    http::settle_fsp(&mut a, &m.fsp_url, &req.hash()).unwrap();
+    settle_fsp(&mut a, &m.air, &req.hash()).unwrap();
     assert_eq!(fsp_total(&a), 13);
     let hex = hex::encode(service().serialize());
     assert_eq!(a.balance().fsp_by_service[&hex], 13, "grouped by service");
@@ -789,9 +774,9 @@ fn an_fsp_handoff_carries_the_did_key_and_the_notes_work_at_the_fsp_mint() {
     assert_eq!(b.handoffs_in()[0].id, out.id);
 
     // And they pay at the service's mint, once the new wallet has read its keys.
-    http::fsp_sync(&mut b, service(), &m.fsp_url).unwrap();
+    fsp_sync(&mut b, &m.air, service()).unwrap();
     let req = b.build_fsp_spend(service(), 5, "coffee").unwrap();
-    http::settle_fsp(&mut b, &m.fsp_url, &req.hash()).unwrap();
+    settle_fsp(&mut b, &m.air, &req.hash()).unwrap();
     assert_eq!(fsp_total(&b), 8);
 
     // The old device lets go of what it handed over: after this it cannot be

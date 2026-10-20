@@ -74,13 +74,13 @@ Expected: `"chain": "regtest"` and `"blocks": 0`, then `{"name": "psp-regtest"}`
 
 ### 2a. The AIR server (T6)
 
-The PSP and the ESP are reached over AIR only: the wallet's calls to them and the FSP's calls to the ESP all go through an AIR server (there is no HTTP route for them any more, and no `--psp-url` or `--esp-url`). Start the AIR server the way sandbox-mint's OPERATIONS.md says (the one bundled with the SPI, or `air_server` from the sandbox checkouts) on this machine, and note its public key, the 66 hex characters it prints:
+Every mint is reached over AIR only: the wallet's calls to the PSP, the ESP and a service's FSP mint, and the FSP's calls to the ESP, all go through an AIR server (there is no HTTP route for them any more, and no `--psp-url`, `--esp-url` or `--fsp-url`). Start the AIR server the way sandbox-mint's OPERATIONS.md says (the one bundled with the SPI, or `air_server` from the sandbox checkouts) on this machine, and note its public key, the 66 hex characters it prints:
 
 ```
 export AIR_SERVER=<the AIR server's key>
 ```
 
-Set the same shell variable in every terminal below (T1 to T5). The mints take it as `PSP_AIR_SERVER`, `ESP_AIR_SERVER` and `FSP_AIR_SERVER` with the host `127.0.0.1`, and the wallet as `ECASH_AIR_SERVER` and `ECASH_AIR_HOST` (step 5). Without them `psp-mint serve`, `esp-mint serve` and `fsp-mint serve` refuse to start, and a wallet command that calls the PSP or the ESP stops with an error that names `air.server` and `air.host`. The mint's local HTTP (`/audit`, `/health`, `/melt`, `/burns` and the operator's routes) is unchanged. Start the mints in the order of steps 3, 4 and 35: the FSP asks the ESP over AIR at startup and exits if it cannot be reached.
+Set the same shell variable in every terminal below (T1 to T5). The mints take it as `PSP_AIR_SERVER`, `ESP_AIR_SERVER` and `FSP_AIR_SERVER` with the host `127.0.0.1` (the FSP mint also as `FSP_AIR_ESP_SERVER` and `FSP_AIR_ESP_HOST`, for its calls to the ESP; here the same server carries both), and the wallet as `ECASH_AIR_SERVER` and `ECASH_AIR_HOST` (step 5), plus `ECASH_AIR_FSP` for the FSP mint (step 35). Without them `psp-mint serve`, `esp-mint serve` and `fsp-mint serve` refuse to start, and a wallet command that calls the PSP or the ESP stops with an error that names `air.server` and `air.host`, and an `fsp` command for a service with no `air.fsp` entry stops with an error that names `air.fsp`. The mint's local HTTP (`/audit`, `/health` for the PSP and the ESP, `/melt`, `/burns` and the operator's routes) is unchanged; fsp-mint's only HTTP route is `/audit`. Start the mints in the order of steps 3, 4 and 35: the FSP asks the ESP over AIR at startup and exits if it cannot be reached.
 
 ### 3. The PSP mint (T2)
 
@@ -604,10 +604,16 @@ Expected: the settings, then `service.did = 0279be667ef9dcbbac55a06295ce870b0702
 ```
 cd ~/fsp-mint
 ESP_DID=$(cd ~/esp-mint && cargo run -q -- pubkey)
-FSP_AIR_ESP_DID=$ESP_DID FSP_AIR_SERVER=$AIR_SERVER FSP_AIR_HOST=127.0.0.1 FSP_NETWORK=regtest FSP_SERVICE_DID=0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798 cargo run -- serve
+FSP_AIR_ESP_DID=$ESP_DID FSP_AIR_ESP_SERVER=$AIR_SERVER FSP_AIR_ESP_HOST=127.0.0.1 FSP_AIR_SERVER=$AIR_SERVER FSP_AIR_HOST=127.0.0.1 FSP_NETWORK=regtest FSP_SERVICE_DID=0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798 cargo run -- serve
 ```
 
-Expected: the settings (with `service.did` from the environment) and `fsp-mint api listening on http://127.0.0.1:3200`. In T1, `curl -s http://127.0.0.1:3200/health` returns `{"network":"regtest","service":"0279be…1798","status":"ok"}` and `/fees` returns `{"issue_fee_per_byte":0,"issue_group_fixed_bytes":16,"issue_note_bytes":106,"issue_output_bytes":41,"max_request_bytes":1048576}`.
+Expected: the settings (with `service.did` from the environment), `fsp-mint api listening on http://127.0.0.1:3200` (the operator's `/audit` only) and `fsp-mint AIR listener: wallets reach this service with the air.fsp entry 0279be…1798@<AIR server key>@127.0.0.1 (ECASH_AIR_FSP, air.fsp; …)`. The entry is what the wallet needs: it is the service's DID, the AIR server the FSP mint listens on, and the host. In T1, `curl -s http://127.0.0.1:3200/audit` returns the FSP mint's counts. The FSP mint's other calls (`/health`, `/keys`, `/fees`, `/rotation`, `/issue`, `/spend`) are AIR calls now, so there is no `curl` for them. In T4, give the wallet the entry (the same variable for every `fsp` command below; the service wallet too, if it uses `fsp`):
+
+```
+export ECASH_AIR_FSP=0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798@$AIR_SERVER@127.0.0.1
+```
+
+Without it `fsp issue --service $SERVICE ...` stops with an error that names `air.fsp` and the service, and sends nothing.
 
 ### 36. Issue FSP from ESP (T4)
 
@@ -803,10 +809,10 @@ The same method for the FSP mint (FSP_ROTATION_ACTIVATION_HOURS and FSP_ROTATION
 cp -R ~/.fsp-mint ~/.fsp-mint.pre-rotation
 python3 -c 'import json,time,os; p=os.path.expanduser("~/.fsp-mint/regtest/first_issue.json"); json.dump({"first_issue":int(time.time())-5400}, open(p,"w"))'
 cd ~/fsp-mint
-FSP_NETWORK=regtest FSP_SERVICE_DID=$SERVICE FSP_ROTATION_ACTIVATION_HOURS=1 FSP_ROTATION_PERIOD_HOURS=1 cargo run -- serve
+FSP_AIR_ESP_DID=$ESP_DID FSP_AIR_ESP_SERVER=$AIR_SERVER FSP_AIR_ESP_HOST=127.0.0.1 FSP_AIR_SERVER=$AIR_SERVER FSP_AIR_HOST=127.0.0.1 FSP_NETWORK=regtest FSP_SERVICE_DID=$SERVICE FSP_ROTATION_ACTIVATION_HOURS=1 FSP_ROTATION_PERIOD_HOURS=1 cargo run -- serve
 ```
 
-In T4: `cargo run -q -- --regtest fsp-window --service $SERVICE` and `cargo run -q -- --regtest balance`. Expected: `fsp-window` lists the new current set (epoch 1) and the previous one `8fa2a88519b4bef5`; the first command that connects prints `fsp http://127.0.0.1:3200: rollover <id>: rolled over to the current keyset` after the wallet's delay, and `balance` shows the same 350000000000 FSP on the new key set in fewer notes (the count depends on the amounts and was not recomputed). The second run prints nothing.
+In T4: `cargo run -q -- --regtest fsp-window --service $SERVICE` and `cargo run -q -- --regtest balance`. Expected: `fsp-window` lists the new current set (epoch 1) and the previous one `8fa2a88519b4bef5`; the first command that connects prints `fsp 0279be…1798: rollover <id>: rolled over to the current keyset` after the wallet's delay, and `balance` shows the same 350000000000 FSP on the new key set in fewer notes (the count depends on the amounts and was not recomputed). The second run prints nothing.
 
 ### 49. Put it away (T1)
 
@@ -817,7 +823,7 @@ for d in .psp-mint .esp-mint .fsp-mint; do mv ~/$d ~/$d.run-20261016; done
 mv ~/.ecash-wallet ~/.ecash-wallet.run-20261016
 rm -f /tmp/handover*.json /tmp/wallet-service*.json /tmp/wallet-rot*.json
 rm -rf /tmp/fsp-export /tmp/fsp-export2
-unset ECASH_AIR_SERVER ECASH_AIR_HOST ECASH_AIR_PSP_DID ECASH_AIR_ESP_DID AIR_SERVER ESP_DID
+unset ECASH_AIR_SERVER ECASH_AIR_HOST ECASH_AIR_PSP_DID ECASH_AIR_ESP_DID ECASH_AIR_FSP AIR_SERVER ESP_DID
 ```
 
 The node's regtest folder moves aside in step 1 of the next run. The copies `~/.esp-mint.pre-rotation` and `~/.fsp-mint.pre-rotation` made in steps 44 and 48 are the state from just before the rotations, and can be removed when this run's data is no longer needed. Delete `~/.esp-mint/esp-mint.toml` if you restore any of it, so the 365-day maturity applies again.

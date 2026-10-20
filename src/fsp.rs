@@ -1,11 +1,11 @@
 //! FSP: Fast Service Points, issued by a service's own fsp-mint.
 //!
 //! - **Issue** ([`Wallet::build_fsp_issue`], [`Wallet::finish_fsp_issue`]): the
-//!   app hands its ESP for a service to that service's fsp-mint (`POST /issue`)
-//!   with blinded FSP outputs, 1:1 less the mint's issue fee. Maturity does not
+//!   app hands its ESP for a service to that service's fsp-mint (an issue
+//!   request, over AIR) with blinded FSP outputs, 1:1 less the mint's issue fee. Maturity does not
 //!   matter and days may be mixed (one group per day).
-//! - **Spend** ([`Wallet::build_fsp_spend`]): a swap with change (`POST
-//!   /spend`): `pay` goes to the service, the change comes back as new notes.
+//! - **Spend** ([`Wallet::build_fsp_spend`]): a swap with change (a spend
+//!   request, over AIR): `pay` goes to the service, the change comes back as new notes.
 //! - **Rollover** ([`Wallet::build_fsp_rollover`]): FSP on the mint's previous
 //!   keyset is swapped (pay 0) to the current one. The command line does this
 //!   automatically every time it talks to an FSP mint and at startup.
@@ -30,10 +30,12 @@ use crate::blind::PendingOutput;
 use crate::error::WalletError;
 use crate::store::{HandedNote, Handover, Kind, StoredNote, StoredTerms, Wallet};
 
-/// What the wallet last saw of an FSP mint (`GET /keys`).
+/// What the wallet last saw of a service's FSP mint (its keys, over AIR). The mint
+/// is found by its service, so no address is kept; a wallet file from before
+/// this one has the `url` the mint was then reached at, which is ignored when
+/// the file is read and not written again.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FspMint {
-    pub url: String,
     pub current: String,
     pub previous: Option<String>,
     /// When the current keyset is replaced, and the previous one deleted.
@@ -62,6 +64,13 @@ pub struct PendingFsp {
     pub id: String,
     pub service: ServiceDid,
     pub op: FspOp,
+}
+
+/// A service's FSP mint in the wallet's records (`fsp_mints`, the swap schedule):
+/// the service's DID in hex. It is never dialled; the mint is reached through the
+/// service's `air.fsp` entry.
+pub fn record_of(service: ServiceDid) -> String {
+    hex::encode(service.serialize())
 }
 
 /// What an issue gave.
@@ -235,18 +244,17 @@ impl Wallet {
         })
     }
 
-    /// Record what an FSP mint's `/keys` said, and move FSP on keysets it no
+    /// Record what an FSP mint's keys said, and move FSP on keysets it no
     /// longer has to the lost record. Returns the lost units. Refuses a mint
     /// that is not the service's.
     pub fn note_fsp_keys(
         &mut self,
         service: ServiceDid,
-        url: &str,
         keys: &KeysResponse,
     ) -> Result<u128, WalletError> {
         if keys.service != Some(service) {
             return Err(WalletError::Invalid(format!(
-                "the FSP mint at {url} is not the mint of service {service}"
+                "the FSP mint reached for service {service} (through its air.fsp entry) says it is not that service's mint"
             )));
         }
         let svc = hex::encode(service.serialize());
@@ -255,7 +263,6 @@ impl Wallet {
             d.fsp_mints.insert(
                 svc.clone(),
                 FspMint {
-                    url: url.into(),
                     current: keys.current.clone(),
                     previous: keys.previous.clone(),
                     next_rotation: keys.next_rotation,
@@ -659,10 +666,8 @@ impl Wallet {
             d.pending_fsp.retain(|q| q.id != id);
             // A rollover done: its swap time goes in this same write.
             if reply.paid == 0 {
-                if let Some(m) = d.fsp_mints.get(&hex::encode(p.service.serialize())) {
-                    let prefix = crate::rotate::schedule_prefix(Kind::Fsp, &m.url);
-                    d.swap_schedule.retain(|k, _| !k.starts_with(&prefix));
-                }
+                let prefix = crate::rotate::schedule_prefix(Kind::Fsp, &record_of(p.service));
+                d.swap_schedule.retain(|k, _| !k.starts_with(&prefix));
             }
             Ok(())
         })?;
@@ -746,13 +751,46 @@ mod tests {
         d.join("wallet.json")
     }
 
-    fn fsp_mint(url: &str, current: &str, previous: Option<&str>) -> FspMint {
+    fn fsp_mint(current: &str, previous: Option<&str>) -> FspMint {
         FspMint {
-            url: url.into(),
             current: current.into(),
             previous: previous.map(String::from),
             next_rotation: None,
         }
+    }
+
+    #[test]
+    fn an_fsp_mint_record_with_the_old_url_still_reads_and_is_written_without_it() {
+        // A wallet file from before the FSP's calls were over AIR kept the URL
+        // the mint was reached at. It is ignored on reading, in a whole wallet
+        // file too, and not written again.
+        let old = serde_json::json!({
+            "url": "http://127.0.0.1:3200",
+            "current": "k1",
+            "previous": "k0",
+            "next_rotation": 5
+        });
+        let m: FspMint = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(
+            m,
+            FspMint {
+                current: "k1".into(),
+                previous: Some("k0".into()),
+                next_rotation: Some(5),
+            }
+        );
+        assert!(serde_json::to_value(&m).unwrap().get("url").is_none());
+
+        let svc = service_of(7);
+        let mut data = crate::store::WalletData::default();
+        data.fsp_mints
+            .insert(record_of(svc), fsp_mint("k9", Some("k8")));
+        let mut file = serde_json::to_value(&data).unwrap();
+        file["fsp_mints"][record_of(svc)] = old;
+        let path = scratch_file("old-url");
+        std::fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
+        let w = Wallet::open(&path).unwrap();
+        assert_eq!(w.fsp_mints()[&record_of(svc)].current, "k1");
     }
 
     #[test]
@@ -778,14 +816,10 @@ mod tests {
         data.fsp_keysets.insert(with_terms.id(), "k0".into());
         data.notes = notes.iter().map(|(n, _)| n.clone()).collect();
         data.notes.push(with_terms.clone());
-        data.fsp_mints.insert(
-            hex::encode(s1.serialize()),
-            fsp_mint("http://one", "k1", Some("k0")),
-        );
-        data.fsp_mints.insert(
-            hex::encode(s2.serialize()),
-            fsp_mint("http://two", "k2", Some("k1")),
-        );
+        data.fsp_mints
+            .insert(hex::encode(s1.serialize()), fsp_mint("k1", Some("k0")));
+        data.fsp_mints
+            .insert(hex::encode(s2.serialize()), fsp_mint("k2", Some("k1")));
         let path = scratch_file("fill");
         std::fs::write(&path, serde_json::to_vec(&data).unwrap()).unwrap();
 

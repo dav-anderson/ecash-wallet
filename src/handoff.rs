@@ -157,7 +157,11 @@
 //!   groups       1   how many groups (1 to 255)
 //!     per group:
 //!     service   33   the service's AIR DID (compressed key)
-//!     mint, keysets, notes   as for PSP
+//!     mint, keysets, notes   as for PSP; the mint is the service's DID in hex
+//!                            (66 characters): a name, not an address, since an
+//!                            FSP mint is reached through the receiver's own
+//!                            `air.fsp` entry. A handoff from before that carries
+//!                            the mint's URL there, which is read and ignored.
 //!   did key     32   the DID secret key
 //! ```
 //!
@@ -165,7 +169,7 @@
 //! first 16 bytes of SHA-256 of the body (not of the sealed bytes, which change
 //! every time they are sealed), in hex, so the sender and the receiver both
 //! have it. A PSP handoff of N notes of one key set with a 22-character URL is
-//! about 188 + 150N characters, an FSP handoff of one service about 166 + 150N.
+//! about 188 + 150N characters, an FSP handoff of one service about 232 + 150N.
 //! A QR code holds at most 4,296 alphanumeric characters (error correction L,
 //! version 40) or 3,391 (M), so one code holds about 27 notes at L or 21 at M. A
 //! funding handoff of $100 is 3 PSP notes (64, 32 and 4 PSP), about 640
@@ -858,10 +862,10 @@ pub struct Imported {
     pub did_key: Option<DidSecretKey>,
     /// Things the wallet could not check, or that differ from what it knew.
     pub warnings: Vec<String>,
-    /// The PSP mint and the FSP (service, mint) pairs the notes are for, so a
+    /// The PSP mint and the FSP services the notes are for, so a
     /// caller can read their keys.
     pub psp_mints: Vec<String>,
-    pub fsp_mints: Vec<(ServiceDid, String)>,
+    pub fsp_mints: Vec<ServiceDid>,
     /// Stored PSP swaps to send (ids of pending rollovers). A PSP handoff has
     /// one; an FSP handoff never does.
     pub psp_swaps: Vec<String>,
@@ -1064,16 +1068,16 @@ impl Wallet {
         }
         let mut groups = Vec::new();
         for (service, notes) in &by_service {
-            let mint = self
-                .fsp_mints()
-                .get(&hex::encode(service))
-                .map(|m| m.url.clone())
-                .ok_or_else(|| {
-                    WalletError::Invalid(format!(
-                        "this wallet has not seen the FSP mint of service {}: connect to it once first",
-                        hex::encode(service)
-                    ))
-                })?;
+            // The handoff names the mint by its service (the group's mint field is
+            // part of the format and is never empty); it is not an address, and
+            // the receiver reaches the mint through its own `air.fsp` entry.
+            self.fsp_mints().get(&hex::encode(service)).ok_or_else(|| {
+                WalletError::Invalid(format!(
+                    "this wallet has not seen the FSP mint of service {}: connect to it once first",
+                    hex::encode(service)
+                ))
+            })?;
+            let mint = hex::encode(service);
             groups.push(FspGroup {
                 service: ServiceDid::from_slice(service).expect("it came from a service ID"),
                 mint,
@@ -1594,7 +1598,7 @@ impl Wallet {
                 }
                 Kind::Fsp => {
                     let service = g.service.expect("an FSP group has a service");
-                    fsp_mints.push((service, g.mint.clone()));
+                    fsp_mints.push(service);
                     let hexed = hex::encode(service.serialize());
                     match self.fsp_mints().get(&hexed) {
                         Some(m) => {
@@ -1610,12 +1614,6 @@ impl Wallet {
                                         .map(|p| format!(" and {p}"))
                                         .unwrap_or_default()
                                 )));
-                            }
-                            if m.url.trim_end_matches('/') != g.mint.trim_end_matches('/') {
-                                warnings.push(format!(
-                                    "the handoff names {} for service {hexed}, and this wallet knows {}: the wallet keeps its own",
-                                    g.mint, m.url
-                                ));
                             }
                         }
                         None => warnings.push(format!(
@@ -1835,7 +1833,9 @@ mod tests {
     const KS_A: &str = "0123456789abcdef";
     const KS_B: &str = "fedcba9876543210";
     const PSP_URL: &str = "http://127.0.0.1:3000";
-    const FSP_URL: &str = "http://127.0.0.1:3200";
+    /// What an FSP group's mint field holds in these tests: a name, never dialled
+    /// (a handoff this wallet exports names the service's DID there).
+    const FSP_MINT: &str = "fsp-mint";
 
     fn service(n: u8) -> ServiceDid {
         let sk = SecretKey::from_slice(&[n; 32]).unwrap();
@@ -1881,11 +1881,10 @@ mod tests {
                 }
                 d.notes.push(n);
             }
-            for (i, s) in [service(1), service(2)].iter().enumerate() {
+            for s in [service(1), service(2)].iter() {
                 d.fsp_mints.insert(
                     hex::encode(s.serialize()),
                     crate::fsp::FspMint {
-                        url: format!("{FSP_URL}{i}"),
                         current: KS_A.into(),
                         previous: Some(KS_B.into()),
                         next_rotation: None,
@@ -2141,7 +2140,7 @@ mod tests {
         let fsp_body = FspPayload {
             groups: vec![FspGroup {
                 service: service(1),
-                mint: FSP_URL.into(),
+                mint: FSP_MINT.into(),
                 notes: a
                     .notes()
                     .iter()
@@ -2337,7 +2336,7 @@ mod tests {
         let payload = FspPayload {
             groups: vec![FspGroup {
                 service: service(1),
-                mint: FSP_URL.into(),
+                mint: FSP_MINT.into(),
                 notes: a
                     .notes()
                     .iter()
@@ -2496,9 +2495,10 @@ mod tests {
         // FSP: version, kind, the group count, one group (service, mint, one key
         // set, the count, two notes), the DID key, the check
         let fsp = fsp_out(&mut a, &[(service(1), 16)]);
-        let url = format!("{FSP_URL}0");
+        // The mint field names the service: its DID in hex.
+        let name = hex::encode(service(1).serialize());
         let raw =
-            3 + (33 + 2 + url.len() + 1 + 8 + 2 + 2 * NOTE_BYTES) + DID_KEY_BYTES + CHECK_BYTES;
+            3 + (33 + 2 + name.len() + 1 + 8 + 2 + 2 * NOTE_BYTES) + DID_KEY_BYTES + CHECK_BYTES;
         assert_eq!(
             base44_decode(&fsp.text[FSP_PREFIX.len()..]).unwrap().len(),
             raw
@@ -2625,7 +2625,7 @@ mod tests {
         let payload = FspPayload {
             groups: vec![FspGroup {
                 service: service(1),
-                mint: FSP_URL.into(),
+                mint: FSP_MINT.into(),
                 notes: fsp_notes,
             }],
             did_key: did(),
@@ -2694,7 +2694,7 @@ mod tests {
         let (text, _) = FspPayload {
             groups: vec![FspGroup {
                 service: service(1),
-                mint: FSP_URL.into(),
+                mint: FSP_MINT.into(),
                 notes: vec![forged],
             }],
             did_key: did(),
@@ -2774,7 +2774,6 @@ mod tests {
             d.fsp_mints.insert(
                 hex::encode(service(1).serialize()),
                 crate::fsp::FspMint {
-                    url: FSP_URL.into(),
                     current: "1111111111111111".into(),
                     previous: None,
                     next_rotation: None,
@@ -2807,8 +2806,7 @@ mod tests {
         assert!(e.contains("expired"), "{e}");
         assert!(c.pending_rollovers().is_empty());
 
-        // with the right sets known it is accepted, and a different URL for the
-        // same service is a warning, not a refusal
+        // with the right sets known it is accepted
         let mut d = Wallet::open(&dir.join("d.json")).unwrap();
         d.update(|w| {
             w.live_keysets
@@ -2816,7 +2814,6 @@ mod tests {
             w.fsp_mints.insert(
                 hex::encode(service(1).serialize()),
                 crate::fsp::FspMint {
-                    url: "http://elsewhere".into(),
                     current: KS_A.into(),
                     previous: Some(KS_B.into()),
                     next_rotation: None,
@@ -2827,15 +2824,8 @@ mod tests {
         .unwrap();
         d.import_psp_handoff(&psp.text, &did(), "").unwrap();
         let got = d.import_fsp_handoff(&fsp.text, "").unwrap();
-        assert!(
-            got.warnings.iter().any(|w| w.contains("http://elsewhere")),
-            "{:?}",
-            got.warnings
-        );
-        assert_eq!(
-            d.fsp_mints()[&hex::encode(service(1).serialize())].url,
-            "http://elsewhere"
-        );
+        assert_eq!(got.fsp_mints, vec![service(1)]);
+        assert!(got.warnings.is_empty(), "{:?}", got.warnings);
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -2909,7 +2899,7 @@ mod tests {
         let fsp = FspPayload {
             groups: vec![FspGroup {
                 service: service(1),
-                mint: FSP_URL.into(),
+                mint: FSP_MINT.into(),
                 notes,
             }],
             did_key: did(),

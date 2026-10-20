@@ -72,13 +72,23 @@ $CLI listwallets
 
 Expected: `"chain": "regtest"` and `"blocks": 0`, then `{"name": "psp-regtest"}` and `{"name": "payer"}`, a balance of `50.00000000`, block count `101`, and a wallet list with `psp` and `payer`. Mining 101 blocks is needed because a block reward can be spent only after 100 more.
 
+### 2a. The AIR server (T6)
+
+The PSP and the ESP are reached over AIR only: the wallet's calls to them and the FSP's calls to the ESP all go through an AIR server (there is no HTTP route for them any more, and no `--psp-url` or `--esp-url`). Start the AIR server the way sandbox-mint's OPERATIONS.md says (the one bundled with the SPI, or `air_server` from the sandbox checkouts) on this machine, and note its public key, the 66 hex characters it prints:
+
+```
+export AIR_SERVER=<the AIR server's key>
+```
+
+Set the same shell variable in every terminal below (T1 to T5). The mints take it as `PSP_AIR_SERVER`, `ESP_AIR_SERVER` and `FSP_AIR_SERVER` with the host `127.0.0.1`, and the wallet as `ECASH_AIR_SERVER` and `ECASH_AIR_HOST` (step 5). Without them `psp-mint serve`, `esp-mint serve` and `fsp-mint serve` refuse to start, and a wallet command that calls the PSP or the ESP stops with an error that names `air.server` and `air.host`. The mint's local HTTP (`/audit`, `/health`, `/melt`, `/burns` and the operator's routes) is unchanged. Start the mints in the order of steps 3, 4 and 35: the FSP asks the ESP over AIR at startup and exits if it cannot be reached.
+
 ### 3. The PSP mint (T2)
 
 The log is teed to a file because the signatures are printed there, a development stand-in for delivery over the AIR. The first build takes a few minutes.
 
 ```
 cd ~/psp-mint
-PSP_SCAN_INTERVAL_SECS=10 cargo run -- --regtest serve 2>&1 | tee ~/psp-serve.log
+PSP_AIR_SERVER=$AIR_SERVER PSP_AIR_HOST=127.0.0.1 PSP_SCAN_INTERVAL_SECS=10 cargo run -- --regtest serve 2>&1 | tee ~/psp-serve.log
 ```
 
 Expected: `scanning wallet psp-regtest every 10 s` and `psp-mint api listening on http://127.0.0.1:3000`. In T1, `curl -s http://127.0.0.1:3000/health` returns `"status":"ok"` and `/audit` returns `{"issued":0,"redeemed":0,"outstanding":0}`.
@@ -87,7 +97,7 @@ Expected: `scanning wallet psp-regtest every 10 s` and `psp-mint api listening o
 
 ```
 cd ~/esp-mint
-ESP_NETWORK=regtest ESP_REDEEM_FEE_PER_BYTE=1000000 cargo run -- serve
+ESP_AIR_SERVER=$AIR_SERVER ESP_AIR_HOST=127.0.0.1 ESP_NETWORK=regtest ESP_REDEEM_FEE_PER_BYTE=1000000 cargo run -- serve
 ```
 
 Every fee in esp-mint defaults to 0. This walkthrough sets the redemption fee to 10^6 ESP units a byte (`ESP_REDEEM_FEE_PER_BYTE`) so that the redemption steps below show a fee being taken; the figures in them depend on it. Start the mint the same way each time it is restarted.
@@ -109,12 +119,14 @@ Run this once. A second run makes a second pending purchase in the wallet file.
 cd ~/ecash-wallet
 export ECASH_WALLET_FILE=/tmp/wallet-regtest.json
 MINT_KEY=$(cd ~/psp-mint && cargo run -q -- --regtest pubkey)
+ESP_DID=$(cd ~/esp-mint && cargo run -q -- pubkey)
+export ECASH_AIR_SERVER=$AIR_SERVER ECASH_AIR_HOST=127.0.0.1 ECASH_AIR_PSP_DID=$MINT_KEY ECASH_AIR_ESP_DID=$ESP_DID
 echo ${#MINT_KEY}
 HEX=$(cargo run -q -- --regtest buy-psp --mint-key $MINT_KEY 4 1)
 echo ${#HEX}
 ```
 
-Expected: `66` (the mint's public key in hex), then `purchase <id>` and `199 bytes. Put the hex below in an OP_RETURN and pay the PSP.` (both on standard error, so they show on the screen but are not in `HEX`), then `398`. The payload is 117 bytes plus 82 for the encryption: 199 bytes, 398 hex characters.
+The wallet takes both mints' DIDs from the settings (the built-in ones are placeholders until the first SPI deploy). Expected: `66` (the mint's public key in hex), then `purchase <id>` and `199 bytes. Put the hex below in an OP_RETURN and pay the PSP.` (both on standard error, so they show on the screen but are not in `HEX`), then `398`. The payload is 117 bytes plus 82 for the encryption: 199 bytes, 398 hex characters.
 
 ### 6. Pay the PSP (T4)
 
@@ -255,13 +267,13 @@ The app wallet is `$ECASH_WALLET_FILE` (the one used so far in T4). The service 
 
 ### 13. Restart both mints on the new build (T2, T3)
 
-The PSP now keeps the memo of each burn and has `POST /burns`, and the ESP mint now has `/transfer` and asks the PSP for the memo. Restart the PSP first, then the ESP mint. Their data in `~/.psp-mint` and `~/.esp-mint` is kept.
+The PSP now keeps the memo of each burn and has `POST /burns`, and the ESP mint now has the transfer call and asks the PSP for the memo. Restart the PSP first, then the ESP mint. Their data in `~/.psp-mint` and `~/.esp-mint` is kept.
 
 In T2, stop the PSP with Ctrl-C and start it again:
 
 ```
 cd ~/psp-mint
-PSP_SCAN_INTERVAL_SECS=10 cargo run -- --regtest serve 2>&1 | tee ~/psp-serve.log
+PSP_AIR_SERVER=$AIR_SERVER PSP_AIR_HOST=127.0.0.1 PSP_SCAN_INTERVAL_SECS=10 cargo run -- --regtest serve 2>&1 | tee ~/psp-serve.log
 ```
 
 Expected: `scanning wallet psp-regtest every 10 s` and `psp-mint api listening on http://127.0.0.1:3000`. In T1, check the new route (an empty list is a valid question):
@@ -276,7 +288,7 @@ In T3, stop the ESP mint with Ctrl-C and start it again:
 
 ```
 cd ~/esp-mint
-ESP_NETWORK=regtest ESP_REDEEM_FEE_PER_BYTE=1000000 cargo run -- serve
+ESP_AIR_SERVER=$AIR_SERVER ESP_AIR_HOST=127.0.0.1 ESP_NETWORK=regtest ESP_REDEEM_FEE_PER_BYTE=1000000 cargo run -- serve
 ```
 
 Expected: the same two lines as in step 4. In T1, `curl -s http://127.0.0.1:3100/audit` still returns `{"issued":500000000000,"outstanding":500000000000,"redeemed":0}`.
@@ -412,13 +424,9 @@ This continues the two runs above (purchase to ESP, then the transfer), with the
 
 The app wallet is the default one, `~/.ecash-wallet/regtest/wallet.json`. The service has its own wallet file, set per command with `ECASH_WALLET_FILE=/tmp/wallet-service.json`. `$SERVICE` is the generator point `0279be…1798` and `$KEY` its secret key `000…01` (see "Regtest, ESP transfer"). `$CLI`, `$PAYER`, `$HEX` and `$TXID` are shell variables in T4.
 
-### 21. Look at the ESP mint's rates (T1)
+### 21. The ESP mint's rates (no command)
 
-```
-curl -s http://127.0.0.1:3100/fees | python3 -m json.tool
-```
-
-Expected: `exchange` with `fee_per_byte "0"`, `maturity_days 365`, `max_items 1000`, `max_request_bytes 1048576`, `min_psp 1` and size `49 + 146 per input + 41 per output`; `transfer` with fee `"0"`, ceiling 1048576 and size `121 + 146 + 41`; `redeem` with `fee_per_byte "1000000"` (set by `ESP_REDEEM_FEE_PER_BYTE` in step 4; the default is `"0"`), `max_memo_bytes 256`, `max_request_bytes 67108864` and size `120 + 187 per input + 82 per output + the memo`. These are the mint's settings (esp-mint README, "Settings and fees"). The wallet reads this before it builds a redemption.
+The ESP's rates are an AIR call now (`GET /fees` is gone from HTTP), and the wallet reads them when it needs them: `redeem` prints each request's size and fee, and `exchange` and `transfer` check the mint's item limits before building. The mint's settings are what they were: `exchange` with `fee_per_byte "0"`, `maturity_days 365`, `max_items 1000`, `max_request_bytes 1048576`, `min_psp 1` and size `49 + 146 per input + 41 per output`; `transfer` with fee `"0"`, ceiling 1048576 and size `121 + 146 + 41`; `redeem` with `fee_per_byte "1000000"` (set by `ESP_REDEEM_FEE_PER_BYTE` in step 4; the default is `"0"`), `max_memo_bytes 256`, `max_request_bytes 15728640` and size `120 + 187 per input + 82 per output + the memo` (esp-mint README, "Settings and fees"). Nothing to run here; the fee shows in step 23's redemption.
 
 ### 22. Make new notes mature the day they are issued (T1)
 
@@ -431,10 +439,9 @@ maturity_days = 0
 EOT
 kill -HUP $(pgrep -f 'target/debug/esp-mint serve')
 sleep 1
-curl -s http://127.0.0.1:3100/fees | python3 -c 'import sys,json;print(json.load(sys.stdin)["exchange"]["maturity_days"])'
 ```
 
-Expected: T3 prints `esp-mint: SIGHUP, settings read again:` and `  terms.maturity_days changed from 365 to 0 days`, and the last command prints `0`. Notes already issued keep their day.
+Expected: T3 prints `esp-mint: SIGHUP, settings read again:` and `  terms.maturity_days changed from 365 to 0 days`. Notes already issued keep their day, and an exchange from now on gives notes that mature the day they are issued.
 
 ### 23. Buy 3 more PSP, a 2 and a 1 (T4)
 
@@ -576,16 +583,9 @@ curl -s http://127.0.0.1:3100/audit; echo
 
 Expected: `payout completed, payment reference regtest-demo-payment-1`, a balance of only the 3×10^11 at day 21107, and `{"issued":1399593000000,"outstanding":500000000000,"redeemed":899593000000}`.
 
-### 34. The size ceiling (T1)
+### 34. The size ceiling (no command)
 
-A body over the route's ceiling is refused before it is parsed.
-
-```
-head -c 1048577 /dev/zero | curl -s -o /dev/stderr -w '\nHTTP %{http_code}\n' -X POST --data-binary @- -H 'content-type: application/json' http://127.0.0.1:3100/exchange
-head -c 1048576 /dev/zero | curl -s -o /dev/stderr -w '\nHTTP %{http_code}\n' -X POST --data-binary @- -H 'content-type: application/json' http://127.0.0.1:3100/exchange
-```
-
-Expected: `HTTP 413` with `{"code":"request_too_large","error":"the request is 1048577 bytes, and this route accepts at most 1048576 bytes. Split the exchange into several requests. Nothing was parsed, burned or charged","limit_bytes":1048576,"size_bytes":1048577}`, then, for the body exactly at the ceiling, `HTTP 400` with `{"code":"malformed_request","error":"not a valid request: expected value at line 1 column 1"}`.
+A request over the route's ceiling is refused before it is parsed. This was a `curl` of 1048577 bytes at the ESP's `POST /exchange`; that route is gone, and the same ceiling now applies to the sealed request the ESP's AIR listener opens: a request over it is answered with a signed refusal that carries `"http_status": 413` and the code `request_too_large`, which the wallet reads as a plain mint error and never as a refusal of the notes (README, "The ESP's calls over AIR"). It cannot be made with `curl`. It is covered by esp-mint's AIR tests and by `tests/esp_air_flow.rs` here. Nothing to run.
 
 ### 35. The FSP mint (T1, then T5)
 
@@ -603,7 +603,8 @@ Expected: the settings, then `service.did = 0279be667ef9dcbbac55a06295ce870b0702
 
 ```
 cd ~/fsp-mint
-FSP_NETWORK=regtest FSP_SERVICE_DID=0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798 cargo run -- serve
+ESP_DID=$(cd ~/esp-mint && cargo run -q -- pubkey)
+FSP_AIR_ESP_DID=$ESP_DID FSP_AIR_SERVER=$AIR_SERVER FSP_AIR_HOST=127.0.0.1 FSP_NETWORK=regtest FSP_SERVICE_DID=0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798 cargo run -- serve
 ```
 
 Expected: the settings (with `service.did` from the environment) and `fsp-mint api listening on http://127.0.0.1:3200`. In T1, `curl -s http://127.0.0.1:3200/health` returns `{"network":"regtest","service":"0279be…1798","status":"ok"}` and `/fees` returns `{"issue_fee_per_byte":0,"issue_group_fixed_bytes":16,"issue_note_bytes":106,"issue_output_bytes":41,"max_request_bytes":1048576}`.
@@ -757,17 +758,16 @@ In T3 (the PSP mint must be running, because the ESP mint checks its network at 
 
 ```
 cd ~/esp-mint
-ESP_NETWORK=regtest ESP_REDEEM_FEE_PER_BYTE=1000000 ESP_ROTATION_ACTIVATION_HOURS=1 ESP_ROTATION_PERIOD_HOURS=1 cargo run -- serve
+ESP_AIR_SERVER=$AIR_SERVER ESP_AIR_HOST=127.0.0.1 ESP_NETWORK=regtest ESP_REDEEM_FEE_PER_BYTE=1000000 ESP_ROTATION_ACTIVATION_HOURS=1 ESP_ROTATION_PERIOD_HOURS=1 cargo run -- serve
 ```
 
-Expected: `key rotation: keyset <new> (epoch 1) is now current; 507d6862e19bf815 (epoch 0) is previous`, then `previous keyset 507d6862e19bf815 (epoch 0), retires at <time>`. In T1, `curl -s http://127.0.0.1:3100/rotation | python3 -m json.tool` shows the current and previous sets with their start and end times, and `/keysets` shows both ids. The audit is unchanged.
+Expected: `key rotation: keyset <new> (epoch 1) is now current; 507d6862e19bf815 (epoch 0) is previous`, then `previous keyset 507d6862e19bf815 (epoch 0), retires at <time>`. The wallet reads the rotation window and the keysets over AIR (step 45 runs it); the mint's `GET /rotation` and `/keysets` are gone from HTTP. The audit is unchanged.
 
 ### 45. The wallet rolls its notes over (T4)
 
-At startup the wallet reads the ESP mint's rotation and swaps notes from the previous set to the current one. It needs the mint's address (T4):
+At startup the wallet reads the ESP mint's rotation over AIR and swaps notes from the previous set to the current one. It uses the AIR settings exported in step 5 (T4):
 
 ```
-export ECASH_ESP_URL=http://127.0.0.1:3100
 ECASH_WALLET_FILE=/tmp/wallet-rot.json cargo run -q -- --regtest balance
 ```
 
@@ -785,16 +785,15 @@ Expected: `rollover refused, notes freed: : input 0: the note is already spent`,
 
 ### 47. The old key set retires, live (T1, then T4)
 
-The mint needs no restart. At the end of the previous set's life (the `retires` time in `/rotation`, here 1792166073), it deletes the key set and its spent list and lists the id as retired:
+The mint needs no restart. At the end of the previous set's life (the `retires` time in the rotation window, here 1792166073), it deletes the key set and its spent list and lists the id as retired:
 
 ```
-curl -s http://127.0.0.1:3100/rotation | python3 -m json.tool
 ECASH_WALLET_FILE=/tmp/wallet-rot.pre.json cargo run -q -- --regtest balance
 ECASH_WALLET_FILE=/tmp/wallet-rot.json cargo run -q -- --regtest balance
 curl -s http://127.0.0.1:3100/audit; echo
 ```
 
-Expected: `/rotation` shows epoch 2 as current, `5e81c980bed405b1` (epoch 1) as previous and `507d…` gone. The stale wallet says `2 note(s) expired: their key set was retired at a rotation before they were rolled over, and they are lost (not counted in the balance)` and shows `esp  0`. The other wallet rolls its notes over again (`rolled over 2 note(s) to the current key set`) and keeps 2×10^11. The audit rose by 2×10^11 on each side for the second rollover (`{"issued":3198787000000,"outstanding":500000000000,"redeemed":2698787000000}`).
+Expected: the mint now has epoch 2 as current, `5e81c980bed405b1` (epoch 1) as previous and `507d…` gone (the wallet's `balance` reads the window over AIR; there is no `GET /rotation` to `curl` any more). The stale wallet says `2 note(s) expired: their key set was retired at a rotation before they were rolled over, and they are lost (not counted in the balance)` and shows `esp  0`. The other wallet rolls its notes over again (`rolled over 2 note(s) to the current key set`) and keeps 2×10^11. The audit rose by 2×10^11 on each side for the second rollover (`{"issued":3198787000000,"outstanding":500000000000,"redeemed":2698787000000}`).
 
 ### 48. FSP key rotation (T1, T5, T4)
 
@@ -818,7 +817,7 @@ for d in .psp-mint .esp-mint .fsp-mint; do mv ~/$d ~/$d.run-20261016; done
 mv ~/.ecash-wallet ~/.ecash-wallet.run-20261016
 rm -f /tmp/handover*.json /tmp/wallet-service*.json /tmp/wallet-rot*.json
 rm -rf /tmp/fsp-export /tmp/fsp-export2
-unset ECASH_ESP_URL
+unset ECASH_AIR_SERVER ECASH_AIR_HOST ECASH_AIR_PSP_DID ECASH_AIR_ESP_DID AIR_SERVER ESP_DID
 ```
 
 The node's regtest folder moves aside in step 1 of the next run. The copies `~/.esp-mint.pre-rotation` and `~/.fsp-mint.pre-rotation` made in steps 44 and 48 are the state from just before the rotations, and can be removed when this run's data is no longer needed. Delete `~/.esp-mint/esp-mint.toml` if you restore any of it, so the 365-day maturity applies again.

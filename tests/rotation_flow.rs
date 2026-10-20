@@ -1,13 +1,21 @@
 //! The wallet's automatic, staggered rollover of PSP and ESP against real
-//! psp-mint and esp-mint servers that rotate their keys (fixed clocks).
+//! psp-mint and esp-mint servers that rotate their keys (fixed clocks), reached
+//! over AIR on their real listeners (see `common/mod.rs`). The AIR client always
+//! dials port 5702, so these tests need that port free, and they take turns on
+//! one `air_server`; they are built only with the `air-listener-tests` feature.
+
+mod common;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
-use axum::Router;
+use ecash_wallet::config::AirSettings;
+use ecash_wallet::mint_info::{
+    psp_claim_keys, psp_post, psp_window, rotation_sync, send_transfer, sync_esp_keysets,
+};
 use ecash_wallet::store::{HandedNote, Handover, StoredNote, WalletData};
-use ecash_wallet::{Kind, Wallet, http};
+use ecash_wallet::{Kind, Wallet};
 use esp_mint::exchange::{Burn, Psp};
 use esp_mint::server::EspState;
 use esp_mint::terms::Terms;
@@ -16,7 +24,13 @@ use mint_types::{Amount, BlindNonce, MintInput, MintOutput, Nonce, Note};
 use rand::rngs::OsRng;
 use secp256k1::{Keypair, SECP256K1};
 use sp_wire::ServiceDid;
-use tokio::runtime::Runtime;
+
+use common::{EspAt, PspAt};
+
+/// What the wallet's records call the PSP and the ESP (keys for their live
+/// keysets and swap times). Nothing dials them: both are reached by DID.
+const PSP_RECORD: &str = "http://127.0.0.1:3000";
+const ESP_RECORD: &str = "http://127.0.0.1:3100";
 
 const T: u64 = 1_800_000_000;
 const H: u64 = 3600;
@@ -38,46 +52,36 @@ fn scratch(name: &str) -> PathBuf {
     d
 }
 
-fn serve(rt: &Runtime, app: Router) -> String {
-    let l = rt
-        .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
-        .unwrap();
-    let a = l.local_addr().unwrap();
-    rt.spawn(async move { axum::serve(l, app).await.unwrap() });
-    format!("http://{a}")
-}
-
 struct PspMint {
-    url: String,
     state: Arc<AppState>,
     rot: psp_mint::server::SharedRotating,
+    /// Its AIR listener, and the turn on the shared server. Last.
+    at: PspAt,
 }
 
-fn start_psp(rt: &Runtime, dir: &Path) -> PspMint {
+fn start_psp(dir: &Path) -> PspMint {
     let d = dir.join("psp");
     let (rotor, logic) =
         psp_mint::rotation::Rotor::open_at(&d, Amount::from_units(1024), 1, 1, T).unwrap();
     let rot =
         psp_mint::server::Rotating::new(rotor, psp_mint::rotation::Rollovers::open(&d).unwrap());
     let state = psp_mint::server::app_state(logic);
-    let melts = Arc::new(Mutex::new(
-        psp_mint::melts::MeltLog::open(&d.join("melt_memos.json")).unwrap(),
-    ));
-    let app = psp_mint::server::router_full(
+    // The listener keeps its state in a folder of its own, outside `dir`, which a
+    // test may remove while the listener is still running.
+    let at = PspAt::new(
         Arc::clone(&state),
-        psp_mint::server::Health::new(100),
-        melts,
-        Default::default(),
-        Some(Arc::clone(&rot)),
+        Arc::clone(&rot),
+        &scratch("airstate-psp"),
     );
-    PspMint {
-        url: serve(rt, app),
-        state,
-        rot,
-    }
+    PspMint { state, rot, at }
 }
 
 impl PspMint {
+    /// The wallet's `[air]` settings for this PSP.
+    fn air(&self) -> AirSettings {
+        self.at.air(10, 3)
+    }
+
     fn set_clock(&self, t: u64) {
         self.rot
             .rotor
@@ -155,34 +159,34 @@ fn file_text(w: &Wallet) -> String {
 
 #[test]
 fn psp_rolls_over_after_its_staggered_time_and_the_time_is_then_forgotten() {
-    let rt = Runtime::new().unwrap();
     let dir = scratch("psp");
-    let m = start_psp(&rt, &dir);
+    let m = start_psp(&dir);
+    let air = m.air();
     let a = m.note(4);
     let b = m.note(1);
     let mut w = wallet_with(&dir, "w", vec![a.clone(), b.clone()]);
     // Before any rotation: one set, nothing to do, nothing scheduled.
-    let log = http::rotation_sync(&mut w, Kind::Psp, &m.url).unwrap();
+    let log = rotation_sync(&mut w, &air, Kind::Psp, PSP_RECORD).unwrap();
     assert!(log.is_empty(), "{log:?}");
     assert_eq!(w.swap_schedule_len(), 0);
     assert_eq!(w.epoch_of(&w.notes()[0]), Some(0));
 
     // The rotation: one random swap time, stored, inside the window.
     m.set_clock(T + H);
-    let win = http::fetch_window(&m.url).unwrap();
+    let win = psp_window(&mut w, &air).unwrap();
     assert_eq!((win.current_epoch, win.previous_epoch), (1, Some(0)));
     let start = win.current_starts.unwrap();
-    let at = w.swap_time(Kind::Psp, &m.url, &win).unwrap();
+    let at = w.swap_time(Kind::Psp, PSP_RECORD, &win).unwrap();
     // Strictly after the start: a delay of 0 would make a wallet that syncs the
     // second the set starts swap at once, and this test would then see no
     // "will be rolled over" step to wait through.
     assert!(at > start && at <= start + 18, "0.5% of a 1-hour period");
     assert_eq!(
-        w.swap_time(Kind::Psp, &m.url, &win).unwrap(),
+        w.swap_time(Kind::Psp, PSP_RECORD, &win).unwrap(),
         at,
         "drawn once"
     );
-    let log = http::rotation_sync(&mut w, Kind::Psp, &m.url).unwrap();
+    let log = rotation_sync(&mut w, &air, Kind::Psp, PSP_RECORD).unwrap();
     for l in &log {
         assert!(
             !l.contains(&at.to_string()),
@@ -193,7 +197,7 @@ fn psp_rolls_over_after_its_staggered_time_and_the_time_is_then_forgotten() {
     // Past the swap time: rolled over without a prompt, and the swap time is
     // gone in the same write that recorded the new notes.
     m.set_clock(T + H + LATER);
-    let log = http::rotation_sync(&mut w, Kind::Psp, &m.url).unwrap();
+    let log = rotation_sync(&mut w, &air, Kind::Psp, PSP_RECORD).unwrap();
     assert!(
         log.iter().any(|l| l.contains("rolled over 2 note(s)")),
         "{log:?}"
@@ -211,7 +215,7 @@ fn psp_rolls_over_after_its_staggered_time_and_the_time_is_then_forgotten() {
 
     // The next rotation retires generation 0; this wallet's notes are on 1.
     m.set_clock(T + 2 * H + LATER);
-    let log = http::rotation_sync(&mut w, Kind::Psp, &m.url).unwrap();
+    let log = rotation_sync(&mut w, &air, Kind::Psp, PSP_RECORD).unwrap();
     assert!(
         log.iter().any(|l| l.contains("rolled over 2 note(s)")),
         "{log:?}"
@@ -221,19 +225,19 @@ fn psp_rolls_over_after_its_staggered_time_and_the_time_is_then_forgotten() {
 
 #[test]
 fn psp_left_offline_through_a_full_cycle_is_lost_and_its_schedule_dropped() {
-    let rt = Runtime::new().unwrap();
     let dir = scratch("psp-lost");
-    let m = start_psp(&rt, &dir);
+    let m = start_psp(&dir);
+    let air = m.air();
     let n = m.note(2);
     let mut w = wallet_with(&dir, "w", vec![n]);
-    http::rotation_sync(&mut w, Kind::Psp, &m.url).unwrap(); // stamped epoch 0
+    rotation_sync(&mut w, &air, Kind::Psp, PSP_RECORD).unwrap(); // stamped epoch 0
     m.set_clock(T + H);
-    let win = http::fetch_window(&m.url).unwrap();
-    w.swap_time(Kind::Psp, &m.url, &win).unwrap();
+    let win = psp_window(&mut w, &air).unwrap();
+    w.swap_time(Kind::Psp, PSP_RECORD, &win).unwrap();
     assert_eq!(w.swap_schedule_len(), 1);
     // Offline past the next rotation: generation 0 is deleted.
     m.set_clock(T + 2 * H);
-    let log = http::rotation_sync(&mut w, Kind::Psp, &m.url).unwrap();
+    let log = rotation_sync(&mut w, &air, Kind::Psp, PSP_RECORD).unwrap();
     assert!(log.iter().any(|l| l.contains("lost")), "{log:?}");
     assert_eq!(w.lost().len(), 1);
     assert!(w.notes().is_empty());
@@ -246,31 +250,28 @@ fn psp_left_offline_through_a_full_cycle_is_lost_and_its_schedule_dropped() {
 
 #[test]
 fn a_crash_before_the_send_or_after_the_mint_answered_is_finished_on_the_next_connection() {
-    let rt = Runtime::new().unwrap();
     let dir = scratch("psp-crash");
-    let m = start_psp(&rt, &dir);
+    let m = start_psp(&dir);
+    let air = m.air();
     let (a, b) = (m.note(1), m.note(2));
     let mut w = wallet_with(&dir, "w", vec![a.clone(), b.clone()]);
-    http::rotation_sync(&mut w, Kind::Psp, &m.url).unwrap();
+    rotation_sync(&mut w, &air, Kind::Psp, PSP_RECORD).unwrap();
     m.set_clock(T + H + LATER);
-    let win = http::fetch_window(&m.url).unwrap();
-    let old = w.prepare_rollover(Kind::Psp, &m.url, &win).unwrap();
-    w.swap_time(Kind::Psp, &m.url, &win).unwrap();
-    let ids = w.build_rollovers(Kind::Psp, &m.url, &win, old).unwrap();
-    // The mint answers, but the reply is lost.
-    let body = w.pending_rollovers()[0].body.clone();
-    let r = reqwest::blocking::Client::new()
-        .post(format!("{}/rollover", m.url))
-        .json(&body)
-        .send()
-        .unwrap();
-    assert_eq!(r.status().as_u16(), 200);
+    let win = psp_window(&mut w, &air).unwrap();
+    let old = w.prepare_rollover(Kind::Psp, PSP_RECORD, &win).unwrap();
+    w.swap_time(Kind::Psp, PSP_RECORD, &win).unwrap();
+    let ids = w.build_rollovers(Kind::Psp, PSP_RECORD, &win, old).unwrap();
+    // The mint answers, but the wallet dies before it finishes the rollover (the
+    // reply is as good as lost): the same body, sent by hand, is applied by the
+    // mint and its answer stored.
+    let body = serde_json::to_vec(&w.pending_rollovers()[0].body).unwrap();
+    psp_post(&mut w, &air, "rollover", &body).unwrap();
     drop(w);
     // Restart: the stored request is sent again and finished from the mint's
     // stored answer.
     let mut w = Wallet::open(&dir.join("w.json")).unwrap();
     assert_eq!(w.pending_rollovers()[0].id, ids[0]);
-    let log = http::rotation_sync(&mut w, Kind::Psp, &m.url).unwrap();
+    let log = rotation_sync(&mut w, &air, Kind::Psp, PSP_RECORD).unwrap();
     assert!(
         log.iter().any(|l| l.contains("rolled over 2 note(s)")),
         "{log:?}"
@@ -282,31 +283,27 @@ fn a_crash_before_the_send_or_after_the_mint_answered_is_finished_on_the_next_co
 
 #[test]
 fn a_failed_rollover_is_logged_and_retried_on_the_next_connection() {
-    let rt = Runtime::new().unwrap();
     let dir = scratch("psp-fail");
-    let m = start_psp(&rt, &dir);
+    let m = start_psp(&dir);
+    let air = m.air();
     let mut w = wallet_with(&dir, "w", vec![m.note(8)]);
-    http::rotation_sync(&mut w, Kind::Psp, &m.url).unwrap();
+    rotation_sync(&mut w, &air, Kind::Psp, PSP_RECORD).unwrap();
     m.set_clock(T + H + LATER);
-    let win = http::fetch_window(&m.url).unwrap();
-    let old = w.prepare_rollover(Kind::Psp, &m.url, &win).unwrap();
-    w.swap_time(Kind::Psp, &m.url, &win).unwrap();
-    w.build_rollovers(Kind::Psp, &m.url, &win, old).unwrap();
-    // The mint is unreachable: point the stored rollover at a dead port.
-    let dead = "http://127.0.0.1:1".to_string();
-    let mut data: WalletData = serde_json::from_str(&file_text(&w)).unwrap();
-    data.pending_rollovers[0].url = dead.clone();
-    std::fs::write(w.path(), serde_json::to_vec(&data).unwrap()).unwrap();
-    let mut w = Wallet::open(w.path()).unwrap();
-    let _ = http::rotation_sync(&mut w, Kind::Psp, &dead);
+    let win = psp_window(&mut w, &air).unwrap();
+    let old = w.prepare_rollover(Kind::Psp, PSP_RECORD, &win).unwrap();
+    w.swap_time(Kind::Psp, PSP_RECORD, &win).unwrap();
+    w.build_rollovers(Kind::Psp, PSP_RECORD, &win, old).unwrap();
+    // The mint is not answering: one short try, then "unreachable". The request
+    // is kept in the wallet file.
+    m.at.silence();
+    let quick = m.at.air(1, 1);
+    let _ = rotation_sync(&mut w, &quick, Kind::Psp, PSP_RECORD);
     assert_eq!(w.pending_rollovers().len(), 1, "kept for the retry");
     assert_eq!(w.swap_schedule_len(), 1, "kept until the swap is done");
-    // Back online.
-    let mut data: WalletData = serde_json::from_str(&file_text(&w)).unwrap();
-    data.pending_rollovers[0].url = m.url.clone();
-    std::fs::write(w.path(), serde_json::to_vec(&data).unwrap()).unwrap();
+    // Back online: the next connection carries on with the kept request.
+    m.at.listen();
     let mut w = Wallet::open(w.path()).unwrap();
-    let log = http::rotation_sync(&mut w, Kind::Psp, &m.url).unwrap();
+    let log = rotation_sync(&mut w, &air, Kind::Psp, PSP_RECORD).unwrap();
     assert!(
         log.iter().any(|l| l.contains("rolled over 1 note(s)")),
         "{log:?}"
@@ -336,7 +333,7 @@ fn service() -> ServiceDid {
 /// A rotating ESP mint (1-hour periods from `T`) and three notes of its
 /// first set for `service()`: 4 and 4 on day 100, 2 on day 200 (ESP notes are
 /// powers of two).
-fn start_esp(rt: &Runtime, dir: &Path) -> (Arc<EspState>, String, Vec<(u64, HandedNote)>) {
+fn start_esp(dir: &Path) -> (EspAt, Vec<(u64, HandedNote)>) {
     let d = dir.join("esp");
     let (rotor, logic) = esp_mint::rotation::Rotor::open_at(&d, 1, 1, T).unwrap();
     let master = rotor.current.master.clone();
@@ -354,7 +351,6 @@ fn start_esp(rt: &Runtime, dir: &Path) -> (Arc<EspState>, String, Vec<(u64, Hand
         rollovers: Some(Mutex::new(esp_mint::rotation::Rollovers::open(&d).unwrap())),
         rotor: Some(Mutex::new(rotor)),
     });
-    let url = serve(rt, esp_mint::server::router(Arc::clone(&state)));
     let mut notes = Vec::new();
     for (units, day) in [(4u64, 100u64), (4, 100), (2, 200)] {
         let terms = Terms {
@@ -391,14 +387,16 @@ fn start_esp(rt: &Runtime, dir: &Path) -> (Arc<EspState>, String, Vec<(u64, Hand
             },
         ));
     }
-    (state, url, notes)
+    // The listener keeps its state in a folder of its own, outside `dir`.
+    (EspAt::new(state, &scratch("airstate-esp")), notes)
 }
 
 #[test]
 fn esp_rolls_over_keeping_its_service_and_day() {
-    let rt = Runtime::new().unwrap();
     let dir = scratch("esp");
-    let (state, url, notes) = start_esp(&rt, &dir);
+    let (esp, notes) = start_esp(&dir);
+    let air = esp.air(10, 3);
+    let state = Arc::clone(&esp.state);
     let mut w = Wallet::open(&dir.join("w.json")).unwrap();
     for day in [100, 200] {
         w.receive_handover(&Handover {
@@ -412,10 +410,10 @@ fn esp_rolls_over_keeping_its_service_and_day() {
         })
         .unwrap();
     }
-    http::rotation_sync(&mut w, Kind::Esp, &url).unwrap();
+    rotation_sync(&mut w, &air, Kind::Esp, ESP_RECORD).unwrap();
     let clock = Arc::clone(&state.rotor.as_ref().unwrap().lock().unwrap().clock);
     clock.store(T + H + LATER, Ordering::SeqCst);
-    let log = http::rotation_sync(&mut w, Kind::Esp, &url).unwrap();
+    let log = rotation_sync(&mut w, &air, Kind::Esp, ESP_RECORD).unwrap();
     assert!(
         log.iter().filter(|l| l.contains("rolled over")).count() == 2,
         "one per day: {log:?}"
@@ -473,9 +471,8 @@ fn settle_now(
 
 #[test]
 fn purchases_around_a_psp_rotation_are_claimed_with_the_keys_of_the_set_that_signed() {
-    let rt = Runtime::new().unwrap();
     let dir = scratch("psp-claim");
-    let m = start_psp(&rt, &dir);
+    let m = start_psp(&dir);
     let _ = m.note(1);
     let mint_key = sp_wire::seal::SecretKey::new();
     let mut w = Wallet::open(&dir.join("w.json")).unwrap();
@@ -488,11 +485,12 @@ fn purchases_around_a_psp_rotation_are_claimed_with_the_keys_of_the_set_that_sig
     let b = w
         .build_psp_payload(&[1], &reply, &mint_key.public_key())
         .unwrap();
-    let old = http::fetch_window(&m.url).unwrap().current_id;
+    let air = m.air();
+    let old = psp_window(&mut w, &air).unwrap().current_id;
     let text_a = settle_now(&m, &dir, &mint_key, "aa", a.payload);
 
     m.set_clock(T + H);
-    let win = http::fetch_window(&m.url).unwrap();
+    let win = psp_window(&mut w, &air).unwrap();
     assert_ne!(win.current_id, old);
     let text_b = settle_now(&m, &dir, &mint_key, "bb", b.payload);
 
@@ -505,7 +503,7 @@ fn purchases_around_a_psp_rotation_are_claimed_with_the_keys_of_the_set_that_sig
     // ... and each is claimed with that set's keys: `a` with the previous
     // set's, though the current set is another.
     for text in [&text_a, &text_b] {
-        let keys = http::psp_claim_keys(&m.url, text).unwrap();
+        let keys = psp_claim_keys(&mut w, &air, text).unwrap();
         let sigs = ecash_wallet::psp::parse_signatures(text).unwrap();
         w.claim_psp(&w.ours(&sigs), &keys).unwrap();
     }
@@ -520,9 +518,9 @@ fn purchases_around_a_psp_rotation_are_claimed_with_the_keys_of_the_set_that_sig
     assert_eq!(w.psp_keyset_of(&by_amount(4)).unwrap(), old);
     assert_eq!(w.psp_keyset_of(&by_amount(1)).unwrap(), win.current_id);
     // The notes are good: the previous-set note rolls over to the current set.
-    http::rotation_sync(&mut w, Kind::Psp, &m.url).unwrap();
+    rotation_sync(&mut w, &air, Kind::Psp, PSP_RECORD).unwrap();
     m.set_clock(T + H + LATER);
-    let log = http::rotation_sync(&mut w, Kind::Psp, &m.url).unwrap();
+    let log = rotation_sync(&mut w, &air, Kind::Psp, PSP_RECORD).unwrap();
     assert!(
         log.iter().any(|l| l.contains("rolled over 1 note")),
         "{log:?}"
@@ -532,16 +530,17 @@ fn purchases_around_a_psp_rotation_are_claimed_with_the_keys_of_the_set_that_sig
     // After the next rotation the first set is retired: a settlement it
     // signed can no longer be claimed, and the wallet says why.
     m.set_clock(T + 2 * H);
-    let _ = http::fetch_window(&m.url).unwrap();
-    let err = http::psp_claim_keys(&m.url, &text_a).unwrap_err();
+    let _ = psp_window(&mut w, &air).unwrap();
+    let err = psp_claim_keys(&mut w, &air, &text_a).unwrap_err();
     assert!(err.to_string().contains("expired"), "{err}");
 }
 
 #[test]
 fn a_transfer_built_before_the_esp_mint_rotated_is_signed_by_the_set_it_names() {
-    let rt = Runtime::new().unwrap();
     let dir = scratch("esp-stale");
-    let (state, url, notes) = start_esp(&rt, &dir);
+    let (esp, notes) = start_esp(&dir);
+    let air = esp.air(10, 3);
+    let state = Arc::clone(&esp.state);
     let mut w = Wallet::open(&dir.join("w.json")).unwrap();
     w.receive_handover(&Handover {
         service: service(),
@@ -553,7 +552,7 @@ fn a_transfer_built_before_the_esp_mint_rotated_is_signed_by_the_set_it_names() 
             .collect(),
     })
     .unwrap();
-    http::sync_esp_keysets(&mut w, &url).unwrap();
+    sync_esp_keysets(&mut w, &air, ESP_RECORD).unwrap();
     let old = w.esp_output_keyset();
     // The mint rotates; the wallet's cached keyset is now the previous one,
     // which the mint still signs with.
@@ -564,7 +563,7 @@ fn a_transfer_built_before_the_esp_mint_rotated_is_signed_by_the_set_it_names() 
         .unwrap();
     assert_eq!(built.request.keyset, old, "built from the stale cache");
     // The wallet kept the keyset with the pending transfer, and sends it as it is.
-    let reply = http::send_transfer(&url, &built.request).unwrap();
+    let reply = send_transfer(&mut w, &air, &built.request).unwrap();
     assert_eq!(reply.keyset, old, "signed by the set the request named");
     let done = w.finish_transfer(&built.id, &reply).unwrap();
     assert_eq!(done.esp_units, 8);
@@ -576,9 +575,8 @@ fn a_transfer_built_before_the_esp_mint_rotated_is_signed_by_the_set_it_names() 
 
 #[test]
 fn a_note_without_a_recorded_keyset_is_refused_not_guessed() {
-    let rt = Runtime::new().unwrap();
     let dir = scratch("psp-noks");
-    let m = start_psp(&rt, &dir);
+    let m = start_psp(&dir);
     let n = m.note(4);
     // Written straight to the file with no keyset, as an old wallet would have.
     let path = dir.join("old.json");

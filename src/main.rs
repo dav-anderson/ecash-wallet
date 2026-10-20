@@ -18,25 +18,32 @@ use sp_wire::ServiceDid;
 use sp_wire::seal::SecretKey as DidSecretKey;
 use sp_wire::units::ESP_PER_PSP;
 
-const DEFAULT_PSP_URL: &str = "http://127.0.0.1:3000";
-const DEFAULT_ESP_URL: &str = "http://127.0.0.1:3100";
+/// What the wallet's records call the PSP and the ESP (their live keysets, their
+/// swap times, the mint a handoff names). Neither is dialled: both are reached
+/// over AIR, by DID. They are the URLs older wallet files recorded for the
+/// default mints, so the records in those files are still found.
+const PSP_RECORD: &str = "http://127.0.0.1:3000";
+const ESP_RECORD: &str = "http://127.0.0.1:3100";
 
 const USAGE: &str = "\
 ecash-wallet [--wallet FILE] [--config FILE] [--regtest|--signet|--testnet] <command>
 
   The network defaults to mainnet (--mainnet may be given; at most one network
-  flag). Before talking to a mint the wallet asks
-  its GET /health which network it is on and refuses if it is another.
+  flag). Before talking to a mint the wallet asks it which network it is on
+  and refuses if it is another. The PSP and the ESP are asked over AIR, so
+  every command that talks to either needs air.server and air.host (see the
+  end of this text).
 
-  buy-psp --mint-key HEX [--reply-did HEX] [--psp-url URL] AMOUNT...
+  buy-psp --mint-key HEX [--reply-did HEX] [--sync] AMOUNT...
       Make the encrypted payload for a PSP purchase and print it as hex, for
       the OP_RETURN. AMOUNT is each note's size in PSP (a power of two). The
-      payload names the PSP's current keyset, read from --psp-url (or as last
-      seen), so the mint signs with it while it is live.
-  claim-psp [--psp-url URL] [--file FILE|-] [BLIND_NONCE:SIGNATURE...]
+      payload names the PSP's current keyset. With --sync the wallet asks the
+      PSP for it over AIR first; without, it uses the one last seen (and
+      sends nothing).
+  claim-psp [--file FILE|-] [BLIND_NONCE:SIGNATURE...]
       Turn the PSP's signatures into notes. Paste the PSP's output into a file,
       or pass pairs. With neither, reads standard input.
-  exchange --service DID --psp N [--amounts A,B,C] [--esp-url URL] [--resume ID]
+  exchange --service DID --psp N [--amounts A,B,C] [--resume ID]
       Exchange at least N PSP for ESP bound to a service (its 33-byte AIR DID,
       66 hex characters). The smallest exchange is 1 PSP. The mint's exchange is exact, so the
       wallet spends whole PSP notes worth at least N and asks for all of their
@@ -52,7 +59,7 @@ ecash-wallet [--wallet FILE] [--config FILE] [--regtest|--signet|--testnet] <com
       a development stand-in for an AIR message to the service.
   receive FILE
       As the service: take a hand-over file into this wallet.
-  transfer --service-key HEX [--day D] [--amounts A,B,C] [--esp-url URL] [--resume ID]
+  transfer --service-key HEX [--day D] [--amounts A,B,C] [--resume ID]
       As the service (HEX is its 32 byte secret key): swap every free ESP note
       this wallet holds for that service and day for fresh notes only it
       controls, with the same service, the same day and the same total.
@@ -61,7 +68,7 @@ ecash-wallet [--wallet FILE] [--config FILE] [--regtest|--signet|--testnet] <com
       --resume sends a pending request again.
   balance
       What the wallet holds and what is waiting.
-  handoff export-psp --to DID --psp N [--psp-url URL] [--out FILE]
+  handoff export-psp --to DID --psp N [--out FILE]
       A PSP handoff, developer to user (after an in-app purchase): free PSP
       notes adding up to exactly N, sealed to the recipient's DID public key
       (DID, 66 hex characters), so only the holder of the matching secret key
@@ -110,7 +117,7 @@ ecash-wallet [--wallet FILE] [--config FILE] [--regtest|--signet|--testnet] <com
       Merge a copy of this wallet retrieved from storage (a wallet file) into
       this one: notes united, anything spent in either copy stays spent,
       pending requests merged once each. Save this wallet back to storage.
-  redeem --service-key HEX --memo TEXT [--max-bytes N] [--esp-url URL]
+  redeem --service-key HEX --memo TEXT [--max-bytes N]
       As the service (HEX is its 32 byte secret key): redeem every free ESP
       note for that service whose redeemable-after day has come, mixed days
       allowed, for a payout to TEXT (for example btc:ADDRESS). The fee rate and
@@ -118,9 +125,9 @@ ecash-wallet [--wallet FILE] [--config FILE] [--regtest|--signet|--testnet] <com
       lowers the ceiling). A redemption over the ceiling is split into several
       requests, each with its own fee and payout entry. Shows the size and fee
       of each request before it is sent.
-  redeem --service-key HEX --resume ID [--esp-url URL]
+  redeem --service-key HEX --resume ID
       Send a pending redemption again (after a lost reply or a fault).
-  redeem --collect [--esp-url URL]
+  redeem --collect
       Ask the mint about every redemption queued for payout: completed ones end,
       declined ones give the reissued notes back with the operator's reason.
   config
@@ -158,21 +165,18 @@ ecash-wallet [--wallet FILE] [--config FILE] [--regtest|--signet|--testnet] <com
 The wallet file is --wallet, else $ECASH_WALLET_FILE, else
 ~/.ecash-wallet/<network>/wallet.json (main, regtest, signet, testnet; an old
 ~/.ecash-wallet/wallet.json is refused until `ecash-wallet migrate` moves it to
-regtest/). URLs default to $ECASH_PSP_URL / $ECASH_ESP_URL,
-else http://127.0.0.1:3000 and http://127.0.0.1:3100.
+regtest/).
 
-The PSP's wire version and network (what its GET /health says), its keys
-(GET /keys), its keysets (GET /keysets), its rotation window (GET /rotation) and
-its rollover and check-state (POST /rollover, POST /check-state), and the ESP's
-wire version and network, keysets, rotation window, fees (GET /fees), rollover,
-exchange, transfer and redeem (POST /rollover, /exchange, /transfer, /redeem), are
-asked over AIR instead of HTTP when config.toml's [air] section (or
-ECASH_AIR_SERVER and ECASH_AIR_HOST) names an AIR server and its host. The PSP
-and the ESP each have their own DID, built in (PLACEHOLDERS until the first SPI
-deploy, and the wallet says so whenever one is in use); air.psp_did
-(ECASH_AIR_PSP_DID) and air.esp_did (ECASH_AIR_ESP_DID) override them. Every
-other call is HTTP (the ESP's /audit and the FSP's calls among them). `config`
-prints every setting.";
+The PSP and the ESP are reached over AIR only: their mint info (which network and
+wire version), keys, keysets, rotation window, fees, rollover, check-state,
+exchange, transfer and redeem are all AIR requests. config.toml's [air] section
+(or ECASH_AIR_SERVER and ECASH_AIR_HOST) must name the AIR server and its host;
+without them a command that talks to the PSP or the ESP fails, saying which
+setting is missing. The PSP and the ESP each have their own DID, built in
+(PLACEHOLDERS until the first SPI deploy, and the wallet says so whenever one is
+in use); air.psp_did (ECASH_AIR_PSP_DID) and air.esp_did (ECASH_AIR_ESP_DID)
+override them. The FSP's calls are HTTP, to the FSP mint (--fsp-url, else the one
+used before, else $ECASH_FSP_URL). `config` prints every setting.";
 
 /// The arguments left after flags are taken out.
 struct Args(Vec<String>);
@@ -189,6 +193,17 @@ impl Args {
         let value = self.0.remove(at + 1);
         self.0.remove(at);
         Ok(Some(value))
+    }
+
+    /// Take `--name`, which has no value, if present.
+    fn switch(&mut self, name: &str) -> bool {
+        match self.0.iter().position(|a| a == name) {
+            Some(at) => {
+                self.0.remove(at);
+                true
+            }
+            None => false,
+        }
     }
 
     fn rest(self) -> Vec<String> {
@@ -291,74 +306,58 @@ fn take_network(args: &mut Args) -> Result<&'static str, WalletError> {
     Ok(found.unwrap_or("main"))
 }
 
-/// The `[air]` settings of this run, set once in `run`. Empty (AIR off) until then.
+/// The `[air]` settings of this run, set once in `run`. Empty until then, and a
+/// call to the PSP or the ESP made with them empty fails, naming what is missing.
 static AIR: std::sync::OnceLock<AirSettings> = std::sync::OnceLock::new();
 
-/// The `[air]` settings of this run (empty before `run` sets them: AIR off).
+/// The `[air]` settings of this run (empty before `run` sets them).
 fn air_settings() -> AirSettings {
     AIR.get().cloned().unwrap_or_default()
 }
 
-/// What the first check of each mint (the PSP, the ESP) in this run came to,
-/// with the URL it was for: a mint is checked at startup and again by the
-/// command, and with AIR a dead mint costs `air.attempts` tries of
-/// `air.reply_wait_secs` each time, so the answer is kept for the run. (HTTP is
-/// checked every time, as before.)
-static CHECKED: std::sync::Mutex<Vec<(config::Party, String, Result<(), String>)>> =
+/// What the first check of each mint (the PSP, the ESP) in this run came to: a
+/// mint is checked at startup and again by the command, and a dead mint costs
+/// `air.attempts` tries of `air.reply_wait_secs` each time, so the answer is
+/// kept for the run.
+static CHECKED: std::sync::Mutex<Vec<(config::Party, Result<(), String>)>> =
     std::sync::Mutex::new(Vec::new());
 
-/// Check a mint's wire version and network before anything else is sent to it:
-/// over AIR when `[air]` is configured (to that mint's own DID: see
-/// `ecash_wallet::mint_info`), else over HTTP.
-fn verify_mint_of(
-    wallet: &mut Wallet,
-    party: config::Party,
-    base: &str,
-) -> Result<(), WalletError> {
+/// Check a mint's wire version and network over AIR before anything else is sent
+/// to it (to that mint's own DID: see `ecash_wallet::mint_info`).
+fn verify_mint_of(wallet: &mut Wallet, party: config::Party) -> Result<(), WalletError> {
     let air = air_settings();
-    let check = |wallet: &mut Wallet| match party {
-        config::Party::Psp => ecash_wallet::mint_info::verify_psp(wallet, &air, base, network()),
-        config::Party::Esp => ecash_wallet::mint_info::verify_esp(wallet, &air, base, network()),
-    };
-    if !air.is_configured() {
-        return check(wallet);
-    }
     let mut checked = CHECKED.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((_, _, result)) = checked.iter().find(|(p, u, _)| *p == party && u == base) {
+    if let Some((_, result)) = checked.iter().find(|(p, _)| *p == party) {
         return result.clone().map_err(WalletError::Mint);
     }
-    let result = check(wallet);
+    let result = match party {
+        config::Party::Psp => ecash_wallet::mint_info::verify_psp(wallet, &air, network()),
+        config::Party::Esp => ecash_wallet::mint_info::verify_esp(wallet, &air, network()),
+    };
     checked.push((
         party,
-        base.to_string(),
         result.as_ref().map(|_| ()).map_err(|e| e.to_string()),
     ));
     result
 }
 
-/// Check the PSP (`verify_mint_of`).
-fn verify_psp(wallet: &mut Wallet, base: &str) -> Result<(), WalletError> {
-    verify_mint_of(wallet, config::Party::Psp, base)
+/// Check the PSP (`verify_mint_of`) and give the name its records use
+/// ([`PSP_RECORD`]).
+fn psp_base(wallet: &mut Wallet) -> Result<&'static str, WalletError> {
+    verify_mint_of(wallet, config::Party::Psp)?;
+    Ok(PSP_RECORD)
 }
 
-/// The PSP's URL, after checking it (`verify_psp`).
-fn psp_base(wallet: &mut Wallet, flag: Option<String>) -> Result<String, WalletError> {
-    let base = url(flag, "ECASH_PSP_URL", DEFAULT_PSP_URL);
-    verify_psp(wallet, &base)?;
-    Ok(base)
+/// Check the ESP (`verify_mint_of`) and give the name its records use
+/// ([`ESP_RECORD`]).
+fn esp_base(wallet: &mut Wallet) -> Result<&'static str, WalletError> {
+    verify_mint_of(wallet, config::Party::Esp)?;
+    Ok(ESP_RECORD)
 }
 
-/// The ESP's URL, after checking it: over AIR to the ESP's own DID when `[air]`
-/// is configured, else `GET /health`.
-fn esp_base(wallet: &mut Wallet, flag: Option<String>) -> Result<String, WalletError> {
-    let base = url(flag, "ECASH_ESP_URL", DEFAULT_ESP_URL);
-    verify_mint_of(wallet, config::Party::Esp, &base)?;
-    Ok(base)
-}
-
-/// A mint's URL, after checking (`GET /health`) that the mint is on this
-/// run's network. Nothing is sent to a mint on another network. (Not for the
-/// PSP or the ESP, whose checks can go over AIR: see `psp_base`, `esp_base`.)
+/// An FSP mint's URL, after checking (`GET /health`) that the mint is on this
+/// run's network. Nothing is sent to a mint on another network. (The PSP and the
+/// ESP are checked over AIR: see `psp_base`, `esp_base`.)
 fn mint_url(flag: Option<String>, var: &str, default: &str) -> Result<String, WalletError> {
     let base = url(flag, var, default);
     http::verify_mint(&base, network())?;
@@ -369,12 +368,12 @@ fn buy_psp(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
     let mint_key = args
         .flag("--mint-key")?
         .ok_or_else(|| WalletError::Invalid("--mint-key HEX is required".into()))?;
-    if let Some(base) = args.flag("--psp-url")? {
-        verify_psp(wallet, &base)?;
+    if args.switch("--sync") {
+        let base = psp_base(wallet)?;
         let air = air_settings();
-        let w = ecash_wallet::mint_info::psp_window(wallet, &air, &base)?;
-        wallet.note_live_keysets(&base, &w)?;
-        ecash_wallet::mint_info::sync_psp_limits(wallet, &air, &base)?;
+        let w = ecash_wallet::mint_info::psp_window(wallet, &air)?;
+        wallet.note_live_keysets(base, &w)?;
+        ecash_wallet::mint_info::sync_psp_limits(wallet, &air)?;
     }
     let reply = match args.flag("--reply-did")? {
         Some(text) => parse_did(&text)?,
@@ -398,7 +397,7 @@ fn buy_psp(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
 }
 
 fn claim_psp(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
-    let base = psp_base(wallet, args.flag("--psp-url")?)?;
+    psp_base(wallet)?;
     let file = args.flag("--file")?;
     let pairs = args.rest();
     let text = match (file, pairs.is_empty()) {
@@ -432,7 +431,7 @@ fn claim_psp(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
     }
     // Unblind with the keys of the keyset the PSP printed; older output names
     // none and was signed with the keys of `GET /keys`.
-    let keys = ecash_wallet::mint_info::psp_claim_keys(wallet, &air_settings(), &base, &text)?;
+    let keys = ecash_wallet::mint_info::psp_claim_keys(wallet, &air_settings(), &text)?;
     let claimed = wallet.claim_psp(&signatures, &keys)?;
     println!(
         "claimed {} PSP in {} note(s); {} output(s) still waiting",
@@ -444,7 +443,7 @@ fn claim_psp(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
 }
 
 fn exchange(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
-    let base = esp_base(wallet, args.flag("--esp-url")?)?;
+    let base = esp_base(wallet)?;
     let resume = args.flag("--resume")?;
     let built: ExchangeBuild = match resume {
         Some(id) => {
@@ -487,12 +486,12 @@ fn exchange(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
             args.done()?;
             let service = service_did(&service)?;
             ecash_wallet::mint_info::sync_esp_keysets(wallet, &air_settings(), &base)?;
-            ecash_wallet::mint_info::sync_esp_limits(wallet, &air_settings(), &base)?;
+            ecash_wallet::mint_info::sync_esp_limits(wallet, &air_settings())?;
             wallet.build_exchange(psp, service, amounts.as_deref())?
         }
     };
     eprintln!("exchange {} (spends {} PSP)", built.id, built.psp_spent);
-    match ecash_wallet::mint_info::send_exchange(wallet, &air_settings(), &base, &built.request) {
+    match ecash_wallet::mint_info::send_exchange(wallet, &air_settings(), &built.request) {
         Ok(response) => {
             let done = wallet.finish_exchange(&built.id, &response)?;
             println!(
@@ -602,8 +601,7 @@ fn hand_over(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
     }
     // The mint's note limit is read when it can be; a hand-over works offline,
     // and then the mint's own check decides.
-    let esp = url(None, "ECASH_ESP_URL", DEFAULT_ESP_URL);
-    if let Err(e) = ecash_wallet::mint_info::sync_esp_limits(wallet, &air_settings(), &esp) {
+    if let Err(e) = ecash_wallet::mint_info::sync_esp_limits(wallet, &air_settings()) {
         eprintln!("the mint's note limit was not read ({e}); the mint will check it");
     }
     let handover = wallet.hand_over_esp(service, units, day)?;
@@ -644,7 +642,7 @@ fn receive(wallet: &mut Wallet, args: Args) -> Result<(), WalletError> {
 }
 
 fn transfer(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
-    let base = esp_base(wallet, args.flag("--esp-url")?)?;
+    let base = esp_base(wallet)?;
     let resume = args.flag("--resume")?;
     // The service key signs a new transfer (not needed with --resume).
     let key = args
@@ -687,7 +685,7 @@ fn transfer(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
             };
             args.done()?;
             ecash_wallet::mint_info::sync_esp_keysets(wallet, &air_settings(), &base)?;
-            ecash_wallet::mint_info::sync_esp_limits(wallet, &air_settings(), &base)?;
+            ecash_wallet::mint_info::sync_esp_limits(wallet, &air_settings())?;
             wallet.build_transfer(&key, day, amounts.as_deref())?
         }
     };
@@ -697,7 +695,7 @@ fn transfer(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
         built.esp_units,
         built.request.inputs.len()
     );
-    match ecash_wallet::mint_info::send_transfer(wallet, &air_settings(), &base, &built.request) {
+    match ecash_wallet::mint_info::send_transfer(wallet, &air_settings(), &built.request) {
         Ok(response) => {
             let done = wallet.finish_transfer(&built.id, &response)?;
             println!(
@@ -809,7 +807,6 @@ fn print_outcome(done: &RedeemOutcome) {
 /// outputs. Returns whether it went through.
 fn send_redemption(
     wallet: &mut Wallet,
-    base: &str,
     key: Option<&SecretKey>,
     mut id: String,
 ) -> Result<(), WalletError> {
@@ -820,8 +817,7 @@ fn send_redemption(
             .find(|p| p.id == id)
             .cloned()
             .ok_or_else(|| WalletError::Unknown(format!("no pending redemption {id}")))?;
-        match ecash_wallet::mint_info::send_redeem(wallet, &air_settings(), base, &pending.body()?)
-        {
+        match ecash_wallet::mint_info::send_redeem(wallet, &air_settings(), &pending.body()?) {
             Ok(response) => {
                 let done = wallet.finish_redemption(&id, &response)?;
                 print_outcome(&done);
@@ -884,7 +880,7 @@ fn send_redemption(
 }
 
 fn redeem(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
-    let base = esp_base(wallet, args.flag("--esp-url")?)?;
+    let base = esp_base(wallet)?;
     let collect = match args.0.iter().position(|a| a == "--collect") {
         Some(at) => {
             args.0.remove(at);
@@ -904,7 +900,7 @@ fn redeem(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
             println!("no redemption is waiting for a payout");
         }
         for id in queued {
-            send_redemption(wallet, &base, None, id)?;
+            send_redemption(wallet, None, id)?;
         }
         return Ok(());
     }
@@ -914,7 +910,7 @@ fn redeem(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
     };
     if let Some(id) = args.flag("--resume")? {
         args.done()?;
-        return send_redemption(wallet, &base, key.as_ref(), id);
+        return send_redemption(wallet, key.as_ref(), id);
     }
     let key = key.ok_or_else(|| WalletError::Invalid("--service-key HEX is required".into()))?;
     let memo = args.flag("--memo")?.ok_or_else(|| {
@@ -925,7 +921,7 @@ fn redeem(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
         None => None,
     };
     args.done()?;
-    let mut fees = ecash_wallet::mint_info::fetch_redeem_fees(wallet, &air_settings(), &base)?;
+    let mut fees = ecash_wallet::mint_info::fetch_redeem_fees(wallet, &air_settings())?;
     if let Some(n) = max_bytes {
         fees.max_request_bytes = fees.max_request_bytes.min(n);
     }
@@ -961,7 +957,7 @@ fn redeem(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
     }
     let mut first_error = None;
     for b in built {
-        if let Err(e) = send_redemption(wallet, &base, Some(&key), b.id) {
+        if let Err(e) = send_redemption(wallet, Some(&key), b.id) {
             if let Some(line) = later_failure_line(&mut first_error, e) {
                 eprintln!("{line}");
             }
@@ -1290,14 +1286,13 @@ fn handoff_export_psp(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletE
         .flag("--psp")?
         .ok_or_else(|| WalletError::Invalid("give the amount with --psp N".into()))?;
     let psp = u128::from(number(&psp, "--psp")?);
-    let psp_url = args.flag("--psp-url")?;
     let out = args.flag("--out")?;
     args.done()?;
     check_out_file(&out)?;
     let recipient = sp_wire::seal::parse_public_key(&to)
         .map_err(|e| WalletError::Invalid(format!("--to: {e}")))?;
     let ids = wallet.select_psp_handoff(psp)?;
-    let mint = psp_base(wallet, psp_url)?;
+    let mint = psp_base(wallet)?;
     let made = wallet.export_psp_handoff(&ids, &mint, &recipient)?;
     handoff_deliver(&made, out)
 }
@@ -1485,8 +1480,8 @@ fn fsp_url(
 /// Check every FSP mint this wallet has used. Nothing is asked; problems are
 /// logged and tried again next time.
 /// At startup: keep PSP and ESP on a live key set (see `rotate.rs`), for the
-/// mints in `$ECASH_PSP_URL` / `$ECASH_ESP_URL` (or the defaults), when this
-/// wallet holds notes of that kind. Quiet when the mint is not reachable.
+/// mints (over AIR), when this wallet holds notes of that kind. Quiet when the
+/// mint is not reachable; a missing `air.server` or `air.host` is said.
 fn startup_rotation_sync(wallet: &mut Wallet) {
     for kind in [ecash_wallet::Kind::Psp, ecash_wallet::Kind::Esp] {
         let holds = wallet.notes().iter().any(|n| n.kind == kind)
@@ -1494,21 +1489,26 @@ fn startup_rotation_sync(wallet: &mut Wallet) {
         if !holds {
             continue;
         }
-        let checked = if kind == ecash_wallet::Kind::Psp {
-            psp_base(wallet, None)
+        let (name, checked) = if kind == ecash_wallet::Kind::Psp {
+            ("psp", psp_base(wallet))
         } else {
-            esp_base(wallet, None)
+            ("esp", esp_base(wallet))
         };
-        let Ok(base) = checked else {
-            continue;
+        let base = match checked {
+            Ok(base) => base,
+            Err(e @ WalletError::Invalid(_)) => {
+                eprintln!("{name}: key rotation not checked: {e}");
+                continue;
+            }
+            Err(_) => continue,
         };
-        match ecash_wallet::mint_info::rotation_sync(wallet, &air_settings(), kind, &base) {
+        match ecash_wallet::mint_info::rotation_sync(wallet, &air_settings(), kind, base) {
             Ok(lines) => {
                 for l in lines {
-                    eprintln!("{base}: {l}");
+                    eprintln!("{name}: {l}");
                 }
             }
-            Err(e) => eprintln!("{base}: key rotation check failed, retried on the next run: {e}"),
+            Err(e) => eprintln!("{name}: key rotation check failed, retried on the next run: {e}"),
         }
     }
 }
@@ -1584,11 +1584,11 @@ fn fsp(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
             let fees = http::fetch_fsp_fees(&base)?;
             // Notes from before keysets were recorded name the ESP mint's
             // live set; best effort, the Issuer refuses a missing one.
-            if let Ok(esp) = esp_base(wallet, None) {
+            if let Ok(esp) = esp_base(wallet) {
                 if let Err(e) =
-                    ecash_wallet::mint_info::sync_esp_keysets(wallet, &air_settings(), &esp)
+                    ecash_wallet::mint_info::sync_esp_keysets(wallet, &air_settings(), esp)
                 {
-                    eprintln!("esp {esp}: keysets not read: {e}");
+                    eprintln!("esp: keysets not read: {e}");
                 }
             }
             let request = wallet.build_fsp_issue(service, units, fees.issue_fee_per_byte)?;
@@ -1717,35 +1717,32 @@ fn config_command(loaded: &config::Loaded, args: Args) -> Result<(), WalletError
     println!("storage.app: {}", loaded.settings.storage_app.describe());
     println!("Storage settings only: nothing reads or writes the AIR for storage yet.");
     let air = &loaded.settings.air;
-    if air.is_configured() {
-        println!(
-            "PSP mint info, keys, keysets, rotation, rollover and check-state, and ESP mint info, keysets, rotation, fees, rollover, exchange, transfer and redeem: over AIR (air.server and air.host are set); every other call is HTTP"
-        );
-        println!(
-            "PSP DID in use: {} ({})",
-            air.psp_did().to_hex(),
-            if air.uses_builtin_did() {
-                "the built-in PLACEHOLDER"
-            } else {
-                "air.psp_did"
-            }
-        );
-        println!(
-            "ESP DID in use: {} ({})",
-            air.esp_did().to_hex(),
-            if air.uses_builtin_esp_did() {
-                "the built-in PLACEHOLDER"
-            } else {
-                "air.esp_did"
-            }
-        );
-        for warning in air.placeholder_warnings() {
-            eprintln!("{warning}");
+    println!(
+        "PSP and ESP calls (mint info, keys, keysets, rotation, fees, rollover, check-state, exchange, transfer, redeem): over AIR only; the FSP's calls are HTTP"
+    );
+    if let Err(why) = air.require() {
+        println!("WARNING: {why}");
+    }
+    println!(
+        "PSP DID in use: {} ({})",
+        air.psp_did().to_hex(),
+        if air.uses_builtin_did() {
+            "the built-in PLACEHOLDER"
+        } else {
+            "air.psp_did"
         }
-    } else {
-        println!(
-            "PSP mint info, keys, keysets, rotation, rollover and check-state, and ESP mint info, keysets, rotation, fees, rollover, exchange, transfer and redeem: over HTTP (air.server and air.host are not set)"
-        );
+    );
+    println!(
+        "ESP DID in use: {} ({})",
+        air.esp_did().to_hex(),
+        if air.uses_builtin_esp_did() {
+            "the built-in PLACEHOLDER"
+        } else {
+            "air.esp_did"
+        }
+    );
+    for warning in air.placeholder_warnings() {
+        eprintln!("{warning}");
     }
     Ok(())
 }

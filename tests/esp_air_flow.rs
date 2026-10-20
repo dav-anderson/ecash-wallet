@@ -1,15 +1,15 @@
 //! The ESP's calls over AIR, end to end: an `air_server` in this process,
 //! esp-mint's real AIR listener answering (with the same `serve` `esp-mint
 //! serve` runs), and the wallet asking, blocking, the way the command line does.
-//! Every call the wallet moved to AIR runs against a real ESP mint (rotating or
-//! not, with a stand-in PSP for the exchange) whose HTTP routes are served in the
-//! process too, so the two ways can be compared: mint info (`verify_esp`),
+//! Every call the wallet makes of the ESP runs against a real ESP mint (rotating
+//! or not, with a stand-in PSP for the exchange): mint info (`verify_esp`),
 //! keysets, fees and rotation (`sync_esp_keysets`, `sync_esp_limits`,
 //! `fetch_redeem_fees`, `esp_window`), rollover (`rotation_sync` for the ESP) and
 //! the three that spend, `send_exchange`, `send_transfer` and `send_redeem`.
 //! Refusals (a `400`, and a `409`, `413` and `404` that must not be taken for
 //! one), a mint that cannot answer, a request resent, a late reply, tampered and
-//! forged replies, HTTP with AIR off, and the built-in placeholder ESP DID.
+//! forged replies, the missing `air.server` and `air.host` (there is no HTTP
+//! form of any call), and the built-in placeholder ESP DID.
 //!
 //! The AIR client always dials port 5702 (upstream item 12), so these tests need
 //! that port free; `local_server::start` says so when it is not. One server
@@ -37,7 +37,7 @@ use ecash_wallet::mint_info::{
     sync_esp_keysets, sync_esp_limits, verify_esp, verify_psp,
 };
 use ecash_wallet::store::{HandedNote, Handover, PendingAirRequest, StoredNote, WalletData};
-use ecash_wallet::{Kind, Wallet, WalletError, http};
+use ecash_wallet::{Kind, Wallet, WalletError};
 use esp_mint::air_listener::{self, Serve, Settings};
 use esp_mint::config::{Config, Handle};
 use esp_mint::exchange;
@@ -65,8 +65,9 @@ use sp_wire::seal::SecretKey as DidKey;
 use sp_wire::{ServiceDid, WIRE_VERSION};
 
 const NETWORK: &str = "main";
-/// A URL nothing listens on: with AIR configured nothing may go to it.
-const DEAD: &str = "http://127.0.0.1:9";
+/// What the wallet's records call the ESP (a key for its live keysets and swap
+/// times). Nothing dials it.
+const RECORD: &str = "http://127.0.0.1:3100";
 /// A test amount of PSP, as in the exchange tests.
 const ONE_PSP: u64 = 100_000_000_000;
 /// A test ESP note size, a power of two.
@@ -308,12 +309,11 @@ fn serve_http(rt: &tokio::runtime::Runtime, app: Router) -> String {
     format!("http://{addr}")
 }
 
-/// A real ESP mint with its HTTP routes served in this process, a stand-in PSP
-/// beside it (for the exchange), and the listener's `serve` for it.
+/// A real ESP mint, a stand-in PSP beside it (for the exchange, served over HTTP:
+/// the ESP's own calls to the PSP are SPI-local), and the listener's `serve` for
+/// the ESP.
 struct Esp {
     _rt: tokio::runtime::Runtime,
-    /// The ESP's HTTP base URL.
-    base: String,
     state: Arc<EspState>,
     psp: Arc<AppState>,
     /// The keyset the mint started on.
@@ -372,10 +372,8 @@ fn start_esp(dir: &Path, rotating: bool, config: Config, psp_url: Option<&str>) 
         rollovers,
         in_flight: Default::default(),
     });
-    let base = serve_http(&rt, server::router(Arc::clone(&state)));
     Esp {
         _rt: rt,
-        base,
         state,
         psp,
         ks,
@@ -539,7 +537,7 @@ fn json<T: serde::Serialize>(value: &T) -> serde_json::Value {
 // ---------------------------------------------------------------- the reads
 
 #[test]
-fn the_esp_reads_over_air_are_what_the_http_routes_give() {
+fn the_esp_reads_over_air_are_the_mints_own() {
     let server = server();
     let (key, did) = mint_key();
     let dir = scratch("reads");
@@ -547,38 +545,23 @@ fn the_esp_reads_over_air_are_what_the_http_routes_give() {
     let listener = start_serving(&server, &key, &dir, esp.serve());
     let air = air_settings(&server, &did, 10, 3);
 
-    // Over AIR. The URL is dead: with AIR configured nothing goes to it.
     let mut w = open_wallet(&dir, "air");
-    verify_esp(&mut w, &air, DEAD, NETWORK).unwrap();
-    sync_esp_keysets(&mut w, &air, DEAD).unwrap();
-    sync_esp_limits(&mut w, &air, DEAD).unwrap();
-    let fees = fetch_redeem_fees(&mut w, &air, DEAD).unwrap();
-    let window = esp_window(&mut w, &air, DEAD).unwrap();
+    verify_esp(&mut w, &air, NETWORK).unwrap();
+    sync_esp_keysets(&mut w, &air, RECORD).unwrap();
+    sync_esp_limits(&mut w, &air).unwrap();
+    let fees = fetch_redeem_fees(&mut w, &air).unwrap();
+    let window = esp_window(&mut w, &air).unwrap();
     assert!(w.air_requests().is_empty(), "every request ended");
 
-    // The same over HTTP, in a wallet of its own.
-    let mut h = open_wallet(&dir, "http");
-    http::verify_mint(&esp.base, NETWORK).unwrap();
-    http::sync_esp_keysets(&mut h, &esp.base).unwrap();
-    http::sync_esp_limits(&mut h, &esp.base).unwrap();
-    let http_fees = http::fetch_redeem_fees(&esp.base).unwrap();
-    let http_window = ecash_wallet::http::fetch_window(&esp.base).unwrap();
-
     assert_eq!(w.esp_output_keyset(), esp.ks);
-    assert_eq!(w.esp_output_keyset(), h.esp_output_keyset());
-    assert_eq!(w.esp_limits(), h.esp_limits());
     assert_eq!(w.esp_limits().exchange_max_items, Some(1000));
-    assert_eq!(fees.fee_per_byte, http_fees.fee_per_byte);
-    assert_eq!(fees.max_request_bytes, http_fees.max_request_bytes);
-    assert_eq!(fees.max_memo_bytes, http_fees.max_memo_bytes);
-    assert_eq!(window.current_id, http_window.current_id);
+    assert_eq!(fees.max_memo_bytes, 256);
+    assert!(fees.max_request_bytes > 0);
     assert_eq!(window.current_id, esp.ks);
-    assert_eq!(window.previous_id, http_window.previous_id);
-    assert_eq!(window.current_epoch, http_window.current_epoch);
-    assert_eq!(window.period_hours, http_window.period_hours);
+    assert_eq!(window.period_hours, 1);
 
-    // A mint on another network is refused over AIR as over HTTP, nothing sent.
-    match verify_esp(&mut w, &air, DEAD, "regtest") {
+    // A mint on another network is refused, nothing sent.
+    match verify_esp(&mut w, &air, "regtest") {
         Err(WalletError::Invalid(why)) => {
             assert!(
                 why.contains("is on main") && why.contains("Nothing was sent"),
@@ -591,7 +574,7 @@ fn the_esp_reads_over_air_are_what_the_http_routes_give() {
 }
 
 #[test]
-fn rotation_of_a_mint_that_does_not_rotate_is_an_error_over_air_as_over_http() {
+fn rotation_of_a_mint_that_does_not_rotate_is_an_error_and_not_a_refusal() {
     let server = server();
     let (key, did) = mint_key();
     let dir = scratch("no-rotation");
@@ -600,13 +583,9 @@ fn rotation_of_a_mint_that_does_not_rotate_is_an_error_over_air_as_over_http() {
     let air = air_settings(&server, &did, 10, 3);
     let mut w = open_wallet(&dir, "w");
 
-    // HTTP says 404. Over AIR a signed refusal that says it was a 404: a plain
-    // mint error with the status, never a refusal of anything.
-    match esp_window(&mut w, &air, DEAD) {
-        Err(WalletError::Mint(why)) => assert!(why.contains("404"), "{why}"),
-        other => panic!("expected a mint error saying 404, got {other:?}"),
-    }
-    match ecash_wallet::http::fetch_window(&esp.base) {
+    // A signed refusal that says it was a 404: a plain mint error with the
+    // status, never a refusal of anything.
+    match esp_window(&mut w, &air) {
         Err(WalletError::Mint(why)) => assert!(why.contains("404"), "{why}"),
         other => panic!("expected a mint error saying 404, got {other:?}"),
     }
@@ -615,7 +594,7 @@ fn rotation_of_a_mint_that_does_not_rotate_is_an_error_over_air_as_over_http() {
         "a signed refusal ends the request"
     );
     // The keysets still answer on a mint that does not rotate.
-    sync_esp_keysets(&mut w, &air, DEAD).unwrap();
+    sync_esp_keysets(&mut w, &air, RECORD).unwrap();
     assert_eq!(w.esp_output_keyset(), esp.ks);
     listener.stop().unwrap();
 }
@@ -623,7 +602,7 @@ fn rotation_of_a_mint_that_does_not_rotate_is_an_error_over_air_as_over_http() {
 // ---------------------------------------------------------------- rollover
 
 #[test]
-fn an_esp_rotation_rollover_goes_over_air_and_ends_as_it_does_over_http() {
+fn an_esp_rotation_rollover_goes_over_air_and_ends_with_the_notes_on_the_new_keyset() {
     let server = server();
     let (key, did) = mint_key();
     let dir = scratch("roll");
@@ -631,20 +610,20 @@ fn an_esp_rotation_rollover_goes_over_air_and_ends_as_it_does_over_http() {
     let listener = start_serving(&server, &key, &dir, esp.serve());
     let air = air_settings(&server, &did, 10, 3);
 
-    // Two notes on the first keyset, in a wallet that sends over AIR.
+    // Two notes on the first keyset.
     let (a, b) = (esp.handed(ONE, PAST), esp.handed(ONE, PAST));
     let (na, nb) = (a.note, b.note);
     let mut w = open_wallet(&dir, "air");
     give(&mut w, PAST, vec![a.clone(), b.clone()]);
     assert!(
-        rotation_sync(&mut w, &air, Kind::Esp, DEAD)
+        rotation_sync(&mut w, &air, Kind::Esp, RECORD)
             .unwrap()
             .is_empty()
     );
     esp.set_clock(T0 + H);
-    rotation_sync(&mut w, &air, Kind::Esp, DEAD).unwrap(); // draws the swap time
+    rotation_sync(&mut w, &air, Kind::Esp, RECORD).unwrap(); // draws the swap time
     esp.set_clock(T0 + H + LATER);
-    let air_log = rotation_sync(&mut w, &air, Kind::Esp, DEAD).unwrap();
+    let air_log = rotation_sync(&mut w, &air, Kind::Esp, RECORD).unwrap();
     assert!(
         air_log.iter().any(|l| l.contains("rolled over 2 note(s)")),
         "{air_log:?}"
@@ -656,32 +635,14 @@ fn an_esp_rotation_rollover_goes_over_air_and_ends_as_it_does_over_http() {
     assert_eq!(w.balance().esp, u128::from(2 * ONE));
     assert!(w.pending_rollovers().is_empty());
     assert!(w.air_requests().is_empty(), "every request ended");
+    assert_eq!(w.notes().len(), 2, "the two notes were swapped for two");
     listener.stop().unwrap();
-
-    // The same story over HTTP, on a mint of its own: the same log.
-    let dir2 = scratch("roll-http");
-    let esp2 = start_esp(&dir2, true, Config::default(), None);
-    let (a2, b2) = (esp2.handed(ONE, PAST), esp2.handed(ONE, PAST));
-    let mut w2 = open_wallet(&dir2, "http");
-    give(&mut w2, PAST, vec![a2, b2]);
-    assert!(
-        http::rotation_sync(&mut w2, Kind::Esp, &esp2.base)
-            .unwrap()
-            .is_empty()
-    );
-    esp2.set_clock(T0 + H);
-    http::rotation_sync(&mut w2, Kind::Esp, &esp2.base).unwrap();
-    esp2.set_clock(T0 + H + LATER);
-    let http_log = http::rotation_sync(&mut w2, Kind::Esp, &esp2.base).unwrap();
-    assert_eq!(air_log, http_log);
-    assert_eq!(w2.balance().esp, w.balance().esp);
-    assert_eq!(w2.notes().len(), w.notes().len());
 }
 
 // ---------------------------------------------------------------- exchange, transfer, redeem
 
 #[test]
-fn an_exchange_over_air_is_what_http_returns_and_a_resent_one_is_not_applied_twice() {
+fn an_exchange_over_air_is_applied_once_and_a_resent_one_gets_the_stored_answer() {
     let server = server();
     let (key, did) = mint_key();
     let dir = scratch("exchange");
@@ -692,22 +653,19 @@ fn an_exchange_over_air_is_what_http_returns_and_a_resent_one_is_not_applied_twi
 
     let note = esp.psp_note(4);
     let mut w = wallet_with_psp(&dir, "w", vec![note.clone()]);
-    sync_esp_keysets(&mut w, &air, DEAD).unwrap();
-    sync_esp_limits(&mut w, &air, DEAD).unwrap();
+    sync_esp_keysets(&mut w, &air, RECORD).unwrap();
+    sync_esp_limits(&mut w, &air).unwrap();
     let built = w.build_exchange(4, service(), None).unwrap();
 
-    let response = send_exchange(&mut w, &air, DEAD, &built.request).unwrap();
+    let response = send_exchange(&mut w, &air, &built.request).unwrap();
     let done = w.finish_exchange(&built.id, &response).unwrap();
     assert_eq!(done.esp_units, 4 * u128::from(ONE_PSP));
     assert_eq!(w.balance().esp, 4 * u128::from(ONE_PSP));
     assert!(esp.psp_spent(&note), "the PSP note was burned");
     assert_eq!(esp.totals(), (4 * ONE_PSP, 0));
 
-    // The same request over HTTP is the stored answer, and over AIR again too:
-    // nothing is applied twice.
-    let over_http = http::send_exchange(&esp.base, &built.request).unwrap();
-    assert_eq!(json(&over_http), json(&response));
-    let again = send_exchange(&mut w, &air, DEAD, &built.request).unwrap();
+    // The same request again is the stored answer: nothing is applied twice.
+    let again = send_exchange(&mut w, &air, &built.request).unwrap();
     assert_eq!(json(&again), json(&response));
     assert_eq!(esp.totals(), (4 * ONE_PSP, 0));
     assert!(w.air_requests().is_empty(), "every request ended");
@@ -715,7 +673,7 @@ fn an_exchange_over_air_is_what_http_returns_and_a_resent_one_is_not_applied_twi
 }
 
 #[test]
-fn a_transfer_over_air_is_what_http_returns_and_a_double_presentation_is_spent_elsewhere() {
+fn a_transfer_over_air_is_applied_once_and_a_double_presentation_is_spent_elsewhere() {
     let server = server();
     let (key, did) = mint_key();
     let dir = scratch("transfer");
@@ -727,11 +685,11 @@ fn a_transfer_over_air_is_what_http_returns_and_a_double_presentation_is_spent_e
     let (a, b) = (esp.handed(2 * ONE, DAY), esp.handed(ONE, DAY));
     let (na, nb) = (a.note, b.note);
     let mut svc = open_wallet(&dir, "svc");
-    sync_esp_keysets(&mut svc, &air, DEAD).unwrap();
+    sync_esp_keysets(&mut svc, &air, RECORD).unwrap();
     give(&mut svc, DAY, vec![a.clone(), b.clone()]);
     // a second copy of the same notes, held by another wallet
     let mut svc2 = open_wallet(&dir, "svc2");
-    sync_esp_keysets(&mut svc2, &air, DEAD).unwrap();
+    sync_esp_keysets(&mut svc2, &air, RECORD).unwrap();
     give(&mut svc2, DAY, vec![a, b]);
     let issued = esp.totals().0;
     // A transfer burns the notes (redeemed) and issues the new ones in their place
@@ -740,7 +698,7 @@ fn a_transfer_over_air_is_what_http_returns_and_a_double_presentation_is_spent_e
 
     let built = svc.build_transfer(&secret(1), None, None).unwrap();
     assert_eq!(built.esp_units, u128::from(3 * ONE));
-    let response = send_transfer(&mut svc, &air, DEAD, &built.request).unwrap();
+    let response = send_transfer(&mut svc, &air, &built.request).unwrap();
     let done = svc.finish_transfer(&built.id, &response).unwrap();
     assert_eq!(done.esp_units, u128::from(3 * ONE));
     assert!(esp.is_spent(&na) && esp.is_spent(&nb));
@@ -750,31 +708,21 @@ fn a_transfer_over_air_is_what_http_returns_and_a_double_presentation_is_spent_e
         "the same amount is redeemed and issued again"
     );
 
-    // The same request over HTTP, and over AIR again: the stored answer.
-    let over_http = http::send_transfer(&esp.base, &built.request).unwrap();
-    assert_eq!(json(&over_http), json(&response));
-    let again = send_transfer(&mut svc, &air, DEAD, &built.request).unwrap();
+    // The same request again: the stored answer.
+    let again = send_transfer(&mut svc, &air, &built.request).unwrap();
     assert_eq!(json(&again), json(&response));
     assert_eq!(esp.totals(), after);
 
-    // The other copy is a double presentation: over AIR the same
-    // `SpentElsewhere`, naming the same notes, as over HTTP.
+    // The other copy is a double presentation: `SpentElsewhere`, naming the
+    // note the mint found spent.
     let dup = svc2.build_transfer(&secret(1), None, None).unwrap();
-    let over_air = send_transfer(&mut svc2, &air, DEAD, &dup.request).unwrap_err();
-    let over_http = http::send_transfer(&esp.base, &dup.request).unwrap_err();
-    match (&over_air, &over_http) {
-        (
-            WalletError::SpentElsewhere { inputs: a, why: wa },
-            WalletError::SpentElsewhere { inputs: h, why: wh },
-        ) => {
-            assert_eq!(a, h);
-            assert_eq!(wa, wh);
+    match send_transfer(&mut svc2, &air, &dup.request).unwrap_err() {
+        WalletError::SpentElsewhere { inputs, .. } => {
             // the mint refuses on the first spent input and names only it
-            assert_eq!(a.len(), 1);
+            assert_eq!(inputs.len(), 1);
         }
-        other => panic!("expected SpentElsewhere both ways, got {other:?}"),
+        other => panic!("expected SpentElsewhere, got {other:?}"),
     }
-    assert_eq!(over_air.to_string(), over_http.to_string());
     assert_eq!(esp.totals(), after, "nothing was applied");
     listener.stop().unwrap();
 }
@@ -800,11 +748,11 @@ fn a_redemption_goes_over_air_in_its_binary_encoding_and_a_resent_one_is_not_app
     let a = esp.handed(4 * ONE, PAST);
     let na = a.note;
     let mut w = open_wallet(&dir, "w");
-    sync_esp_keysets(&mut w, &air, DEAD).unwrap();
+    sync_esp_keysets(&mut w, &air, RECORD).unwrap();
     give(&mut w, PAST, vec![a]);
 
     // The fees come over AIR too.
-    let fees = fetch_redeem_fees(&mut w, &air, DEAD).unwrap();
+    let fees = fetch_redeem_fees(&mut w, &air).unwrap();
     assert_eq!(fees.fee_per_byte, 1_000_000);
     let built = w.build_redemption(&secret(1), MEMO, &fees, now()).unwrap();
     assert_eq!(built.len(), 1);
@@ -814,18 +762,15 @@ fn a_redemption_goes_over_air_in_its_binary_encoding_and_a_resent_one_is_not_app
         "the body is the canonical binary encoding, not JSON"
     );
 
-    let response = send_redeem(&mut w, &air, DEAD, &body).unwrap();
+    let response = send_redeem(&mut w, &air, &body).unwrap();
     let outcome = w.finish_redemption(&built[0].id, &response).unwrap();
     assert_eq!(outcome.message, "payout queued");
     assert!(esp.is_spent(&na));
     assert_eq!(esp.totals().1, 4 * ONE);
     assert_eq!(esp.queue_len(), 1);
 
-    // The same bytes over HTTP, and over AIR again: the stored answer, and one
-    // queue entry, not three.
-    let over_http = http::send_redeem(&esp.base, &body).unwrap();
-    assert_eq!(json(&over_http), json(&response));
-    let again = send_redeem(&mut w, &air, DEAD, &body).unwrap();
+    // The same bytes again: the stored answer, and one queue entry, not two.
+    let again = send_redeem(&mut w, &air, &body).unwrap();
     assert_eq!(json(&again), json(&response));
     assert_eq!(esp.totals().1, 4 * ONE);
     assert_eq!(esp.queue_len(), 1);
@@ -836,7 +781,7 @@ fn a_redemption_goes_over_air_in_its_binary_encoding_and_a_resent_one_is_not_app
 // ---------------------------------------------------------------- refusals
 
 #[test]
-fn a_400_is_a_refusal_over_air_as_over_http_but_a_409_a_413_and_a_404_are_not() {
+fn a_400_is_a_refusal_over_air_but_a_409_a_413_and_a_404_are_not() {
     let server = server();
     let (key, did) = mint_key();
     let dir = scratch("refusals");
@@ -856,68 +801,51 @@ fn a_400_is_a_refusal_over_air_as_over_http_but_a_409_a_413_and_a_404_are_not() 
 
     let note = esp.psp_note(4);
     let mut w = wallet_with_psp(&dir, "w", vec![note.clone()]);
-    sync_esp_keysets(&mut w, &air, DEAD).unwrap();
-    sync_esp_limits(&mut w, &air, DEAD).unwrap();
+    sync_esp_keysets(&mut w, &air, RECORD).unwrap();
+    sync_esp_limits(&mut w, &air).unwrap();
     let built = w.build_exchange(4, service(), None).unwrap();
 
-    // A 400 (a keyset the mint does not have): `Refused`, with the HTTP text,
-    // and nothing is burned.
+    // A 400 (a keyset the mint does not have): `Refused`, and nothing is burned.
     let mut bad = built.request.clone();
     bad.keyset = "ff".repeat(8);
-    let over_air = send_exchange(&mut w, &air, DEAD, &bad).unwrap_err();
-    let over_http = http::send_exchange(&esp.base, &bad).unwrap_err();
-    assert!(matches!(over_air, WalletError::Refused(_)), "{over_air:?}");
-    assert!(
-        matches!(over_http, WalletError::Refused(_)),
-        "{over_http:?}"
-    );
-    assert_eq!(over_air.to_string(), over_http.to_string());
+    let refused = send_exchange(&mut w, &air, &bad).unwrap_err();
+    assert!(matches!(refused, WalletError::Refused(_)), "{refused:?}");
     assert!(!esp.psp_spent(&note));
 
     // A 409, the same exchange arriving while it is being processed: a plain
-    // mint error that says 409, over AIR as over HTTP. It is not a refusal: the
+    // mint error that says 409. It is not a refusal: the
     // pending exchange stays, with its note reserved, and the same request goes
     // through once the first is over.
     let hash = exchange::request_hash(&built.request).unwrap();
     let claim = esp.state.in_flight.claim(&hash).expect("a free place");
-    for result in [
-        send_exchange(&mut w, &air, DEAD, &built.request).unwrap_err(),
-        http::send_exchange(&esp.base, &built.request).unwrap_err(),
-    ] {
-        match result {
-            WalletError::Mint(why) => assert!(why.contains("409"), "{why}"),
-            other => panic!("expected a mint error saying 409, got {other:?}"),
-        }
+    match send_exchange(&mut w, &air, &built.request).unwrap_err() {
+        WalletError::Mint(why) => assert!(why.contains("409"), "{why}"),
+        other => panic!("expected a mint error saying 409, got {other:?}"),
     }
     assert_eq!(w.pending_exchanges().len(), 1);
     assert!(!esp.psp_spent(&note));
     drop(claim);
-    let response = send_exchange(&mut w, &air, DEAD, &built.request).unwrap();
+    let response = send_exchange(&mut w, &air, &built.request).unwrap();
     w.finish_exchange(&built.id, &response).unwrap();
     assert!(esp.psp_spent(&note));
 
-    // A 413 on a transfer: a plain mint error that says so, both ways.
+    // A 413 on a transfer: a plain mint error that says so.
     let mut svc = open_wallet(&dir, "svc");
-    sync_esp_keysets(&mut svc, &air, DEAD).unwrap();
+    sync_esp_keysets(&mut svc, &air, RECORD).unwrap();
     let notes: Vec<_> = (0..8).map(|_| esp.handed(ONE, DAY)).collect();
     give(&mut svc, DAY, notes);
     let big = svc.build_transfer(&secret(1), None, None).unwrap();
-    for result in [
-        send_transfer(&mut svc, &air, DEAD, &big.request).unwrap_err(),
-        http::send_transfer(&esp.base, &big.request).unwrap_err(),
-    ] {
-        match result {
-            WalletError::Mint(why) => assert!(why.contains("413"), "{why}"),
-            other => panic!("expected a mint error saying 413, got {other:?}"),
-        }
+    match send_transfer(&mut svc, &air, &big.request).unwrap_err() {
+        WalletError::Mint(why) => assert!(why.contains("413"), "{why}"),
+        other => panic!("expected a mint error saying 413, got {other:?}"),
     }
     assert_eq!(svc.pending_transfers().len(), 1, "not cancelled");
 
-    // A 413 on a redemption is `RedeemRefused` with its code, both ways.
+    // A 413 on a redemption is `RedeemRefused` with its code.
     let mut r = open_wallet(&dir, "r");
-    sync_esp_keysets(&mut r, &air, DEAD).unwrap();
+    sync_esp_keysets(&mut r, &air, RECORD).unwrap();
     give(&mut r, PAST, vec![esp.handed(ONE, PAST)]);
-    let mut fees = fetch_redeem_fees(&mut r, &air, DEAD).unwrap();
+    let mut fees = fetch_redeem_fees(&mut r, &air).unwrap();
     assert_eq!(
         fees.max_request_bytes, 100,
         "the fees say the mint's ceiling"
@@ -929,13 +857,9 @@ fn a_400_is_a_refusal_over_air_as_over_http_but_a_409_a_413_and_a_404_are_not() 
     let redeem = r.build_redemption(&secret(1), MEMO, &fees, now()).unwrap();
     let body = redeem[0].body.clone();
     assert!(body.len() > 100);
-    let over_air = send_redeem(&mut r, &air, DEAD, &body).unwrap_err();
-    let over_http = http::send_redeem(&esp.base, &body).unwrap_err();
-    for e in [&over_air, &over_http] {
-        match e {
-            WalletError::RedeemRefused { code, .. } => assert_eq!(code, "request_too_large"),
-            other => panic!("expected RedeemRefused, got {other:?}"),
-        }
+    match send_redeem(&mut r, &air, &body).unwrap_err() {
+        WalletError::RedeemRefused { code, .. } => assert_eq!(code, "request_too_large"),
+        other => panic!("expected RedeemRefused, got {other:?}"),
     }
     listener.stop().unwrap();
 }
@@ -945,7 +869,7 @@ fn a_psp_the_esp_cannot_reach_is_a_mint_error_that_keeps_the_exchange_pending() 
     let server = server();
     let (key, did) = mint_key();
     let dir = scratch("dead-psp");
-    // Nothing listens on port 9: the HTTP route would answer 502.
+    // Nothing listens on port 9, where the ESP looks for its PSP.
     let esp = start_esp(&dir, false, Config::default(), Some("http://127.0.0.1:9"));
     let state_dir = scratch("dead-psp-state");
     let listener = start_serving(&server, &key, &state_dir, esp.serve());
@@ -953,22 +877,18 @@ fn a_psp_the_esp_cannot_reach_is_a_mint_error_that_keeps_the_exchange_pending() 
 
     let note = esp.psp_note(4);
     let mut w = wallet_with_psp(&dir, "w", vec![note.clone()]);
-    sync_esp_keysets(&mut w, &air, DEAD).unwrap();
-    sync_esp_limits(&mut w, &air, DEAD).unwrap();
+    sync_esp_keysets(&mut w, &air, RECORD).unwrap();
+    sync_esp_limits(&mut w, &air).unwrap();
     let built = w.build_exchange(4, service(), None).unwrap();
 
-    // Over AIR a signed "unavailable"; over HTTP a 502. Neither is a refusal,
-    // and the wallet says the request may be sent again.
-    match send_exchange(&mut w, &air, DEAD, &built.request) {
+    // A signed "unavailable" (the mint's 502). It is not a refusal, and the
+    // wallet says the request may be sent again.
+    match send_exchange(&mut w, &air, &built.request) {
         Err(WalletError::Mint(why)) => {
             assert!(why.contains("could not answer exchange now"), "{why}");
             assert!(why.contains("Send the same request again"), "{why}");
         }
         other => panic!("expected a mint error, got {other:?}"),
-    }
-    match http::send_exchange(&esp.base, &built.request) {
-        Err(WalletError::Mint(why)) => assert!(why.contains("502"), "{why}"),
-        other => panic!("expected a mint error saying 502, got {other:?}"),
     }
     assert_eq!(w.pending_exchanges().len(), 1);
     assert_eq!(w.balance().reserved, 1, "the note is reserved, not freed");
@@ -997,9 +917,9 @@ fn an_unanswered_exchange_is_kept_and_the_next_call_carries_on_with_it() {
     let quick = air_settings(&server, &did, 1, 1);
     // (The keysets and limits cannot be read either, so name the mint's keyset
     // by hand as a wallet that had read them earlier would.)
-    w.note_esp_keysets(DEAD, &esp.ks, None).unwrap();
+    w.note_esp_keysets(RECORD, &esp.ks, None).unwrap();
     let built = w.build_exchange(4, service(), None).unwrap();
-    match send_exchange(&mut w, &quick, DEAD, &built.request) {
+    match send_exchange(&mut w, &quick, &built.request) {
         Err(WalletError::Mint(why)) => {
             assert!(
                 why.contains("did not answer") && why.contains("the ESP"),
@@ -1023,7 +943,7 @@ fn an_unanswered_exchange_is_kept_and_the_next_call_carries_on_with_it() {
     let listener = start_serving(&server, &key, &state_dir, esp.serve());
     wait_for_next(&state_dir, 1);
     assert!(esp.psp_spent(&note));
-    let response = send_exchange(&mut w, &air, DEAD, &built.request).unwrap();
+    let response = send_exchange(&mut w, &air, &built.request).unwrap();
     assert!(w.air_requests().is_empty());
     thread::sleep(Duration::from_millis(500));
     assert_eq!(
@@ -1107,7 +1027,7 @@ fn a_tampered_forged_or_wrong_kind_reply_to_an_esp_call_is_refused_and_applies_n
         (KIND_EXCHANGE, br#"{"x":1}"#.to_vec()),
     ] {
         let call = |w: &mut Wallet| match kind {
-            KIND_FEES => sync_esp_limits(w, &air, DEAD).map(|_| ()),
+            KIND_FEES => sync_esp_limits(w, &air).map(|_| ()),
             _ => air::answer(w, &air, Party::Esp, kind, &body).map(|_| ()),
         };
 
@@ -1184,13 +1104,13 @@ fn a_tampered_forged_or_wrong_kind_reply_to_an_esp_call_is_refused_and_applies_n
 // ---------------------------------------------------------------- HTTP, DIDs
 
 #[test]
-fn with_air_off_every_esp_call_goes_over_http_and_nothing_goes_over_air() {
+fn without_air_server_and_host_no_call_to_the_esp_is_made_and_the_error_names_the_setting() {
     let server = server();
-    let dir = scratch("off");
+    let dir = scratch("required");
     let esp = start_esp(&dir, true, Config::default(), None);
-    // AIR is off: no server, no host. A listener would be asked for nothing.
+    // A listener is up, and must be asked for nothing.
     let (key, _) = mint_key();
-    let state_dir = scratch("off-state");
+    let state_dir = scratch("required-state");
     let listener = start_serving(&server, &key, &state_dir, esp.serve());
     let air = AirSettings::default();
     assert!(!air.is_configured());
@@ -1198,28 +1118,34 @@ fn with_air_off_every_esp_call_goes_over_http_and_nothing_goes_over_air() {
 
     let note = esp.psp_note(4);
     let mut w = wallet_with_psp(&dir, "w", vec![note.clone()]);
-    verify_esp(&mut w, &air, &esp.base, NETWORK).unwrap();
-    sync_esp_keysets(&mut w, &air, &esp.base).unwrap();
-    sync_esp_limits(&mut w, &air, &esp.base).unwrap();
-    assert_eq!(
-        fetch_redeem_fees(&mut w, &air, &esp.base)
-            .unwrap()
-            .max_memo_bytes,
-        256
-    );
-    assert_eq!(
-        esp_window(&mut w, &air, &esp.base).unwrap().current_id,
-        esp.ks
-    );
+    w.note_esp_keysets(RECORD, &esp.ks, None).unwrap();
     let built = w.build_exchange(4, service(), None).unwrap();
-    let response = send_exchange(&mut w, &air, &esp.base, &built.request).unwrap();
-    w.finish_exchange(&built.id, &response).unwrap();
-    assert!(esp.psp_spent(&note));
-    assert!(
-        rotation_sync(&mut w, &air, Kind::Esp, &esp.base)
-            .unwrap()
-            .is_empty()
-    );
+    let named_both = |why: &str| {
+        assert!(
+            why.contains("air.server") && why.contains("air.host"),
+            "{why}"
+        );
+        assert!(
+            why.contains("ECASH_AIR_SERVER") && why.contains("ECASH_AIR_HOST"),
+            "{why}"
+        );
+    };
+    let invalid = |r: Result<(), WalletError>| match r {
+        Err(WalletError::Invalid(why)) => named_both(&why),
+        other => panic!("expected the missing settings to be named, got {other:?}"),
+    };
+    invalid(verify_esp(&mut w, &air, NETWORK));
+    invalid(sync_esp_keysets(&mut w, &air, RECORD));
+    invalid(sync_esp_limits(&mut w, &air));
+    invalid(fetch_redeem_fees(&mut w, &air).map(|_| ()));
+    invalid(esp_window(&mut w, &air).map(|_| ()));
+    invalid(send_exchange(&mut w, &air, &built.request).map(|_| ()));
+    invalid(send_redeem(&mut w, &air, b"x").map(|_| ()));
+    invalid(rotation_sync(&mut w, &air, Kind::Esp, RECORD).map(|_| ()));
+
+    // The exchange is still pending, its note reserved, and nothing went out.
+    assert_eq!(w.pending_exchanges().len(), 1);
+    assert!(!esp.psp_spent(&note));
     assert!(w.air_requests().is_empty());
     thread::sleep(Duration::from_millis(300));
     assert_eq!(
@@ -1267,8 +1193,8 @@ fn the_psp_and_the_esp_share_an_air_server_and_each_is_asked_at_its_own_did() {
     let mut w = open_wallet(&dir, "w");
 
     // One server, two DIDs, two answers.
-    verify_psp(&mut w, &air, DEAD, NETWORK).unwrap();
-    verify_esp(&mut w, &air, DEAD, NETWORK).unwrap();
+    verify_psp(&mut w, &air, NETWORK).unwrap();
+    verify_esp(&mut w, &air, NETWORK).unwrap();
     assert_eq!(Party::Psp.did(&air), psp_did);
     assert_eq!(Party::Esp.did(&air), esp_did);
 
@@ -1328,7 +1254,7 @@ fn the_builtin_placeholder_esp_did_never_passes_silently() {
     // A call is sealed to it and nobody can answer: unreachable, and the error
     // says that the DID is the ESP's placeholder, for a read and a call with a body.
     let mut w = open_wallet(&dir, "w");
-    match verify_esp(&mut w, &air, DEAD, NETWORK) {
+    match verify_esp(&mut w, &air, NETWORK) {
         Err(WalletError::Mint(why)) => {
             assert!(why.contains("PLACEHOLDER ESP DID"), "{why}");
             assert!(why.contains("air.esp_did"), "{why}");
@@ -1349,7 +1275,7 @@ fn the_builtin_placeholder_esp_did_never_passes_silently() {
     };
     assert!(!real.uses_builtin_esp_did());
     assert_eq!(real.esp_placeholder_warning(), None);
-    match verify_esp(&mut w, &real, DEAD, NETWORK) {
+    match verify_esp(&mut w, &real, NETWORK) {
         Err(WalletError::Mint(why)) => assert!(!why.contains("PLACEHOLDER"), "{why}"),
         other => panic!("expected the unlistened DID to be unreachable, got {other:?}"),
     }

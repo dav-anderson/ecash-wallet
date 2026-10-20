@@ -4,16 +4,27 @@
 //! DID key and a little FSP, never swapped, usable at a real fsp-mint), and the
 //! sender's side (notes taken out, check, reclaim before and after the receiver's
 //! swap, cancel, done, and records `send-psp` left in old wallet files).
+//!
+//! The PSP mint is reached over AIR, on its real listener against a real
+//! `air_server` started in this process (see `common/mod.rs`); so is the ESP mint
+//! behind the fsp-mint of the FSP test, whose Issuer is the real `AirIssuer`. The
+//! AIR client always dials port 5702, so these tests need that port free, and they
+//! take turns on the one shared server; they are built only with the
+//! `air-listener-tests` feature. The wallet's own calls to the FSP mint are HTTP.
+
+mod common;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use axum::Router;
+use ecash_wallet::config::AirSettings;
 use ecash_wallet::handoff::{
     FSP_PREFIX, FSP_WARNING, HandoffKind, HandoffState, PSP_PREFIX, PSP_WARNING, Standing,
 };
 use ecash_wallet::legacy::{SentState, SentToken};
+use ecash_wallet::mint_info::{check_handoff, complete_import, reclaim_handoff, rotation_sync};
 use ecash_wallet::store::{HandedNote, Handover, StoredNote, WalletData};
 use ecash_wallet::{Kind, Wallet, http};
 use esp_mint::exchange::{Burn, Psp};
@@ -30,6 +41,12 @@ use secp256k1::{Keypair, SECP256K1, SecretKey};
 use sp_wire::ServiceDid;
 use sp_wire::seal::SecretKey as DidSecretKey;
 use tokio::runtime::Runtime;
+
+use common::{EspAt, PspAt};
+
+/// What the wallet's records call the PSP (the mint a handoff names). Nothing
+/// dials it: the PSP is reached by DID.
+const RECORD: &str = "http://127.0.0.1:3000";
 
 const T: u64 = 1_800_000_000;
 const NOW: u64 = 1_791_571_184;
@@ -58,36 +75,34 @@ fn serve(rt: &Runtime, app: Router) -> String {
 // ---- PSP ---------------------------------------------------------------------------
 
 struct PspMint {
-    url: String,
     state: Arc<AppState>,
     rot: psp_mint::server::SharedRotating,
+    /// Its AIR listener, and the turn on the shared server. Last.
+    at: PspAt,
 }
 
-fn start_psp(rt: &Runtime, dir: &Path) -> PspMint {
+fn start_psp(dir: &Path) -> PspMint {
     let d = dir.join("psp");
     let (rotor, logic) =
         psp_mint::rotation::Rotor::open_at(&d, Amount::from_units(1024), 1, 1, T).unwrap();
     let rot =
         psp_mint::server::Rotating::new(rotor, psp_mint::rotation::Rollovers::open(&d).unwrap());
     let state = psp_mint::server::app_state(logic);
-    let melts = Arc::new(Mutex::new(
-        psp_mint::melts::MeltLog::open(&d.join("melt_memos.json")).unwrap(),
-    ));
-    let app = psp_mint::server::router_full(
+    // The listener keeps its state in a folder of its own, outside `dir`.
+    let at = PspAt::new(
         Arc::clone(&state),
-        psp_mint::server::Health::new(100),
-        melts,
-        Default::default(),
-        Some(Arc::clone(&rot)),
+        Arc::clone(&rot),
+        &scratch("airstate-psp"),
     );
-    PspMint {
-        url: serve(rt, app),
-        state,
-        rot,
-    }
+    PspMint { state, rot, at }
 }
 
 impl PspMint {
+    /// The wallet's `[air]` settings for this PSP.
+    fn air(&self) -> AirSettings {
+        self.at.air(10, 3)
+    }
+
     fn note(&self, units: u64) -> StoredNote {
         let kp = Keypair::new(SECP256K1, &mut OsRng);
         let nonce = Nonce(kp.public_key());
@@ -155,15 +170,15 @@ fn make(
     to: &DidSecretKey,
 ) -> ecash_wallet::handoff::HandoffExport {
     let ids = dev.select_psp_handoff(units).unwrap();
-    dev.export_psp_handoff(&ids, &m.url, &to.public_key())
+    dev.export_psp_handoff(&ids, RECORD, &to.public_key())
         .unwrap()
 }
 
 #[test]
 fn a_psp_handoff_sealed_to_the_user_counts_at_once_and_is_swapped_at_the_mint() {
-    let rt = Runtime::new().unwrap();
     let dir = scratch("psp");
-    let m = start_psp(&rt, &dir);
+    let m = start_psp(&dir);
+    let air = m.air();
     let (a, b, c) = (m.note(4), m.note(1), m.note(2));
     let mut dev = psp_wallet(&m, &dir, "dev", vec![a.clone(), b.clone(), c]);
     let mut user = psp_wallet(&m, &dir, "user", vec![]);
@@ -171,7 +186,7 @@ fn a_psp_handoff_sealed_to_the_user_counts_at_once_and_is_swapped_at_the_mint() 
 
     let ids = dev.select_psp_handoff(5).unwrap();
     let out = dev
-        .export_psp_handoff(&ids, &m.url, &user_key.public_key())
+        .export_psp_handoff(&ids, RECORD, &user_key.public_key())
         .unwrap();
     assert!(out.text.starts_with(PSP_PREFIX));
     assert_eq!(out.kind, HandoffKind::Psp);
@@ -182,7 +197,7 @@ fn a_psp_handoff_sealed_to_the_user_counts_at_once_and_is_swapped_at_the_mint() 
     assert_eq!(dev.handoffs_out()[0].state, HandoffState::Pending);
     assert_eq!(
         dev.handoffs_out()[0].mint,
-        m.url,
+        RECORD,
         "the mint is kept for check and reclaim"
     );
 
@@ -202,7 +217,7 @@ fn a_psp_handoff_sealed_to_the_user_counts_at_once_and_is_swapped_at_the_mint() 
     assert_eq!(psp_total(&user), 5);
     assert_eq!(user.balance().psp, 5);
     assert_eq!(user.unswapped_psp(), 5);
-    let log = http::complete_import(&mut user, &imported);
+    let log = complete_import(&mut user, &air, &imported);
     assert!(log.iter().any(|l| l.contains("final")), "{log:?}");
     assert_eq!(psp_total(&user), 5);
     assert_eq!(user.unswapped_psp(), 0);
@@ -226,7 +241,7 @@ fn a_psp_handoff_sealed_to_the_user_counts_at_once_and_is_swapped_at_the_mint() 
     let mut thief = psp_wallet(&m, &dir, "thief", vec![]);
     let imported = thief.import_psp_handoff(&out.text, &user_key, "").unwrap();
     assert_eq!(psp_total(&thief), 5);
-    let log = http::complete_import(&mut thief, &imported);
+    let log = complete_import(&mut thief, &air, &imported);
     assert!(
         log.iter().any(|l| l.contains("spent already")),
         "the mint refuses a second swap: {log:?}"
@@ -238,7 +253,7 @@ fn a_psp_handoff_sealed_to_the_user_counts_at_once_and_is_swapped_at_the_mint() 
 
     // The sender asks the mint and learns it was claimed.
     assert_eq!(
-        http::check_handoff(&mut dev, &out.id).unwrap(),
+        check_handoff(&mut dev, &air, &out.id).unwrap(),
         Standing::Received
     );
     assert_eq!(dev.handoffs_out()[0].state, HandoffState::Done);
@@ -248,20 +263,22 @@ fn a_psp_handoff_sealed_to_the_user_counts_at_once_and_is_swapped_at_the_mint() 
 
 #[test]
 fn unswapped_psp_is_in_the_balance_and_spendable_and_is_swapped_when_the_mint_answers() {
-    let rt = Runtime::new().unwrap();
     let dir = scratch("unswapped");
-    let m = start_psp(&rt, &dir);
+    let m = start_psp(&dir);
+    let air = m.air();
     let key = did(7);
 
-    // The handoff names a mint that is not up: the swap cannot go through.
+    // The mint is not answering: the swap cannot go through (one short try).
+    m.at.silence();
+    let quick = m.at.air(1, 1);
     let mut dev = psp_wallet(&m, &dir, "dev", vec![m.note(8), m.note(2)]);
     let ids = dev.select_psp_handoff(10).unwrap();
     let out = dev
-        .export_psp_handoff(&ids, "http://127.0.0.1:1", &key.public_key())
+        .export_psp_handoff(&ids, RECORD, &key.public_key())
         .unwrap();
     let mut user = psp_wallet(&m, &dir, "user", vec![]);
     let imported = user.import_psp_handoff(&out.text, &key, "").unwrap();
-    let log = http::complete_import(&mut user, &imported);
+    let log = complete_import(&mut user, &quick, &imported);
     assert!(log.iter().any(|l| l.contains("stays unswapped")), "{log:?}");
     assert_eq!(psp_total(&user), 10);
     assert_eq!(user.balance().psp, 10, "counted, not locked");
@@ -277,15 +294,16 @@ fn unswapped_psp_is_in_the_balance_and_spendable_and_is_swapped_when_the_mint_an
     assert_eq!(again.unswapped_psp(), 10);
     assert_eq!(again.balance().psp, 10);
 
-    // The same notes with the mint reachable: the swap is sent again by the
+    // The same notes with the mint answering: the swap is sent again by the
     // next sync (what the command line does at every start), and then it is final.
+    m.at.listen();
     let mut dev2 = psp_wallet(&m, &dir, "dev2", vec![m.note(8), m.note(2)]);
     let out = make(&mut dev2, &m, 10, &key);
     let mut user2 = psp_wallet(&m, &dir, "user2", vec![]);
     let imported = user2.import_psp_handoff(&out.text, &key, "").unwrap();
     assert_eq!(user2.unswapped_psp(), 10, "stored and not sent yet");
     assert_eq!(psp_total(&user2), 10, "and already counted");
-    let log = http::rotation_sync(&mut user2, Kind::Psp, &m.url).unwrap();
+    let log = rotation_sync(&mut user2, &air, Kind::Psp, RECORD).unwrap();
     assert!(log.iter().any(|l| l.contains("swapped 10 PSP")), "{log:?}");
     assert_eq!(imported.psp_swaps.len(), 1);
     assert_eq!(psp_total(&user2), 10);
@@ -301,7 +319,7 @@ fn unswapped_psp_is_in_the_balance_and_spendable_and_is_swapped_when_the_mint_an
     user3.import_psp_handoff(&out.text, &key, "").unwrap();
     let onward = make(&mut user3, &m, 2, &did(8));
     assert_eq!(psp_total(&user3), 8);
-    let log = http::rotation_sync(&mut user3, Kind::Psp, &m.url).unwrap();
+    let log = rotation_sync(&mut user3, &air, Kind::Psp, RECORD).unwrap();
     assert!(log.iter().any(|l| l.contains("swapped 8 PSP")), "{log:?}");
     assert_eq!(psp_total(&user3), 8);
     assert!(user3.pending_rollovers().is_empty());
@@ -309,16 +327,16 @@ fn unswapped_psp_is_in_the_balance_and_spendable_and_is_swapped_when_the_mint_an
     let imported = friend
         .import_psp_handoff(&onward.text, &did(8), "")
         .unwrap();
-    let log = http::complete_import(&mut friend, &imported);
+    let log = complete_import(&mut friend, &air, &imported);
     assert!(log.iter().any(|l| l.contains("final")), "{log:?}");
     assert_eq!(psp_total(&friend), 2);
 }
 
 #[test]
 fn the_sender_reclaims_a_handoff_the_receiver_has_not_swapped() {
-    let rt = Runtime::new().unwrap();
     let dir = scratch("reclaim-before");
-    let m = start_psp(&rt, &dir);
+    let m = start_psp(&dir);
+    let air = m.air();
     let (a, b, c) = (m.note(4), m.note(1), m.note(2));
     let mut dev = psp_wallet(&m, &dir, "dev", vec![a.clone(), b.clone(), c]);
     let key = did(7);
@@ -327,10 +345,10 @@ fn the_sender_reclaims_a_handoff_the_receiver_has_not_swapped() {
 
     // Nothing is spent at the mint yet: it is still the sender's.
     assert_eq!(
-        http::check_handoff(&mut dev, &out.id).unwrap(),
+        check_handoff(&mut dev, &air, &out.id).unwrap(),
         Standing::Pending
     );
-    let done = http::reclaim_handoff(&mut dev, &out.id).unwrap();
+    let done = reclaim_handoff(&mut dev, &air, &out.id).unwrap();
     assert_eq!(done.standing, Standing::Reclaimed);
     assert!(
         done.log.iter().any(|l| l.contains("reclaimed 5 PSP")),
@@ -351,11 +369,11 @@ fn the_sender_reclaims_a_handoff_the_receiver_has_not_swapped() {
     assert!(dev.cancel_handoff(&out.id).is_err());
     // asking again changes nothing
     assert_eq!(
-        http::check_handoff(&mut dev, &out.id).unwrap(),
+        check_handoff(&mut dev, &air, &out.id).unwrap(),
         Standing::Reclaimed
     );
     assert_eq!(
-        http::reclaim_handoff(&mut dev, &out.id).unwrap().standing,
+        reclaim_handoff(&mut dev, &air, &out.id).unwrap().standing,
         Standing::Reclaimed
     );
     assert_eq!(psp_total(&dev), 7);
@@ -368,7 +386,7 @@ fn the_sender_reclaims_a_handoff_the_receiver_has_not_swapped() {
     let mut user = psp_wallet(&m, &dir, "user", vec![]);
     let imported = user.import_psp_handoff(&out.text, &key, "dev").unwrap();
     assert_eq!(psp_total(&user), 5);
-    let log = http::complete_import(&mut user, &imported);
+    let log = complete_import(&mut user, &air, &imported);
     assert!(log.iter().any(|l| l.contains("spent already")), "{log:?}");
     assert_eq!(psp_total(&user), 0);
     assert!(user.pending_rollovers().is_empty());
@@ -377,18 +395,18 @@ fn the_sender_reclaims_a_handoff_the_receiver_has_not_swapped() {
 
 #[test]
 fn a_reclaim_after_the_receiver_swapped_finds_the_notes_gone_and_takes_nothing() {
-    let rt = Runtime::new().unwrap();
     let dir = scratch("reclaim-after");
-    let m = start_psp(&rt, &dir);
+    let m = start_psp(&dir);
+    let air = m.air();
     let mut dev = psp_wallet(&m, &dir, "dev", vec![m.note(4), m.note(1), m.note(2)]);
     let key = did(7);
     let out = make(&mut dev, &m, 5, &key);
     let mut user = psp_wallet(&m, &dir, "user", vec![]);
     let imported = user.import_psp_handoff(&out.text, &key, "").unwrap();
-    let log = http::complete_import(&mut user, &imported);
+    let log = complete_import(&mut user, &air, &imported);
     assert!(log.iter().any(|l| l.contains("final")), "{log:?}");
 
-    let done = http::reclaim_handoff(&mut dev, &out.id).unwrap();
+    let done = reclaim_handoff(&mut dev, &air, &out.id).unwrap();
     assert_eq!(done.standing, Standing::Received);
     assert!(done.log.is_empty(), "no swap was sent: {:?}", done.log);
     assert_eq!(psp_total(&dev), 2, "nothing came back");
@@ -401,7 +419,7 @@ fn a_reclaim_after_the_receiver_swapped_finds_the_notes_gone_and_takes_nothing()
     assert_eq!(psp_total(&user), 5, "the receiver kept what it swapped");
     // asking again, and cancelling, change nothing
     assert_eq!(
-        http::reclaim_handoff(&mut dev, &out.id).unwrap().standing,
+        reclaim_handoff(&mut dev, &air, &out.id).unwrap().standing,
         Standing::Received
     );
     assert!(dev.cancel_handoff(&out.id).is_err());
@@ -409,9 +427,9 @@ fn a_reclaim_after_the_receiver_swapped_finds_the_notes_gone_and_takes_nothing()
 
 #[test]
 fn a_note_spent_elsewhere_drops_out_and_the_rest_is_still_reclaimed_or_swapped() {
-    let rt = Runtime::new().unwrap();
     let dir = scratch("partly");
-    let m = start_psp(&rt, &dir);
+    let m = start_psp(&dir);
+    let air = m.air();
     let (c, d) = (m.note(2), m.note(8));
     let key = did(7);
 
@@ -423,7 +441,7 @@ fn a_note_spent_elsewhere_drops_out_and_the_rest_is_still_reclaimed_or_swapped()
     let mut holder = psp_wallet(&m, &dir, "holder", vec![]);
     let imported = holder.import_psp_handoff(&c_out.text, &did(5), "").unwrap();
     assert!(
-        http::complete_import(&mut holder, &imported)
+        complete_import(&mut holder, &air, &imported)
             .iter()
             .any(|l| l.contains("final"))
     );
@@ -431,11 +449,11 @@ fn a_note_spent_elsewhere_drops_out_and_the_rest_is_still_reclaimed_or_swapped()
 
     // The sender sees one of two spent and takes the other back.
     assert_eq!(
-        http::check_handoff(&mut dev, &out.id).unwrap(),
+        check_handoff(&mut dev, &air, &out.id).unwrap(),
         Standing::Partly { spent: 1, left: 1 }
     );
     assert_eq!(dev.handoffs_out()[0].notes.len(), 1);
-    let done = http::reclaim_handoff(&mut dev, &out.id).unwrap();
+    let done = reclaim_handoff(&mut dev, &air, &out.id).unwrap();
     assert_eq!(done.standing, Standing::Reclaimed);
     assert_eq!(psp_total(&dev), 8, "the unspent note is back");
     assert!(m.spent(&d));
@@ -451,11 +469,11 @@ fn a_note_spent_elsewhere_drops_out_and_the_rest_is_still_reclaimed_or_swapped()
     let imported = holder2
         .import_psp_handoff(&e_out.text, &did(5), "")
         .unwrap();
-    http::complete_import(&mut holder2, &imported);
+    complete_import(&mut holder2, &air, &imported);
     let mut user = psp_wallet(&m, &dir, "user", vec![]);
     let imported = user.import_psp_handoff(&out2.text, &key, "").unwrap();
     assert_eq!(psp_total(&user), 10);
-    let log = http::complete_import(&mut user, &imported);
+    let log = complete_import(&mut user, &air, &imported);
     assert!(log.iter().any(|l| l.contains("spent already")), "{log:?}");
     assert!(log.iter().any(|l| l.contains("final")), "{log:?}");
     assert_eq!(
@@ -467,7 +485,7 @@ fn a_note_spent_elsewhere_drops_out_and_the_rest_is_still_reclaimed_or_swapped()
     assert_eq!(user.unswapped_psp(), 0);
     assert!(user.pending_rollovers().is_empty());
     assert_eq!(
-        http::check_handoff(&mut dev2, &out2.id).unwrap(),
+        check_handoff(&mut dev2, &air, &out2.id).unwrap(),
         Standing::Received
     );
 }
@@ -491,12 +509,12 @@ fn old_wallet(m: &PspMint, dir: &Path, name: &str, sent: Vec<SentToken>) -> Wall
 
 #[test]
 fn old_send_psp_records_are_handoffs_that_can_be_checked_and_reclaimed() {
-    let rt = Runtime::new().unwrap();
     let dir = scratch("legacy");
-    let m = start_psp(&rt, &dir);
+    let m = start_psp(&dir);
+    let air = m.air();
     let token = |id: &str, notes: Vec<StoredNote>, state| SentToken {
         id: id.into(),
-        mint: m.url.clone(),
+        mint: RECORD.to_string(),
         amount: notes.iter().map(|n| u128::from(n.amount)).sum(),
         notes,
         state,
@@ -527,18 +545,18 @@ fn old_send_psp_records_are_handoffs_that_can_be_checked_and_reclaimed() {
     assert_eq!(dev.handoffs_out()[0].kind, HandoffKind::Psp);
     assert_eq!(dev.handoffs_out()[0].psp_units, 6);
     assert_eq!(
-        http::check_handoff(&mut dev, "received-token").unwrap(),
+        check_handoff(&mut dev, &air, "received-token").unwrap(),
         Standing::Received
     );
     assert_eq!(
-        http::check_handoff(&mut dev, "reclaimed-token").unwrap(),
+        check_handoff(&mut dev, &air, "reclaimed-token").unwrap(),
         Standing::Reclaimed
     );
     assert_eq!(
-        http::check_handoff(&mut dev, "pending-token").unwrap(),
+        check_handoff(&mut dev, &air, "pending-token").unwrap(),
         Standing::Pending
     );
-    let done = http::reclaim_handoff(&mut dev, "pending-token").unwrap();
+    let done = reclaim_handoff(&mut dev, &air, "pending-token").unwrap();
     assert_eq!(done.standing, Standing::Reclaimed);
     assert_eq!(psp_total(&dev), 6);
     assert!(m.spent(&a) && m.spent(&b));
@@ -559,7 +577,7 @@ fn old_send_psp_records_are_handoffs_that_can_be_checked_and_reclaimed() {
     record.reclaim = None;
     data.sent = vec![SentToken {
         id: record.id.clone(),
-        mint: m.url.clone(),
+        mint: RECORD.to_string(),
         amount: 9,
         notes: record.notes.clone(),
         state: SentState::Reclaiming { rollover },
@@ -571,7 +589,7 @@ fn old_send_psp_records_are_handoffs_that_can_be_checked_and_reclaimed() {
     assert_eq!(old.pending_rollovers().len(), 1);
     // `handoff check` sends the stored swap again and finishes it
     assert_eq!(
-        http::check_handoff(&mut old, &record.id).unwrap(),
+        check_handoff(&mut old, &air, &record.id).unwrap(),
         Standing::Reclaimed
     );
     assert_eq!(psp_total(&old), 9);
@@ -580,13 +598,12 @@ fn old_send_psp_records_are_handoffs_that_can_be_checked_and_reclaimed() {
 
 #[test]
 fn a_cancelled_psp_handoff_returns_the_notes() {
-    let rt = Runtime::new().unwrap();
     let dir = scratch("cancel");
-    let m = start_psp(&rt, &dir);
+    let m = start_psp(&dir);
     let mut dev = psp_wallet(&m, &dir, "dev", vec![m.note(8), m.note(2)]);
     let ids = dev.select_psp_handoff(10).unwrap();
     let out = dev
-        .export_psp_handoff(&ids, &m.url, &did(7).public_key())
+        .export_psp_handoff(&ids, RECORD, &did(7).public_key())
         .unwrap();
     assert_eq!(psp_total(&dev), 0);
     assert_eq!(dev.cancel_handoff(&out.id).unwrap(), 2);
@@ -620,6 +637,8 @@ impl Psp for NoPsp {
 struct FspMints {
     esp: Arc<EspState>,
     fsp_url: String,
+    /// The ESP mint's AIR listener and the turn on the shared AIR server. Last.
+    _esp_at: EspAt,
 }
 
 fn start_fsp(rt: &Runtime, dir: &Path) -> FspMints {
@@ -637,8 +656,12 @@ fn start_fsp(rt: &Runtime, dir: &Path) -> FspMints {
         rotor: None,
         rollovers: None,
     });
-    let esp_url = serve(rt, esp_mint::server::router(Arc::clone(&esp)));
+    // The listener keeps its state in a folder of its own, outside `dir`.
+    let esp_at = EspAt::new(Arc::clone(&esp), &scratch("airstate-esp"));
     let mut cfg = fsp_mint::config::Config::default();
+    for (key, value) in esp_at.fsp_settings("20", "2") {
+        cfg.set(key, &value).unwrap();
+    }
     cfg.set("service.did", &service().to_string()).unwrap();
     cfg.set("rotation.activation_hours", "120").unwrap();
     cfg.set("rotation.period_hours", "240").unwrap();
@@ -653,7 +676,7 @@ fn start_fsp(rt: &Runtime, dir: &Path) -> FspMints {
     let state = Arc::new(FspState {
         spender: Spender::open(&dir.join("fsp"), cfg.rotation(), 1024, NOW).unwrap(),
         issues: Mutex::new(Issues::open(&dir.join("fsp")).unwrap()),
-        issuer: Box::new(fsp_mint::esp_client::HttpIssuer::new(&esp_url, 10).unwrap()),
+        issuer: Box::new(fsp_mint::esp_air::AirIssuer::new(&cfg).unwrap()),
         service_keypair: Some(service_keypair),
         clock: Box::new(|| NOW),
         config: cfg,
@@ -661,6 +684,7 @@ fn start_fsp(rt: &Runtime, dir: &Path) -> FspMints {
     FspMints {
         esp,
         fsp_url: serve(rt, fsp_mint::server::router(state)),
+        _esp_at: esp_at,
     }
 }
 
@@ -751,7 +775,7 @@ fn an_fsp_handoff_carries_the_did_key_and_the_notes_work_at_the_fsp_mint() {
         Some([7u8; 32])
     );
     assert!(imported.psp_swaps.is_empty());
-    assert!(http::complete_import(&mut b, &imported).is_empty());
+    assert!(complete_import(&mut b, &AirSettings::default(), &imported).is_empty());
     assert!(b.pending_rollovers().is_empty() && b.pending_fsp().is_empty());
     assert_eq!(fsp_total(&b), 13);
     assert_eq!(b.balance().fsp_by_service[&hex], 13);
@@ -778,14 +802,13 @@ fn an_fsp_handoff_carries_the_did_key_and_the_notes_work_at_the_fsp_mint() {
 
 #[test]
 fn the_old_combined_handoff_and_wrong_kinds_are_refused_at_the_wallet() {
-    let rt = Runtime::new().unwrap();
     let dir = scratch("wrong");
-    let m = start_psp(&rt, &dir);
+    let m = start_psp(&dir);
     let mut dev = psp_wallet(&m, &dir, "dev", vec![m.note(4), m.note(2)]);
     let mut user = psp_wallet(&m, &dir, "user", vec![]);
     let ids = dev.select_psp_handoff(6).unwrap();
     let out = dev
-        .export_psp_handoff(&ids, &m.url, &did(7).public_key())
+        .export_psp_handoff(&ids, RECORD, &did(7).public_key())
         .unwrap();
     // A PSP string is not an FSP handoff and the reverse, and the old prefix is gone.
     assert!(user.import_fsp_handoff(&out.text, "").is_err());

@@ -1,17 +1,23 @@
-//! Redemption over HTTP, end to end, the way the `redeem` command does it: an
-//! ESP server with its own mint and the operator's admin listener, and a
-//! service wallet that reads `GET /fees`, builds and signs the canonical
-//! request, sends it, and collects the outcome by sending it again.
+//! Redemption over AIR, end to end, the way the `redeem` command does it: an ESP
+//! mint answering on its real AIR listener, the operator's admin routes (HTTP,
+//! local to the SPI), and a service wallet that reads the ESP's fees, builds and
+//! signs the canonical request, sends it, and collects the outcome by sending it
+//! again.
 //!
 //! A redemption never calls the PSP, so the PSP stand-in refuses every call.
-//! These are plain tests with their own runtime, because they use the blocking
-//! HTTP client.
+//! These are plain tests with their own runtime, because the operator's calls
+//! use the blocking HTTP client. The AIR client always dials port 5702, so they
+//! need that port free, and they take turns on one `air_server` (see
+//! `common/mod.rs`); they are built only with the `air-listener-tests` feature.
+
+mod common;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use axum::Router;
-use ecash_wallet::http::{fetch_redeem_fees, send_redeem};
+use ecash_wallet::config::AirSettings;
+use ecash_wallet::mint_info::{fetch_redeem_fees, send_redeem, sync_esp_keysets};
 use ecash_wallet::redeem::{EntryOutcome, RedeemOutcome, RedemptionState};
 use ecash_wallet::store::{HandedNote, Handover};
 use ecash_wallet::{Wallet, WalletError};
@@ -20,7 +26,7 @@ use esp_mint::exchange::{Burn, Psp};
 use esp_mint::queue::Queue;
 use esp_mint::redeem::{self, Reason};
 use esp_mint::responses::Responses;
-use esp_mint::server::{self, EspState};
+use esp_mint::server::EspState;
 use esp_mint::terms::Terms;
 use mint_types::{Amount, BlindNonce, MintInput, MintOutput, Nonce, Note};
 use rand::rngs::OsRng;
@@ -28,6 +34,8 @@ use secp256k1::{Keypair, SECP256K1, SecretKey};
 use serde_json::{Value, json};
 use sp_wire::ServiceDid;
 use tokio::runtime::Runtime;
+
+use common::EspAt;
 
 /// A test amount, a power of two (about $1.10). Every ESP note is one.
 const ONE: u64 = 1 << 40;
@@ -40,6 +48,9 @@ const PAST2: u64 = 200;
 const FUTURE: u64 = 1_000_000;
 const RATE: u128 = 1_000_000;
 const MEMO: &str = "btc:bc1qpayhere";
+/// What the wallet's records call the ESP (a key for its live keysets). Nothing
+/// dials it.
+const RECORD: &str = "http://127.0.0.1:3100";
 
 fn now() -> u64 {
     std::time::SystemTime::now()
@@ -96,10 +107,13 @@ fn serve(rt: &Runtime, app: Router) -> String {
 }
 
 struct Mint {
-    esp: String,
+    /// The wallet's `[air]` settings pointing at the ESP mint.
+    air: AirSettings,
     admin: String,
     state: Arc<EspState>,
     queue_path: PathBuf,
+    /// Last, so the turn on the AIR server ends after the rest is dropped.
+    _esp: EspAt,
 }
 
 fn start(rt: &Runtime, dir: &Path, max_bytes: usize) -> Mint {
@@ -122,7 +136,10 @@ fn start(rt: &Runtime, dir: &Path, max_bytes: usize) -> Mint {
         rotor: None,
         rollovers: None,
     });
-    let esp = serve(rt, server::router(Arc::clone(&state)));
+    // The listener keeps its state in a folder of its own, outside `dir`, which a
+    // test removes while the listener is still running.
+    let esp = EspAt::new(Arc::clone(&state), &scratch("airstate"));
+    let air = esp.air(10, 3);
     let admin = serve(
         rt,
         admin::router(Arc::new(AdminState {
@@ -133,10 +150,11 @@ fn start(rt: &Runtime, dir: &Path, max_bytes: usize) -> Mint {
         })),
     );
     Mint {
-        esp,
+        air,
         admin,
         state,
         queue_path,
+        _esp: esp,
     }
 }
 
@@ -228,7 +246,7 @@ fn send(mint: &Mint, wallet: &mut Wallet, mut id: String) -> RedeemOutcome {
             .unwrap()
             .body()
             .unwrap();
-        match send_redeem(&mint.esp, &body) {
+        match send_redeem(wallet, &mint.air, &body) {
             Ok(response) => return wallet.finish_redemption(&id, &response).unwrap(),
             Err(WalletError::RedeemRefused {
                 code,
@@ -252,14 +270,14 @@ fn queued_then_declined_then_collected_with_the_fee_shown_and_retries_idempotent
     let rt = Runtime::new().unwrap();
     let mint = start(&rt, &dir, 1 << 20);
     let mut wallet = Wallet::open(&dir.join("wallet.json")).unwrap();
-    ecash_wallet::http::sync_esp_keysets(&mut wallet, &mint.esp).unwrap();
+    sync_esp_keysets(&mut wallet, &mint.air, RECORD).unwrap();
     let a = handed(&mint, 4 * ONE, PAST);
     let b = handed(&mint, 2 * ONE, PAST2);
     let (na, nb) = (a.note, b.note);
     give(&mut wallet, PAST, vec![a]);
     give(&mut wallet, PAST2, vec![b]);
 
-    let fees = fetch_redeem_fees(&mint.esp).unwrap();
+    let fees = fetch_redeem_fees(&mut wallet, &mint.air).unwrap();
     assert_eq!(fees.fee_per_byte, RATE);
     assert_eq!(fees.max_request_bytes, 1 << 20);
     let built = wallet
@@ -299,7 +317,7 @@ fn queued_then_declined_then_collected_with_the_fee_shown_and_retries_idempotent
     assert_eq!(Queue::open(&mint.queue_path).unwrap().len(), 1);
     // and the wallet survives a reopen with the redemption still waiting
     let mut wallet = Wallet::open(&dir.join("wallet.json")).unwrap();
-    ecash_wallet::http::sync_esp_keysets(&mut wallet, &mint.esp).unwrap();
+    sync_esp_keysets(&mut wallet, &mint.air, RECORD).unwrap();
     assert_eq!(wallet.pending_redemptions().len(), 1);
 
     admin_post(
@@ -338,9 +356,9 @@ fn a_paid_entry_is_collected_as_completed() {
     let rt = Runtime::new().unwrap();
     let mint = start(&rt, &dir, 1 << 20);
     let mut wallet = Wallet::open(&dir.join("wallet.json")).unwrap();
-    ecash_wallet::http::sync_esp_keysets(&mut wallet, &mint.esp).unwrap();
+    sync_esp_keysets(&mut wallet, &mint.air, RECORD).unwrap();
     give(&mut wallet, PAST, vec![handed(&mint, ONE, PAST)]);
-    let fees = fetch_redeem_fees(&mint.esp).unwrap();
+    let fees = fetch_redeem_fees(&mut wallet, &mint.air).unwrap();
     let b = wallet
         .build_redemption(&secret(1), MEMO, &fees, now())
         .unwrap()
@@ -369,7 +387,7 @@ fn a_note_immature_at_the_mint_is_refunded_and_nothing_owed_fee_taken() {
     let rt = Runtime::new().unwrap();
     let mint = start(&rt, &dir, 1 << 20);
     let mut wallet = Wallet::open(&dir.join("wallet.json")).unwrap();
-    ecash_wallet::http::sync_esp_keysets(&mut wallet, &mint.esp).unwrap();
+    sync_esp_keysets(&mut wallet, &mint.air, RECORD).unwrap();
     // a small mature note that cannot pay the fee, and a large one the mint
     // will find immature
     let small = handed(&mint, SMALL, PAST);
@@ -377,7 +395,7 @@ fn a_note_immature_at_the_mint_is_refunded_and_nothing_owed_fee_taken() {
     let (ns, nb) = (small.note, big.note);
     give(&mut wallet, PAST, vec![small]);
     give(&mut wallet, FUTURE, vec![big]);
-    let fees = fetch_redeem_fees(&mint.esp).unwrap();
+    let fees = fetch_redeem_fees(&mut wallet, &mint.air).unwrap();
     // On the wallet's own clock the big note is not mature, so it is left out
     // and the small one alone is below the fee.
     assert!(matches!(
@@ -432,9 +450,9 @@ fn a_note_spent_elsewhere_is_dropped_on_rebuild_and_the_rest_is_queued() {
         keyset: x.keyset.clone(),
     };
     let mut first = Wallet::open(&dir.join("first.json")).unwrap();
-    ecash_wallet::http::sync_esp_keysets(&mut first, &mint.esp).unwrap();
+    sync_esp_keysets(&mut first, &mint.air, RECORD).unwrap();
     give(&mut first, PAST, vec![x]);
-    let fees = fetch_redeem_fees(&mint.esp).unwrap();
+    let fees = fetch_redeem_fees(&mut first, &mint.air).unwrap();
     let b = first
         .build_redemption(&secret(1), MEMO, &fees, now())
         .unwrap()
@@ -442,7 +460,7 @@ fn a_note_spent_elsewhere_is_dropped_on_rebuild_and_the_rest_is_queued() {
     send(&mint, &mut first, b.id);
     // a second copy of the wallet still holds the same note, and one more
     let mut second = Wallet::open(&dir.join("second.json")).unwrap();
-    ecash_wallet::http::sync_esp_keysets(&mut second, &mint.esp).unwrap();
+    sync_esp_keysets(&mut second, &mint.air, RECORD).unwrap();
     give(&mut second, PAST, vec![copy, handed(&mint, 2 * ONE, PAST)]);
     let b = second
         .build_redemption(&secret(1), MEMO, &fees, now())
@@ -470,9 +488,9 @@ fn a_below_fee_refusal_moves_the_notes_the_mint_calls_spent_to_the_spent_record(
         keyset: x.keyset.clone(),
     };
     let mut first = Wallet::open(&dir.join("first.json")).unwrap();
-    ecash_wallet::http::sync_esp_keysets(&mut first, &mint.esp).unwrap();
+    sync_esp_keysets(&mut first, &mint.air, RECORD).unwrap();
     give(&mut first, PAST, vec![x]);
-    let fees = fetch_redeem_fees(&mint.esp).unwrap();
+    let fees = fetch_redeem_fees(&mut first, &mint.air).unwrap();
     let b = first
         .build_redemption(&secret(1), MEMO, &fees, now())
         .unwrap()
@@ -483,7 +501,7 @@ fn a_below_fee_refusal_moves_the_notes_the_mint_calls_spent_to_the_spent_record(
     // a second wallet holds only a copy of the spent note. It looks worth the
     // fee to the wallet, but to the mint it is worth nothing: below_fee
     let mut second = Wallet::open(&dir.join("second.json")).unwrap();
-    ecash_wallet::http::sync_esp_keysets(&mut second, &mint.esp).unwrap();
+    sync_esp_keysets(&mut second, &mint.air, RECORD).unwrap();
     give(&mut second, PAST, vec![copy]);
     let b = second
         .build_redemption(&secret(1), MEMO, &fees, now())
@@ -496,7 +514,7 @@ fn a_below_fee_refusal_moves_the_notes_the_mint_calls_spent_to_the_spent_record(
         .unwrap()
         .body()
         .unwrap();
-    let refused = send_redeem(&mint.esp, &body).unwrap_err();
+    let refused = send_redeem(&mut second, &mint.air, &body).unwrap_err();
     let WalletError::RedeemRefused { code, notes, .. } = &refused else {
         panic!("expected a refusal, got {refused:?}");
     };
@@ -528,7 +546,7 @@ fn a_redemption_over_the_ceiling_is_split_and_each_part_is_queued() {
     let ceiling = redeem::encoded_len(2, MEMO.len(), most, most);
     let mint = start(&rt, &dir, ceiling as usize);
     let mut wallet = Wallet::open(&dir.join("wallet.json")).unwrap();
-    ecash_wallet::http::sync_esp_keysets(&mut wallet, &mint.esp).unwrap();
+    sync_esp_keysets(&mut wallet, &mint.air, RECORD).unwrap();
     give(
         &mut wallet,
         PAST,
@@ -539,7 +557,7 @@ fn a_redemption_over_the_ceiling_is_split_and_each_part_is_queued() {
         PAST2,
         (0..2).map(|_| handed(&mint, ONE, PAST2)).collect(),
     );
-    let fees = fetch_redeem_fees(&mint.esp).unwrap();
+    let fees = fetch_redeem_fees(&mut wallet, &mint.air).unwrap();
     assert_eq!(fees.max_request_bytes, ceiling);
     let built = wallet
         .build_redemption(&secret(1), MEMO, &fees, now())
@@ -564,9 +582,9 @@ fn notes_below_the_fee_and_notes_of_another_service_are_refused_locally() {
     let rt = Runtime::new().unwrap();
     let mint = start(&rt, &dir, 1 << 20);
     let mut wallet = Wallet::open(&dir.join("wallet.json")).unwrap();
-    ecash_wallet::http::sync_esp_keysets(&mut wallet, &mint.esp).unwrap();
+    sync_esp_keysets(&mut wallet, &mint.air, RECORD).unwrap();
     give(&mut wallet, PAST, vec![handed(&mint, 1_000, PAST)]);
-    let fees = fetch_redeem_fees(&mint.esp).unwrap();
+    let fees = fetch_redeem_fees(&mut wallet, &mint.air).unwrap();
     assert!(matches!(
         wallet.build_redemption(&secret(1), MEMO, &fees, now()),
         Err(WalletError::NotEnough(_))

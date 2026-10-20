@@ -20,8 +20,8 @@
 //! [`Wallet::export_psp_handoff`] and [`Wallet::export_fsp_handoff`] make a
 //! handoff, [`Wallet::import_handoff`] (or the two kind-specific imports) takes
 //! one in, the swap that a PSP import stores is sent by
-//! [`crate::http::complete_import`], and the sender's questions to the mint are
-//! asked by [`crate::http::check_handoff`] and [`crate::http::reclaim_handoff`].
+//! [`crate::mint_info::complete_import`], and the sender's questions to the mint are
+//! asked by [`crate::mint_info::check_handoff`] and [`crate::mint_info::reclaim_handoff`].
 //!
 //! # PSP handoff
 //!
@@ -37,7 +37,7 @@
 //! mint's current key set) is stored in the same write, which the caller sends
 //! at once. The wallet swaps them first whenever the mint can be reached: on
 //! import, then on every later connection (the startup sync,
-//! [`crate::http::rotation_sync`], sends stored swaps before anything else). Until
+//! [`crate::mint_info::rotation_sync`], sends stored swaps before anything else). Until
 //! the swap goes through the notes are **unswapped**: they count in the
 //! balance ([`crate::store::Balance::psp`], with
 //! [`crate::store::Balance::unswapped_psp`] saying how much of it is still
@@ -1314,7 +1314,7 @@ impl Wallet {
     /// Store a swap of what is left of PSP handoff `id` back to this wallet, for
     /// fresh notes only this wallet knows, before anything is sent. Returns the
     /// stored swap's id; calling it again returns the same one while it is out.
-    /// The caller sends it ([`crate::http::reclaim_handoff`]).
+    /// The caller sends it ([`crate::mint_info::reclaim_handoff`]).
     pub fn begin_reclaim(&mut self, id: &str) -> Result<String, WalletError> {
         let h = self.askable(id)?;
         if h.state != HandoffState::Pending {
@@ -1487,7 +1487,7 @@ impl Wallet {
     /// Take in a PSP handoff, opened with the recipient's DID secret key. The
     /// notes are not added: a swap at the PSP mint is stored in the same write
     /// as the import record, and the caller sends it
-    /// ([`crate::http::complete_import`]). There is no way to import one
+    /// ([`crate::mint_info::complete_import`]). There is no way to import one
     /// without the swap.
     pub fn import_psp_handoff(
         &mut self,

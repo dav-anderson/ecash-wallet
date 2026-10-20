@@ -42,8 +42,6 @@ pub enum WalletError {
     /// The mint could not be reached, or answered with a fault. The outcome may
     /// be unknown, and retrying the same request is safe.
     Mint(String),
-    /// A feature that waits on its mint.
-    NotBuilt(&'static str),
     /// The mint speaks another wire version than this wallet (or reports none).
     /// Nothing was sent. Update whichever is older.
     Wire {
@@ -97,7 +95,6 @@ impl fmt::Display for WalletError {
                 write!(f, "the mint refused the redemption ({code}): {why}")
             }
             WalletError::Mint(e) => write!(f, "{e}"),
-            WalletError::NotBuilt(what) => write!(f, "not built yet: {what}"),
             WalletError::Wire { url, why } => {
                 write!(
                     f,

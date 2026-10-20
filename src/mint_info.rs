@@ -1,7 +1,7 @@
-//! Which way the wallet's calls to the PSP and the ESP are made: over AIR when
-//! the wallet is configured for it, otherwise over HTTP. This is the one place
-//! that decides, so the library's callers (the command line, an app, the tests)
-//! all get the same rule.
+//! The wallet's calls to the PSP and the ESP. They are made over AIR and only
+//! over AIR: there is no HTTP form of any of them. This is the one place that
+//! says which call goes to which mint, so the library's callers (the command
+//! line, an app, the tests) all get the same rule.
 //!
 //! **The PSP's** calls are its mint info ([`verify_psp`]), its keys, keysets and
 //! rotation ([`psp_keys`], [`psp_keysets`], [`psp_window`], and the calls built
@@ -14,20 +14,19 @@
 //! fees ([`sync_esp_limits`], [`fetch_redeem_fees`]), rotation ([`esp_window`])
 //! and rollover ([`esp_post`], used by [`rotation_sync`]), and the three calls
 //! that spend: [`send_exchange`], [`send_transfer`] and [`send_redeem`]. The ESP
-//! has no `GET /keys` (its keys arrive in the replies) and its `GET /audit` is the
-//! operator's, so neither is here.
+//! has no keys call (its keys arrive in the replies).
 //!
-//! **Over AIR** needs `air.server` and `air.host`
-//! ([`crate::config::AirSettings::is_configured`]; the DIDs are `air.psp_did` and
-//! `air.esp_did`, or the built-in ones, PLACEHOLDERS until the first SPI deploy)
-//! and the `air` feature. The PSP and the ESP share the AIR server and have their
-//! own DIDs. **Over HTTP** is what the `http` functions do, as before; it is also
-//! what every call other than these still uses (and the FSP mints, whose calls
-//! never go over AIR here). HTTP is to be removed completely once the AIR
-//! integration is done: each HTTP branch is one small function named `http_*` or
-//! [`over_http`], with one call each, so removing HTTP removes these and the
-//! `!air.is_configured()` lines and nothing else. Nothing is cached here, as
-//! nothing was over HTTP: every call asks again.
+//! **They need `air.server` and `air.host`** ([`AirSettings::require`]; the DIDs
+//! are `air.psp_did` and `air.esp_did`, or the built-in ones, PLACEHOLDERS until
+//! the first SPI deploy). A call made without them fails with an error that
+//! names the missing setting. The PSP and the ESP share the AIR server and have
+//! their own DIDs. What is left on HTTP is the FSP mints' calls ([`crate::http`],
+//! feature `http`). Nothing is cached here: every call asks again.
+//!
+//! **`base` names a mint in the wallet's records** (its live keysets, its swap
+//! times, the mint a handoff names); it is never dialled. The PSP and the ESP are
+//! each one mint, found by their DID, so a record of either is found by its
+//! kind.
 
 use std::collections::BTreeMap;
 
@@ -40,353 +39,192 @@ use sp_wire::air_request::{
 use sp_wire::esp::exchange::{ExchangeRequest, ExchangeResponse};
 use sp_wire::esp::redeem::RedeemResponse;
 use sp_wire::esp::transfer::{TransferRequest, TransferResponse};
+use sp_wire::keys::{CheckStateRequest, CheckStateResponse};
 
 use crate::Wallet;
 use crate::config::{AirSettings, Party};
 use crate::error::WalletError;
 use crate::redeem::RedeemFees;
 use crate::rotate::Window;
+use crate::store::Kind;
 
-/// Check a mint's wire version and network before anything else is sent to it:
-/// over AIR (to the mint's DID) when `air` is configured, else over HTTP at
-/// `base`. `expected_network` is `main`, `regtest`, `signet` or `testnet`.
-fn verify(
-    wallet: &mut Wallet,
-    air: &AirSettings,
-    party: Party,
-    base: &str,
-    expected_network: &str,
-) -> Result<(), WalletError> {
-    if !air.is_configured() {
-        return over_http(base, expected_network);
-    }
-    over_air(wallet, air, party, expected_network)
-}
-
-/// Check the PSP's wire version and network before anything else is sent to it:
-/// over AIR (to the PSP's DID: `air.psp_did`, or the built-in one) when `air` is
-/// configured, else over HTTP at `base`.
+/// Check the PSP's wire version and network before anything else is sent to it,
+/// over AIR (to the PSP's DID: `air.psp_did`, or the built-in one).
+/// `expected_network` is `main`, `regtest`, `signet` or `testnet`.
 pub fn verify_psp(
     wallet: &mut Wallet,
     air: &AirSettings,
-    base: &str,
     expected_network: &str,
 ) -> Result<(), WalletError> {
-    verify(wallet, air, Party::Psp, base, expected_network)
+    crate::air::verify_mint(wallet, air, Party::Psp, expected_network)
 }
 
-/// Check the ESP's wire version and network before anything else is sent to it:
-/// over AIR (to the ESP's own DID: `air.esp_did`, or the built-in one) when `air`
-/// is configured, else over HTTP at `base`.
+/// Check the ESP's wire version and network before anything else is sent to it,
+/// over AIR (to the ESP's own DID: `air.esp_did`, or the built-in one).
 pub fn verify_esp(
     wallet: &mut Wallet,
     air: &AirSettings,
-    base: &str,
     expected_network: &str,
 ) -> Result<(), WalletError> {
-    verify(wallet, air, Party::Esp, base, expected_network)
+    crate::air::verify_mint(wallet, air, Party::Esp, expected_network)
 }
 
-#[cfg(feature = "air")]
-fn over_air(
-    wallet: &mut Wallet,
-    air: &AirSettings,
-    party: Party,
-    network: &str,
-) -> Result<(), WalletError> {
-    crate::air::verify_mint(wallet, air, party, network)
-}
+// ---------------------------------------------------------------- the PSP
 
-#[cfg(not(feature = "air"))]
-fn over_air(_: &mut Wallet, _: &AirSettings, _: Party, _: &str) -> Result<(), WalletError> {
-    Err(WalletError::Invalid(NO_AIR.into()))
-}
-
-/// The HTTP branch: the only call to `http::verify_mint`, for the PSP and the
-/// ESP. To remove HTTP, delete this function and the `!air.is_configured()` line
-/// above.
-#[cfg(feature = "http")]
-fn over_http(base: &str, network: &str) -> Result<(), WalletError> {
-    crate::http::verify_mint(base, network)
-}
-
-#[cfg(not(feature = "http"))]
-fn over_http(_: &str, _: &str) -> Result<(), WalletError> {
-    Err(WalletError::NotBuilt(
-        "the HTTP calls (feature `http`) and AIR is not configured",
-    ))
-}
-
-// ---------------------------------------------------------------- keys, keysets, rotation
-
-/// A read-only question to a mint over AIR, read as the type its HTTP route
-/// returns.
-#[cfg(feature = "air")]
-fn air_fetch<T: serde::de::DeserializeOwned>(
-    wallet: &mut Wallet,
-    air: &AirSettings,
-    party: Party,
-    kind: u8,
-) -> Result<T, WalletError> {
-    crate::air::fetch(wallet, air, party, kind)
-}
-
-#[cfg(not(feature = "air"))]
-fn air_fetch<T>(_: &mut Wallet, _: &AirSettings, _: Party, _: u8) -> Result<T, WalletError> {
-    Err(WalletError::Invalid(NO_AIR.into()))
-}
-
-/// [`air_fetch`] for a body the caller reads itself: its text.
-#[cfg(feature = "air")]
-fn air_text(
-    wallet: &mut Wallet,
-    air: &AirSettings,
-    party: Party,
-    kind: u8,
-) -> Result<String, WalletError> {
-    crate::air::fetch_text(wallet, air, party, kind)
-}
-
-#[cfg(not(feature = "air"))]
-fn air_text(_: &mut Wallet, _: &AirSettings, _: Party, _: u8) -> Result<String, WalletError> {
-    Err(WalletError::Invalid(NO_AIR.into()))
-}
-
-#[cfg(not(feature = "air"))]
-const NO_AIR: &str = "air.server and air.host are set, but this build of the wallet has no AIR (the `air` feature is off). Unset them to use HTTP";
-
-/// The PSP's public key for each note size: `GET /keys`, or over AIR a signed
-/// reply with the same body.
+/// The PSP's public key for each note size: a signed reply over AIR.
 pub fn psp_keys(
     wallet: &mut Wallet,
     air: &AirSettings,
-    base: &str,
 ) -> Result<BTreeMap<Amount, PublicKey>, WalletError> {
-    if !air.is_configured() {
-        return http_keys(base);
-    }
-    let reply: sp_wire::keys::KeysResponse = air_fetch(wallet, air, Party::Psp, KIND_KEYS)?;
+    let reply: sp_wire::keys::KeysResponse = crate::air::fetch(wallet, air, Party::Psp, KIND_KEYS)?;
     Ok(reply.keys)
 }
 
-/// The PSP's live keysets: `GET /keysets`, or over AIR.
+/// The PSP's live keysets.
 pub fn psp_keysets(
     wallet: &mut Wallet,
     air: &AirSettings,
-    base: &str,
 ) -> Result<sp_wire::psp::KeysetsResponse, WalletError> {
-    if !air.is_configured() {
-        return http_keysets(base);
-    }
-    air_fetch(wallet, air, Party::Psp, KIND_KEYSETS)
+    crate::air::fetch(wallet, air, Party::Psp, KIND_KEYSETS)
 }
 
-/// The PSP's rotation window: `GET /rotation`, or over AIR.
-pub fn psp_window(
-    wallet: &mut Wallet,
-    air: &AirSettings,
-    base: &str,
-) -> Result<Window, WalletError> {
-    if !air.is_configured() {
-        return http_window(base);
-    }
-    let reply: sp_wire::fsp::RotationResponse = air_fetch(wallet, air, Party::Psp, KIND_ROTATION)?;
+/// The PSP's rotation window.
+pub fn psp_window(wallet: &mut Wallet, air: &AirSettings) -> Result<Window, WalletError> {
+    let reply: sp_wire::fsp::RotationResponse =
+        crate::air::fetch(wallet, air, Party::Psp, KIND_ROTATION)?;
     Ok(reply.into())
 }
 
 /// Read the PSP's largest note size from its keys (the highest amount it has a
 /// key for) and give it to the wallet, so no cap is written into the wallet.
-pub fn sync_psp_limits(
-    wallet: &mut Wallet,
-    air: &AirSettings,
-    base: &str,
-) -> Result<(), WalletError> {
-    let keys = psp_keys(wallet, air, base)?;
+pub fn sync_psp_limits(wallet: &mut Wallet, air: &AirSettings) -> Result<(), WalletError> {
+    let keys = psp_keys(wallet, air)?;
     wallet.set_psp_max_denomination(keys.keys().map(|a| a.units).max());
     Ok(())
 }
 
 /// The keys to unblind a PSP settlement's signatures with (see
-/// [`crate::psp::claim_keys_with`]), read over AIR when configured.
+/// [`crate::psp::claim_keys_with`]).
 pub fn psp_claim_keys(
     wallet: &mut Wallet,
     air: &AirSettings,
-    base: &str,
     settlement_text: &str,
 ) -> Result<BTreeMap<Amount, PublicKey>, WalletError> {
-    if !air.is_configured() {
-        return http_claim_keys(base, settlement_text);
-    }
     let wallet = std::cell::RefCell::new(wallet);
     crate::psp::claim_keys_with(
         settlement_text,
         || {
             let reply: sp_wire::keys::KeysResponse =
-                air_fetch(&mut wallet.borrow_mut(), air, Party::Psp, KIND_KEYS)?;
+                crate::air::fetch(&mut wallet.borrow_mut(), air, Party::Psp, KIND_KEYS)?;
             Ok(reply.keys)
         },
-        || air_fetch(&mut wallet.borrow_mut(), air, Party::Psp, KIND_KEYSETS),
+        || crate::air::fetch(&mut wallet.borrow_mut(), air, Party::Psp, KIND_KEYSETS),
     )
 }
 
 /// A POST to the PSP: `route` is `rollover` or `check-state`, `body` the request
-/// JSON. Over AIR when configured (a sealed request, a signed reply, a refusal
-/// that maps to the HTTP `400` of the same meaning), else the HTTP POST.
-/// This is the [`crate::http::Post`] of every PSP call below.
+/// JSON. A sealed request, a signed reply, and a refusal that maps to the `400`
+/// of the same meaning ([`WalletError::Refused`], or
+/// [`WalletError::SpentElsewhere`] with the notes).
 pub fn psp_post(
     wallet: &mut Wallet,
     air: &AirSettings,
-    base: &str,
     route: &str,
     body: &[u8],
 ) -> Result<serde_json::Value, WalletError> {
-    if !air.is_configured() {
-        return http_post(base, route, body);
-    }
     let kind = match route {
         "rollover" => KIND_ROLLOVER,
         "check-state" => KIND_CHECK_STATE,
         other => {
             return Err(WalletError::Invalid(format!(
-                "`{other}` is not a call the PSP takes over AIR (only rollover and check-state are)"
+                "`{other}` is not a call the PSP takes (only rollover and check-state are)"
             )));
         }
     };
-    air_post(wallet, air, Party::Psp, kind, body)
-}
-
-#[cfg(feature = "air")]
-fn air_post(
-    wallet: &mut Wallet,
-    air: &AirSettings,
-    party: Party,
-    kind: u8,
-    body: &[u8],
-) -> Result<serde_json::Value, WalletError> {
-    crate::air::post(wallet, air, party, kind, body)
-}
-
-#[cfg(not(feature = "air"))]
-fn air_post(
-    _: &mut Wallet,
-    _: &AirSettings,
-    _: Party,
-    _: u8,
-    _: &[u8],
-) -> Result<serde_json::Value, WalletError> {
-    Err(WalletError::Invalid(NO_AIR.into()))
+    crate::air::post(wallet, air, Party::Psp, kind, body)
 }
 
 // ---------------------------------------------------------------- the ESP
 
-/// The ESP mint's live keyset IDs: `GET /keysets`, or over AIR; remembered in the
-/// wallet (new outputs name the current one, and notes from before keysets were
-/// recorded fall back to them). See [`crate::http::sync_esp_keysets`].
+/// The ESP mint's live keyset IDs, remembered in the wallet under `base` (new
+/// outputs name the current one, and notes from before keysets were recorded
+/// fall back to them).
 pub fn sync_esp_keysets(
     wallet: &mut Wallet,
     air: &AirSettings,
     base: &str,
 ) -> Result<(), WalletError> {
-    if !air.is_configured() {
-        return http_sync_esp_keysets(wallet, base);
-    }
-    let v: serde_json::Value = air_fetch(wallet, air, Party::Esp, KIND_KEYSETS)?;
+    let v: serde_json::Value = crate::air::fetch(wallet, air, Party::Esp, KIND_KEYSETS)?;
     let current = v["current"]
         .as_str()
         .ok_or_else(|| WalletError::Mint("keysets over AIR: no current keyset".into()))?;
     wallet.note_esp_keysets(base, current, v["previous"].as_str())
 }
 
-/// The ESP mint's note limits: `GET /fees`, or over AIR; given to the wallet (see
+/// The ESP mint's note limits, given to the wallet (see
 /// [`crate::store::EspLimits`]), so no limit is written into the wallet.
-pub fn sync_esp_limits(
-    wallet: &mut Wallet,
-    air: &AirSettings,
-    base: &str,
-) -> Result<(), WalletError> {
-    if !air.is_configured() {
-        return http_sync_esp_limits(wallet, base);
-    }
-    let text = air_text(wallet, air, Party::Esp, KIND_FEES)?;
+pub fn sync_esp_limits(wallet: &mut Wallet, air: &AirSettings) -> Result<(), WalletError> {
+    let text = crate::air::fetch_text(wallet, air, Party::Esp, KIND_FEES)?;
     let limits = crate::esp_replies::parse_esp_limits(&text)
         .map_err(|why| WalletError::Mint(format!("fees over AIR: {why}")))?;
     wallet.set_esp_limits(limits);
     Ok(())
 }
 
-/// The ESP mint's redemption fee rate and ceilings: `GET /fees` (`redeem`), or
-/// over AIR.
+/// The ESP mint's redemption fee rate and ceilings (the `redeem` part of its
+/// fees).
 pub fn fetch_redeem_fees(
     wallet: &mut Wallet,
     air: &AirSettings,
-    base: &str,
 ) -> Result<RedeemFees, WalletError> {
-    if !air.is_configured() {
-        return http_fetch_redeem_fees(base);
-    }
-    let text = air_text(wallet, air, Party::Esp, KIND_FEES)?;
+    let text = crate::air::fetch_text(wallet, air, Party::Esp, KIND_FEES)?;
     crate::esp_replies::parse_redeem_fees(&text)
         .map_err(|why| WalletError::Mint(format!("fees over AIR: {why}")))
 }
 
-/// The ESP's rotation window: `GET /rotation`, or over AIR. A mint that does not
-/// rotate answers `404` over HTTP and a signed refusal that says `404` over AIR:
-/// an error either way.
-pub fn esp_window(
-    wallet: &mut Wallet,
-    air: &AirSettings,
-    base: &str,
-) -> Result<Window, WalletError> {
-    if !air.is_configured() {
-        return http_window(base);
-    }
-    let reply: sp_wire::fsp::RotationResponse = air_fetch(wallet, air, Party::Esp, KIND_ROTATION)?;
+/// The ESP's rotation window. A mint that does not rotate answers with a signed
+/// refusal that says `404`: an error.
+pub fn esp_window(wallet: &mut Wallet, air: &AirSettings) -> Result<Window, WalletError> {
+    let reply: sp_wire::fsp::RotationResponse =
+        crate::air::fetch(wallet, air, Party::Esp, KIND_ROTATION)?;
     Ok(reply.into())
 }
 
-/// A POST to the ESP: `route` is `rollover` (the one a [`crate::http::Post`]
-/// makes), `body` the request JSON. Over AIR when configured, else the HTTP POST.
+/// A POST to the ESP: `route` is `rollover` (the one a rotation sync makes),
+/// `body` the request JSON.
 pub fn esp_post(
     wallet: &mut Wallet,
     air: &AirSettings,
-    base: &str,
     route: &str,
     body: &[u8],
 ) -> Result<serde_json::Value, WalletError> {
-    if !air.is_configured() {
-        return http_post(base, route, body);
-    }
     match route {
-        "rollover" => air_post(wallet, air, Party::Esp, KIND_ROLLOVER, body),
+        "rollover" => crate::air::post(wallet, air, Party::Esp, KIND_ROLLOVER, body),
         other => Err(WalletError::Invalid(format!(
-            "`{other}` is not a call a rotation sync makes of the ESP over AIR (only rollover is)"
+            "`{other}` is not a call a rotation sync makes of the ESP (only rollover is)"
         ))),
     }
 }
 
-/// Send an exchange to the ESP mint: `POST /exchange`, or over AIR (a sealed
-/// request, the same JSON body, a signed reply).
+/// Send an exchange to the ESP mint (a sealed request, the JSON body, a signed
+/// reply).
 ///
-/// A `400` (over AIR a signed refusal without an `http_status`) is
+/// A `400` (a signed refusal without an `http_status`) is
 /// [`WalletError::Refused`], or [`WalletError::SpentElsewhere`] with the PSP
 /// notes the mint names: nothing was burned, and the pending exchange can be
 /// cancelled. Anything else that goes wrong is [`WalletError::Mint`], where the
-/// outcome may be unknown: a `409 in_progress` (over AIR a refusal that says
-/// `"http_status": 409`), a `5xx` (over AIR a signed "unavailable", the `502` of
-/// a PSP that could not be reached included), no reply. Send the same request
-/// again: the mint stores its answers by request hash, over HTTP and over AIR.
+/// outcome may be unknown: a refusal that says `"http_status": 409` (in
+/// progress), a signed "unavailable" (the mint's `5xx`, the `502` of a PSP that
+/// could not be reached included), no reply. Send the same request again: the
+/// mint stores its answers by request hash.
 pub fn send_exchange(
     wallet: &mut Wallet,
     air: &AirSettings,
-    base: &str,
     request: &ExchangeRequest,
 ) -> Result<ExchangeResponse, WalletError> {
-    if !air.is_configured() {
-        return http_send_exchange(base, request);
-    }
     let body = serde_json::to_vec(request)
         .map_err(|e| WalletError::Mint(format!("exchange over AIR: {e}")))?;
-    air_send_esp(
+    crate::air::send_esp(
         wallet,
         air,
         KIND_EXCHANGE,
@@ -396,20 +234,16 @@ pub fn send_exchange(
     )
 }
 
-/// Send a transfer to the ESP mint: `POST /transfer`, or over AIR. Refusals are
-/// read as the exchange's are ([`send_exchange`]).
+/// Send a transfer to the ESP mint. Refusals are read as the exchange's are
+/// ([`send_exchange`]).
 pub fn send_transfer(
     wallet: &mut Wallet,
     air: &AirSettings,
-    base: &str,
     request: &TransferRequest,
 ) -> Result<TransferResponse, WalletError> {
-    if !air.is_configured() {
-        return http_send_transfer(base, request);
-    }
     let body = serde_json::to_vec(request)
         .map_err(|e| WalletError::Mint(format!("transfer over AIR: {e}")))?;
-    air_send_esp(
+    crate::air::send_esp(
         wallet,
         air,
         KIND_TRANSFER,
@@ -419,8 +253,8 @@ pub fn send_transfer(
     )
 }
 
-/// Send a redemption to the ESP mint: `POST /redeem`, or over AIR; `body` is the
-/// canonical encoding as built by `Wallet::build_redemption`, sent as it is.
+/// Send a redemption to the ESP mint; `body` is the canonical encoding as built
+/// by `Wallet::build_redemption`, sent as it is.
 ///
 /// A `400` or `413` is [`WalletError::RedeemRefused`]: nothing was burned.
 /// Anything else that goes wrong is [`WalletError::Mint`], where the outcome may
@@ -429,13 +263,9 @@ pub fn send_transfer(
 pub fn send_redeem(
     wallet: &mut Wallet,
     air: &AirSettings,
-    base: &str,
     body: &[u8],
 ) -> Result<RedeemResponse, WalletError> {
-    if !air.is_configured() {
-        return http_send_redeem(base, body);
-    }
-    air_send_esp(
+    crate::air::send_esp(
         wallet,
         air,
         KIND_REDEEM,
@@ -445,238 +275,419 @@ pub fn send_redeem(
     )
 }
 
-#[cfg(feature = "air")]
-fn air_send_esp<R: serde::de::DeserializeOwned>(
-    wallet: &mut Wallet,
-    air: &AirSettings,
-    kind: u8,
-    body: &[u8],
-    refusal: &dyn Fn(&str) -> WalletError,
-    refusal_statuses: &[u16],
-) -> Result<R, WalletError> {
-    crate::air::send_esp(wallet, air, kind, body, refusal, refusal_statuses)
-}
-
-#[cfg(not(feature = "air"))]
-fn air_send_esp<R>(
-    _: &mut Wallet,
-    _: &AirSettings,
-    _: u8,
-    _: &[u8],
-    _: &dyn Fn(&str) -> WalletError,
-    _: &[u16],
-) -> Result<R, WalletError> {
-    Err(WalletError::Invalid(NO_AIR.into()))
-}
-
 // ---------------------------------------------------------------- rollover and handoffs
 
-/// Keep a PSP or ESP mint's notes on a live key set (see
-/// [`crate::http::rotation_sync`]). For the PSP and the ESP the window is read,
-/// and the rollovers are sent, over AIR when configured (each to its own DID);
-/// the FSP's never is.
-#[cfg(feature = "http")]
+/// Send one stored rollover and settle it. A refusal that burned nothing
+/// cancels it and frees its notes; the next sync builds a new one from a fresh
+/// read of the mint's window. The outputs name the keyset the wallet last saw,
+/// and a mint signs with any live keyset, so a rotation after the rollover was
+/// built does not refuse it.
+///
+/// A stored swap of notes received in a handoff (`handoff|...`) is different in
+/// one way: its notes are in the wallet's balance and can be spent, so it is
+/// first made to fit what the wallet still holds
+/// ([`Wallet::live_swap`]), and a note the mint says is spent is dropped from
+/// the balance instead of being freed (it was never this wallet's to free).
+fn send_rollover(wallet: &mut Wallet, id: &str, post: Post<'_>) -> Result<String, WalletError> {
+    let mut id = id.to_string();
+    let first = wallet
+        .pending_rollovers()
+        .iter()
+        .find(|p| p.id == id)
+        .map(|p| p.schedule.starts_with(crate::handoff::SWAP_TAG));
+    if first == Some(true) {
+        match wallet.live_swap(&id)? {
+            Some(live) => id = live,
+            None => {
+                return Ok(
+                    "the notes of a stored swap were spent before it was sent, so there is nothing left to swap"
+                        .into(),
+                );
+            }
+        }
+    }
+    let p = wallet
+        .pending_rollovers()
+        .iter()
+        .find(|p| p.id == id)
+        .cloned()
+        .ok_or_else(|| WalletError::Invalid(format!("no rollover {id}")))?;
+    let received = p.schedule.starts_with(crate::handoff::SWAP_TAG);
+    let body = serde_json::to_vec(&p.body)
+        .map_err(|e| WalletError::Mint(format!("{}/rollover: {e}", p.url)))?;
+    let reply: Result<serde_json::Value, WalletError> = post(wallet, "rollover", &body);
+    match reply {
+        Ok(v) => {
+            let (epoch, keyset, sigs, keys) = match p.kind {
+                Kind::Psp => {
+                    let r: sp_wire::psp::RolloverResponse =
+                        serde_json::from_value(v).map_err(|e| WalletError::Mint(e.to_string()))?;
+                    (
+                        r.epoch,
+                        r.keyset,
+                        r.outcomes.into_iter().map(|o| o.0).collect::<Vec<_>>(),
+                        r.keys,
+                    )
+                }
+                _ => {
+                    let r: sp_wire::esp::rollover::RolloverResponse =
+                        serde_json::from_value(v).map_err(|e| WalletError::Mint(e.to_string()))?;
+                    (r.epoch, r.keyset, r.signatures, r.keys)
+                }
+            };
+            wallet.finish_rollover(&id, epoch, &keyset, &sigs, &keys)?;
+            if received {
+                let units: u128 = p.outputs.iter().map(|o| u128::from(o.amount)).sum();
+                return Ok(format!(
+                    "swapped {units} PSP received in a handoff at the mint, for notes only this wallet knows: final"
+                ));
+            }
+            if p.schedule.starts_with(crate::handoff::RECLAIM_TAG) {
+                let units: u128 = p.outputs.iter().map(|o| u128::from(o.amount)).sum();
+                return Ok(format!(
+                    "reclaimed {units} PSP: the notes were swapped back at the mint for notes only this wallet knows"
+                ));
+            }
+            Ok(format!(
+                "rolled over {} note(s) to the current key set",
+                p.inputs.len()
+            ))
+        }
+        Err(WalletError::SpentElsewhere { why, inputs }) if received => {
+            // The mint refused the whole swap and burned nothing. The notes it
+            // names are spent: somebody reached the mint first (the sender
+            // reclaimed, or a copy was received first). They leave the balance;
+            // the rest are swapped now.
+            let (dropped, rest) = wallet.swap_found_spent(&id, &inputs)?;
+            if dropped == 0 {
+                return Ok(format!(
+                    "the mint refused the swap of received notes: {why}. The notes stay as they are"
+                ));
+            }
+            let mut text = format!(
+                "the mint says {dropped} note(s) received in a handoff were spent already ({why}), so they are not counted any more: whoever reached the mint first has them. Tell the sender"
+            );
+            if let Some(rest) = rest {
+                text.push_str(&format!(
+                    ". The rest: {}",
+                    send_rollover(wallet, &rest, &mut *post)?
+                ));
+            }
+            Ok(text)
+        }
+        Err(WalletError::Refused(why)) if received => {
+            // Refused for another reason (say its key set is retired): nothing
+            // was burned and the notes stay in the balance as they are.
+            wallet.cancel_rollover(&id)?;
+            Ok(format!(
+                "the mint refused the swap of received notes, which stay in the balance as they are: {why}"
+            ))
+        }
+        Err(WalletError::SpentElsewhere { why, .. } | WalletError::Refused(why))
+            if p.schedule.starts_with(crate::legacy::RECEIVE_TAG) =>
+        {
+            // A swap that `receive-psp` (wallet 0.4.0) stored: nothing here was
+            // ever this wallet's, so a refusal ends it.
+            wallet.cancel_rollover(&id)?;
+            Ok(format!(
+                "the mint refused the swap of received notes, so none of them was kept: {why}. Tell the sender"
+            ))
+        }
+        Err(WalletError::SpentElsewhere { why, inputs }) => {
+            // Some notes are spent. They leave the balance; the rest are free.
+            // (If this was a reclaim, the handoff goes back to pending in the
+            // same write, and the next `handoff check` reads the mint's record.)
+            let report = wallet.mark_spent_in_rollover(&id, &inputs)?;
+            Ok(format!(
+                "rollover refused ({why}): {} note(s) marked spent, {} freed",
+                report.marked_spent, report.freed
+            ))
+        }
+        Err(WalletError::Refused(why)) => {
+            wallet.cancel_rollover(&id)?;
+            Ok(format!("rollover refused, notes freed: {why}"))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Keep a PSP or ESP mint's notes on a live key set: finish stored rollovers,
+/// mark lost notes, and when this rotation's (random, stored) swap time has
+/// come, roll the previous set's notes over. Called on every connection to
+/// the mint and at startup. Never asks; a failure is logged and retried on the
+/// next connection. The log never contains a swap time.
+///
+/// The window is read, and the rollovers are sent, over AIR to the DID of the
+/// mint `kind` names. `base` names the mint in the wallet's records (its live
+/// keysets, its swap times); it is not dialled. The FSP's notes are not rolled
+/// over here but by [`crate::http::fsp_sync`].
 pub fn rotation_sync(
     wallet: &mut Wallet,
     air: &AirSettings,
-    kind: crate::Kind,
+    kind: Kind,
     base: &str,
 ) -> Result<Vec<String>, WalletError> {
-    if !air.is_configured() {
-        return crate::http::rotation_sync(wallet, kind, base);
-    }
     match kind {
-        crate::Kind::Psp => crate::http::rotation_sync_with(
+        Kind::Psp => rotation_sync_with(
             wallet,
             kind,
             base,
-            &mut |w| psp_window(w, air, base),
-            &mut |w, base, route, body| psp_post(w, air, base, route, body),
+            &mut |w| psp_window(w, air),
+            &mut |w, route, body| psp_post(w, air, route, body),
         ),
-        crate::Kind::Esp => crate::http::rotation_sync_with(
+        Kind::Esp => rotation_sync_with(
             wallet,
             kind,
             base,
-            &mut |w| esp_window(w, air, base),
-            &mut |w, base, route, body| esp_post(w, air, base, route, body),
+            &mut |w| esp_window(w, air),
+            &mut |w, route, body| esp_post(w, air, route, body),
         ),
-        crate::Kind::Fsp => crate::http::rotation_sync(wallet, kind, base),
+        Kind::Fsp => Err(WalletError::Invalid(
+            "FSP notes are rolled over by the FSP sync (`fsp sync`), not by the PSP and ESP rotation sync"
+                .into(),
+        )),
     }
 }
 
-/// Take back what is left of a PSP handoff (see [`crate::http::reclaim_handoff`]);
-/// the window the swap names, the swap and the check are over AIR when configured.
-#[cfg(feature = "http")]
-pub fn reclaim_handoff(
+/// How a rotation sync reads the mint's window: given the wallet (a read over
+/// AIR keeps its request in the wallet file), the window as the mint says it is
+/// now.
+type WindowSource<'a> =
+    &'a mut dyn FnMut(&mut Wallet) -> Result<crate::rotate::Window, WalletError>;
+
+/// How a POST to the PSP or the ESP is made: given the wallet (an AIR request is
+/// kept in the wallet file), the route (`rollover` or `check-state`) and the
+/// request JSON, the mint's answer as JSON, or the wallet's error for a refusal.
+/// A refusal is the same [`WalletError`] whichever mint it comes from, so
+/// everything that reads one is the same.
+type Post<'a> =
+    &'a mut dyn FnMut(&mut Wallet, &str, &[u8]) -> Result<serde_json::Value, WalletError>;
+
+/// [`rotation_sync`], with the mint's window read by `window` and its rollovers
+/// sent by `post`.
+fn rotation_sync_with(
     wallet: &mut Wallet,
-    air: &AirSettings,
-    id: &str,
-) -> Result<crate::http::Reclaim, WalletError> {
-    if !air.is_configured() {
-        return crate::http::reclaim_handoff(wallet, id);
+    kind: Kind,
+    base: &str,
+    window: WindowSource<'_>,
+    post: Post<'_>,
+) -> Result<Vec<String>, WalletError> {
+    let mut log = Vec::new();
+    let pending: Vec<String> = wallet
+        .pending_rollovers()
+        .iter()
+        .filter(|p| p.kind == kind)
+        .map(|p| p.id.clone())
+        .collect();
+    for id in pending {
+        match send_rollover(wallet, &id, &mut *post) {
+            Ok(t) => log.push(t),
+            Err(e) => log.push(format!(
+                "rollover failed, retried on the next connection: {e}"
+            )),
+        }
     }
-    crate::http::reclaim_handoff_with(
-        wallet,
-        id,
-        &mut |w, mint| psp_window(w, air, mint),
-        &mut |w, base, route, body| psp_post(w, air, base, route, body),
-    )
+    let w = window(wallet)?;
+    // Refreshed on every connection, so the cached live keysets never go stale.
+    match kind {
+        Kind::Psp => wallet.note_live_keysets(base, &w)?,
+        Kind::Esp => wallet.note_esp_keysets(base, &w.current_id, w.previous_id.as_deref())?,
+        Kind::Fsp => {}
+    }
+    let lost_before = wallet.lost().len();
+    let old = wallet.prepare_rollover(kind, base, &w)?;
+    if wallet.lost().len() > lost_before {
+        log.push(format!(
+            "{} note(s) expired: their key set was retired at a rotation before they were rolled over, and they are lost (not counted in the balance)",
+            wallet.lost().len() - lost_before
+        ));
+    }
+    if old.is_empty() {
+        return Ok(log);
+    }
+    let at = wallet.swap_time(kind, base, &w)?;
+    if w.now < at {
+        log.push(format!(
+            "{} note(s) will be rolled over to the current key set, staggered after the rotation",
+            old.len()
+        ));
+        return Ok(log);
+    }
+    for id in wallet.build_rollovers(kind, base, &w, old)? {
+        match send_rollover(wallet, &id, &mut *post) {
+            Ok(t) => log.push(t),
+            Err(e) => log.push(format!(
+                "rollover failed, retried on the next connection: {e}"
+            )),
+        }
+    }
+    Ok(log)
 }
 
-/// Ask the mint where a PSP handoff this wallet made stands (see
-/// [`crate::http::check_handoff`]); `POST /check-state` is over AIR when
-/// configured.
-#[cfg(feature = "http")]
-pub fn check_handoff(
-    wallet: &mut Wallet,
-    air: &AirSettings,
-    id: &str,
-) -> Result<crate::handoff::Standing, WalletError> {
-    if !air.is_configured() {
-        return crate::http::check_handoff(wallet, id);
-    }
-    crate::http::check_handoff_with(wallet, id, &mut |w, base, route, body| {
-        psp_post(w, air, base, route, body)
-    })
-}
+// ---- PSP handed from wallet to wallet (see `handoff.rs`) ---------------------
 
-/// Finish the import of a PSP handoff (see [`crate::http::complete_import`]); the
-/// swap is sent over AIR when configured.
-#[cfg(feature = "http")]
+/// Finish the import of a PSP handoff: send the stored PSP swap now. (An FSP
+/// handoff has nothing to send: it is never swapped.) Returns lines for the log.
+/// A mint that cannot be reached leaves the swap stored and the notes
+/// **unswapped**: they are already in the balance and can be spent
+/// ([`crate::store::Balance::unswapped_psp`] says how much is still waiting), and
+/// the swap is sent again on every later connection to the mint
+/// ([`rotation_sync`], which the command line runs at startup). The swap is what
+/// makes the notes the receiver's alone: until it goes through, the sender can
+/// still reclaim them.
 pub fn complete_import(
     wallet: &mut Wallet,
     air: &AirSettings,
     imported: &crate::handoff::Imported,
 ) -> Vec<String> {
-    if !air.is_configured() {
-        return crate::http::complete_import(wallet, imported);
-    }
-    crate::http::complete_import_with(wallet, imported, &mut |w, base, route, body| {
-        psp_post(w, air, base, route, body)
+    complete_import_with(wallet, imported, &mut |w, route, body| {
+        psp_post(w, air, route, body)
     })
 }
 
-// The HTTP branches, one function each. To remove HTTP, delete these and the
-// `!air.is_configured()` lines above.
-
-#[cfg(feature = "http")]
-fn http_keys(base: &str) -> Result<BTreeMap<Amount, PublicKey>, WalletError> {
-    crate::http::fetch_psp_keys(base)
+/// [`complete_import`], with the swap sent by `post`.
+fn complete_import_with(
+    wallet: &mut Wallet,
+    imported: &crate::handoff::Imported,
+    post: Post<'_>,
+) -> Vec<String> {
+    let mut log = Vec::new();
+    for id in &imported.psp_swaps {
+        let amount: u128 = wallet
+            .pending_rollovers()
+            .iter()
+            .find(|p| &p.id == id)
+            .map(|p| p.outputs.iter().map(|o| u128::from(o.amount)).sum())
+            .unwrap_or(0);
+        match send_rollover(wallet, id, &mut *post) {
+            Ok(text) => log.push(text),
+            Err(e) => log.push(format!(
+                "the mint could not be reached, so {amount} PSP stays unswapped: it is in your balance and can be spent, and the swap is sent again on the next connection to the mint: {e}"
+            )),
+        }
+    }
+    log
 }
 
-#[cfg(feature = "http")]
-fn http_keysets(base: &str) -> Result<sp_wire::psp::KeysetsResponse, WalletError> {
-    crate::http::fetch_psp_keysets(base)
+/// Ask the mint where a PSP handoff this wallet made stands, and record it.
+/// The mint's record decides: none of the notes spent means it is still the
+/// sender's to reclaim, all spent means the receiver has it (the handoff is
+/// done), some spent means the rest can still be reclaimed. If a reclaim is
+/// stored it is sent first (again, after a crash or a lost reply).
+pub fn check_handoff(
+    wallet: &mut Wallet,
+    air: &AirSettings,
+    id: &str,
+) -> Result<crate::handoff::Standing, WalletError> {
+    check_handoff_with(wallet, id, &mut |w, route, body| {
+        psp_post(w, air, route, body)
+    })
 }
 
-#[cfg(feature = "http")]
-fn http_window(base: &str) -> Result<Window, WalletError> {
-    crate::http::fetch_window(base)
+/// [`check_handoff`], with the questions to the mint (check-state, and the swap
+/// back if a reclaim is stored) sent by `post`.
+fn check_handoff_with(
+    wallet: &mut Wallet,
+    id: &str,
+    post: Post<'_>,
+) -> Result<crate::handoff::Standing, WalletError> {
+    use crate::handoff::{HandoffState, Standing};
+    let h = wallet
+        .handoffs_out()
+        .iter()
+        .find(|h| h.id == id)
+        .cloned()
+        .ok_or_else(|| WalletError::Unknown(format!("no handoff {id}")))?;
+    if h.state != HandoffState::Pending {
+        return wallet.handoff_standing(id);
+    }
+    if let Some(rollover) = &h.reclaim {
+        if wallet.pending_rollovers().iter().any(|p| &p.id == rollover) {
+            send_rollover(wallet, rollover, &mut *post)?;
+        }
+        let now = wallet.handoff_standing(id)?;
+        if now == Standing::Reclaimed {
+            return Ok(now);
+        }
+    }
+    let h = wallet
+        .handoffs_out()
+        .iter()
+        .find(|h| h.id == id)
+        .cloned()
+        .ok_or_else(|| WalletError::Unknown(format!("no handoff {id}")))?;
+    if h.state != HandoffState::Pending || h.notes.is_empty() {
+        return wallet.handoff_standing(id);
+    }
+    // Errors for an FSP handoff and a record without a mint, before any call.
+    wallet.handoff_standing(id)?;
+    let req = CheckStateRequest {
+        nonces: h.notes.iter().map(|n| n.note.nonce).collect(),
+    };
+    let body = serde_json::to_vec(&req)
+        .map_err(|e| WalletError::Mint(format!("{}/check-state: {e}", h.mint)))?;
+    let answer = post(wallet, "check-state", &body)?;
+    let r: CheckStateResponse = serde_json::from_value(answer).map_err(|e| {
+        WalletError::Mint(format!("{}/check-state: {e}", h.mint.trim_end_matches('/')))
+    })?;
+    wallet.settle_handoff(id, &r.spent)
 }
 
-#[cfg(feature = "http")]
-fn http_post(base: &str, route: &str, body: &[u8]) -> Result<serde_json::Value, WalletError> {
-    crate::http::post_bytes(base, route, body)
+/// What a reclaim did: where the handoff stands afterwards, and what the mint
+/// said about the swap back, if one was sent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Reclaim {
+    pub standing: crate::handoff::Standing,
+    pub log: Vec<String>,
 }
 
-#[cfg(feature = "http")]
-fn http_claim_keys(
-    base: &str,
-    settlement_text: &str,
-) -> Result<BTreeMap<Amount, PublicKey>, WalletError> {
-    crate::http::psp_claim_keys(base, settlement_text)
+/// Take back what is left of a PSP handoff the receiver has not swapped: the
+/// notes are swapped at the mint for new ones only this wallet knows. The mint
+/// takes whichever swap reaches it first. If the receiver swapped first, the
+/// handoff is recorded as done and nothing comes back; the standing says so.
+pub fn reclaim_handoff(
+    wallet: &mut Wallet,
+    air: &AirSettings,
+    id: &str,
+) -> Result<Reclaim, WalletError> {
+    reclaim_handoff_with(
+        wallet,
+        id,
+        &mut |w| psp_window(w, air),
+        &mut |w, route, body| psp_post(w, air, route, body),
+    )
 }
 
-#[cfg(feature = "http")]
-fn http_sync_esp_keysets(wallet: &mut Wallet, base: &str) -> Result<(), WalletError> {
-    crate::http::sync_esp_keysets(wallet, base)
-}
-
-#[cfg(feature = "http")]
-fn http_sync_esp_limits(wallet: &mut Wallet, base: &str) -> Result<(), WalletError> {
-    crate::http::sync_esp_limits(wallet, base)
-}
-
-#[cfg(feature = "http")]
-fn http_fetch_redeem_fees(base: &str) -> Result<RedeemFees, WalletError> {
-    crate::http::fetch_redeem_fees(base)
-}
-
-#[cfg(feature = "http")]
-fn http_send_exchange(
-    base: &str,
-    request: &ExchangeRequest,
-) -> Result<ExchangeResponse, WalletError> {
-    crate::http::send_exchange(base, request)
-}
-
-#[cfg(feature = "http")]
-fn http_send_transfer(
-    base: &str,
-    request: &TransferRequest,
-) -> Result<TransferResponse, WalletError> {
-    crate::http::send_transfer(base, request)
-}
-
-#[cfg(feature = "http")]
-fn http_send_redeem(base: &str, body: &[u8]) -> Result<RedeemResponse, WalletError> {
-    crate::http::send_redeem(base, body)
-}
-
-#[cfg(not(feature = "http"))]
-const NO_HTTP: &str = "the HTTP calls (feature `http`) and AIR is not configured";
-
-#[cfg(not(feature = "http"))]
-fn http_post(_: &str, _: &str, _: &[u8]) -> Result<serde_json::Value, WalletError> {
-    Err(WalletError::NotBuilt(NO_HTTP))
-}
-
-#[cfg(not(feature = "http"))]
-fn http_keys(_: &str) -> Result<BTreeMap<Amount, PublicKey>, WalletError> {
-    Err(WalletError::NotBuilt(NO_HTTP))
-}
-
-#[cfg(not(feature = "http"))]
-fn http_keysets(_: &str) -> Result<sp_wire::psp::KeysetsResponse, WalletError> {
-    Err(WalletError::NotBuilt(NO_HTTP))
-}
-
-#[cfg(not(feature = "http"))]
-fn http_window(_: &str) -> Result<Window, WalletError> {
-    Err(WalletError::NotBuilt(NO_HTTP))
-}
-
-#[cfg(not(feature = "http"))]
-fn http_claim_keys(_: &str, _: &str) -> Result<BTreeMap<Amount, PublicKey>, WalletError> {
-    Err(WalletError::NotBuilt(NO_HTTP))
-}
-
-#[cfg(not(feature = "http"))]
-fn http_sync_esp_keysets(_: &mut Wallet, _: &str) -> Result<(), WalletError> {
-    Err(WalletError::NotBuilt(NO_HTTP))
-}
-
-#[cfg(not(feature = "http"))]
-fn http_sync_esp_limits(_: &mut Wallet, _: &str) -> Result<(), WalletError> {
-    Err(WalletError::NotBuilt(NO_HTTP))
-}
-
-#[cfg(not(feature = "http"))]
-fn http_fetch_redeem_fees(_: &str) -> Result<RedeemFees, WalletError> {
-    Err(WalletError::NotBuilt(NO_HTTP))
-}
-
-#[cfg(not(feature = "http"))]
-fn http_send_exchange(_: &str, _: &ExchangeRequest) -> Result<ExchangeResponse, WalletError> {
-    Err(WalletError::NotBuilt(NO_HTTP))
-}
-
-#[cfg(not(feature = "http"))]
-fn http_send_transfer(_: &str, _: &TransferRequest) -> Result<TransferResponse, WalletError> {
-    Err(WalletError::NotBuilt(NO_HTTP))
-}
-
-#[cfg(not(feature = "http"))]
-fn http_send_redeem(_: &str, _: &[u8]) -> Result<RedeemResponse, WalletError> {
-    Err(WalletError::NotBuilt(NO_HTTP))
+/// [`reclaim_handoff`], with the mint's window read by `window` and the swap and
+/// the check sent by `post`.
+fn reclaim_handoff_with(
+    wallet: &mut Wallet,
+    id: &str,
+    window: WindowSource<'_>,
+    post: Post<'_>,
+) -> Result<Reclaim, WalletError> {
+    use crate::handoff::Standing;
+    let mut log = Vec::new();
+    if let s @ (Standing::Received | Standing::Reclaimed) =
+        check_handoff_with(wallet, id, &mut *post)?
+    {
+        return Ok(Reclaim { standing: s, log });
+    }
+    let h = wallet
+        .handoffs_out()
+        .iter()
+        .find(|h| h.id == id)
+        .cloned()
+        .ok_or_else(|| WalletError::Unknown(format!("no handoff {id}")))?;
+    if h.reclaim.is_none() {
+        // The swap names the mint's current key set, read fresh; the mint signs
+        // with any live key set, so one rotation in between does not refuse it.
+        if let Ok(w) = window(wallet) {
+            wallet.note_live_keysets(&h.mint, &w)?;
+        }
+    }
+    let rollover = wallet.begin_reclaim(id)?;
+    log.push(send_rollover(wallet, &rollover, &mut *post)?);
+    let standing = check_handoff_with(wallet, id, &mut *post)?;
+    Ok(Reclaim { standing, log })
 }

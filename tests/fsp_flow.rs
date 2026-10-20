@@ -1,6 +1,16 @@
 //! FSP from the wallet's side, against a real ESP mint and a real fsp-mint in
 //! this process: issue, pay, and the automatic rollover across key rotation,
 //! with crashes, an offline wallet and a failed swap.
+//!
+//! fsp-mint reaches the ESP mint over AIR only (its Issuer is the real
+//! `AirIssuer`), so the ESP mint answers on its real AIR listener against a real
+//! `air_server` started in this process (see `common/mod.rs`), as fsp-mint's own
+//! `tests/fsp_flow.rs` does. The AIR client always dials port 5702, so these
+//! tests need that port free, and they take turns on the one shared server; they
+//! are built only with the `air-listener-tests` feature. The wallet's own calls
+//! to the FSP mint are HTTP.
+
+mod common;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -25,6 +35,8 @@ use rand::rngs::OsRng;
 use secp256k1::{Keypair, SECP256K1, SecretKey};
 use sp_wire::ServiceDid;
 use tokio::runtime::Runtime;
+
+use common::EspAt;
 
 const NOW: u64 = 1_791_571_184;
 const DAY: u64 = 86_400;
@@ -76,6 +88,9 @@ struct Mints {
     esp: Arc<EspState>,
     fsp_url: String,
     clock: Arc<AtomicU64>,
+    /// The ESP mint's AIR listener and the turn on the shared AIR server, which
+    /// a test holds until it drops the mints. Last.
+    _esp_at: EspAt,
 }
 
 /// Both mints. The FSP mint first issued at `NOW`; rotation activates 120
@@ -95,8 +110,12 @@ fn start(rt: &Runtime, dir: &Path) -> Mints {
         rotor: None,
         rollovers: None,
     });
-    let esp_url = serve(rt, esp_mint::server::router(Arc::clone(&esp)));
+    // The listener keeps its state in a folder of its own, outside `dir`.
+    let esp_at = EspAt::new(Arc::clone(&esp), &scratch("airstate"));
     let mut cfg = fsp_mint::config::Config::default();
+    for (key, value) in esp_at.fsp_settings("20", "2") {
+        cfg.set(key, &value).unwrap();
+    }
     cfg.set("service.did", &service().to_string()).unwrap();
     cfg.set("rotation.activation_hours", "120").unwrap();
     cfg.set("rotation.period_hours", "240").unwrap();
@@ -108,7 +127,7 @@ fn start(rt: &Runtime, dir: &Path) -> Mints {
     let state = Arc::new(FspState {
         spender: Spender::open(&dir.join("fsp"), cfg.rotation(), 1024, NOW).unwrap(),
         issues: Mutex::new(Issues::open(&dir.join("fsp")).unwrap()),
-        issuer: Box::new(fsp_mint::esp_client::HttpIssuer::new(&esp_url, 10).unwrap()),
+        issuer: Box::new(fsp_mint::esp_air::AirIssuer::new(&cfg).unwrap()),
         service_keypair: Some(service_keypair()),
         clock: Box::new(move || c.load(Ordering::SeqCst)),
         config: cfg,
@@ -118,6 +137,7 @@ fn start(rt: &Runtime, dir: &Path) -> Mints {
         esp,
         fsp_url,
         clock,
+        _esp_at: esp_at,
     }
 }
 
@@ -299,7 +319,9 @@ fn offline_within_the_window_rolls_over_and_beyond_it_is_lost() {
     assert_eq!(sync.lost, 0);
     assert_eq!(fsp_units(&w), 3);
 
-    // Another wallet, offline through a whole period after its set retired.
+    // Another wallet, offline through a whole period after its set retired. (The
+    // first pair of mints gives up its turn on the AIR server first.)
+    drop(m);
     let dir2 = scratch("offline-lost");
     let m2 = start(&rt, &dir2);
     let mut w2 = wallet_with_esp(&dir2, &m2, &[2, 1]);

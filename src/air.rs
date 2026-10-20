@@ -1,17 +1,15 @@
 //! The PSP's and the ESP's calls over AIR: the wallet's side of the calls
-//! between a wallet and a mint that do not go over HTTP. Feature `air`.
+//! between a wallet and the SPI's mints. They are the only way the wallet
+//! reaches the PSP and the ESP.
 //!
-//! The PSP's calls are **mint info** (what `GET /health` reports, `wire_version`
-//! and `network`, which `verify_mint` reads before anything else is sent to a
-//! mint), **keys**, **keysets** and **rotation** (`GET /keys`, `/keysets`,
-//! `/rotation`) and **rollover** and **check-state** (`POST /rollover`,
-//! `/check-state`). The ESP's are mint info, **keysets**, **rotation**, **fees**
-//! (`GET /fees`), **rollover**, **exchange**, **transfer** and **redeem**
-//! (`POST /rollover`, `/exchange`, `/transfer`, `/redeem`); the ESP has no
-//! `GET /keys` (the keys arrive in the replies), and its `GET /audit` is the
-//! operator's. The reply bodies are the JSON (for a redemption, the request
-//! body is the binary encoding) the HTTP routes return. Over AIR the wallet
-//! writes one sealed request into a mailbox of the mint's DID on a configured
+//! The PSP's calls are **mint info** (what the mint's health report says,
+//! `wire_version` and `network`, which `verify_mint` reads before anything else
+//! is sent to a mint), **keys**, **keysets** and **rotation** and **rollover**
+//! and **check-state**. The ESP's are mint info, **keysets**, **rotation**,
+//! **fees**, **rollover**, **exchange**, **transfer** and **redeem**; the ESP has
+//! no keys call (the keys arrive in the replies). The reply bodies are JSON
+//! (for a redemption, the request body is the binary encoding). Over AIR the
+//! wallet writes one sealed request into a mailbox of the mint's DID on a configured
 //! AIR server and waits for the mint's signed reply in a cell only it and the
 //! mint can find. The protocol, the checks on the reply and the reasons are
 //! `sp_wire::air_request` and REQUEST-DESIGN.md (sandbox-mint, `air-sandbox/`,
@@ -58,7 +56,7 @@
 //!   work and frees notes, and a `409` must not. A signed `unavailable` (the
 //!   mint's `5xx`, its PSP unreachable included) is a [`WalletError::Mint`] too,
 //!   and a retry is safe.
-//! - **No caching**, like the HTTP calls they replace: every call asks again.
+//! - **No caching**: every call asks again.
 //!
 //! The call blocks (the wallet is blocking): the AIR client is async, so it runs
 //! on a runtime built for the call, on a thread of its own, which also works
@@ -68,9 +66,11 @@
 //! ones ([`crate::config::BUILTIN_SPI_DID`], [`crate::config::BUILTIN_ESP_DID`],
 //! PLACEHOLDERS until the first SPI deploy); the AIR server and its host are
 //! configuration (upstream item 4 will resolve them from the DID) and are the
-//! same for both mints. Over AIR, only these calls change: everything else the
-//! wallet sends the PSP (`/melt`, `/burns`, `/audit`) or the ESP (`/audit`) is
-//! still HTTP, and so is every call to the FSPs.
+//! same for both mints. Without them every call here fails with an error that
+//! names the missing setting ([`crate::config::AirSettings::require`]). What the
+//! wallet never sends the PSP or the ESP at all is `/melt`, `/burns` and
+//! `/audit`: those are local to the SPI. The calls to the FSPs are HTTP
+//! (`crate::http`).
 
 use sp_wire::air_request::ask::{AskConfig, AskError, InFlight, Verified, ask};
 use sp_wire::air_request::client::{self, ServerRef, block_on_new_runtime};
@@ -149,18 +149,7 @@ fn body_hash(body: &[u8]) -> String {
 }
 
 fn ask_config(air: &AirSettings, party: Party) -> Result<AskConfig, WalletError> {
-    let missing = |what: &str| {
-        WalletError::Invalid(format!(
-            "AIR is not configured for the {}: {what} is not set",
-            party.name()
-        ))
-    };
-    if air.server.is_empty() {
-        return Err(missing("air.server"));
-    }
-    if air.host.is_empty() {
-        return Err(missing("air.host"));
-    }
+    air.require().map_err(WalletError::Invalid)?;
     let mint = party.did(air);
     Ok(AskConfig {
         server: ServerRef {
@@ -285,7 +274,7 @@ fn run_request(
 }
 
 /// The wallet's error for a reply that failed a check: the same words and
-/// kinds as the HTTP check for the two that `verify_mint` makes.
+/// kinds as the checks `verify_mint` makes.
 fn refusal(party: Party, mint_hex: &str, kind: u8, e: VerifyError) -> WalletError {
     let what = what(kind);
     let mint = format!(
@@ -408,8 +397,7 @@ impl Answered {
     }
 
     /// The wallet's error for a refusal that is not a `400`, and so does not mean
-    /// "the mint did not take the notes": a plain mint error with the status, as
-    /// the HTTP call's is.
+    /// "the mint did not take the notes": a plain mint error with the status.
     pub fn status_error(&self, party: Party, mint_hex: &str, kind: u8) -> WalletError {
         WalletError::Mint(format!(
             "the {} {} (over AIR) answered {} with {}: {}",
@@ -451,12 +439,11 @@ pub fn answer(
 }
 
 /// The wallet's side of a POST over AIR whose answer is JSON (the rollover and
-/// check-state of the PSP, the rollover of the ESP): `body` is the request JSON
-/// the HTTP call would post, and the result is the mint's answer JSON. A signed
-/// `400` is the wallet's error for the HTTP `400` of the same meaning
-/// ([`crate::error::mint_refusal`]: `Refused`, or `SpentElsewhere` with the
-/// notes); every other refusal (`request_too_large`, `409`, `404`) is a plain
-/// mint error, as the HTTP status is, so everything that handles a refusal
+/// check-state of the PSP, the rollover of the ESP): `body` is the request JSON,
+/// and the result is the mint's answer JSON. A signed `400` is the wallet's
+/// error for a refusal of the request ([`crate::error::mint_refusal`]: `Refused`,
+/// or `SpentElsewhere` with the notes); every other refusal (`request_too_large`,
+/// `409`, `404`) is a plain mint error, so everything that handles a refusal
 /// handles this one.
 pub fn post(
     wallet: &mut Wallet,
@@ -480,8 +467,8 @@ pub fn post(
     })
 }
 
-/// The wallet's error for a signed refusal: the body is the JSON the HTTP route
-/// answers its `4xx` with.
+/// The wallet's error for a signed refusal: the body is the JSON the mint answers
+/// a refused request with.
 fn refused_by_mint(party: Party, mint_hex: &str, kind: u8, answered: &Answered) -> WalletError {
     let value: serde_json::Value = serde_json::from_slice(&answered.body).unwrap_or_default();
     let code = value["code"].as_str().unwrap_or("").to_string();
@@ -493,10 +480,10 @@ fn refused_by_mint(party: Party, mint_hex: &str, kind: u8, answered: &Answered) 
     crate::error::mint_refusal(&value, &code, &answered.why())
 }
 
-/// [`call`], with the body read as JSON of type `T`: the type the HTTP call
-/// reads. A refusal (the `404` of the ESP's rotation on a mint that does not
-/// rotate, say) is an error with its status, as over HTTP, and a signed body
-/// that is not that type is the mint's own fault and is refused as such.
+/// [`call`], with the body read as JSON of type `T`. A refusal (the `404` of the
+/// ESP's rotation on a mint that does not rotate, say) is an error with its
+/// status, and a signed body that is not that type is the mint's own fault and
+/// is refused as such.
 pub fn fetch<T: serde::de::DeserializeOwned>(
     wallet: &mut Wallet,
     air: &AirSettings,
@@ -519,7 +506,7 @@ pub fn fetch<T: serde::de::DeserializeOwned>(
 }
 
 /// [`fetch`], for a body the caller reads itself: its text. Used for the ESP's
-/// `GET /fees`, which the HTTP functions read from text too.
+/// fees call, which is read from its text.
 pub fn fetch_text(
     wallet: &mut Wallet,
     air: &AirSettings,
@@ -534,13 +521,12 @@ pub fn fetch_text(
     Ok(answered.text())
 }
 
-/// The ESP's exchange, transfer and redemption over AIR: `body` is what the HTTP
-/// call posts (JSON, or for the redemption the canonical binary encoding), and
-/// the result is the answer read as `R`. A refusal whose HTTP status is in
+/// The ESP's exchange, transfer and redemption over AIR: `body` is the request
+/// (JSON, or for the redemption the canonical binary encoding), and the result is
+/// the answer read as `R`. A refusal whose HTTP status is in
 /// `refusal_statuses` (the `400` of the exchange and the transfer; the `400` and
-/// the `413` of the redemption) is read by `refusal` from the body's text, the
-/// same reader the HTTP call uses, so that a refusal is the same
-/// [`WalletError`] both ways; any other refusal (`409 in_progress`, say) is a
+/// the `413` of the redemption) is read by `refusal` from the body's text, into a
+/// [`WalletError`]; any other refusal (`409 in_progress`, say) is a
 /// plain mint error with its status, never a refusal of the notes.
 pub fn send_esp<R: serde::de::DeserializeOwned>(
     wallet: &mut Wallet,
@@ -571,7 +557,7 @@ pub fn send_esp<R: serde::de::DeserializeOwned>(
 
 /// Ask a mint for its mint info over AIR and refuse if its wire version is not
 /// this wallet's or its network is not `expected_network` (`main`, `regtest`,
-/// `signet` or `testnet`), the checks `http::verify_mint` makes on `/health`.
+/// `signet` or `testnet`).
 /// The status the mint reports is not an error here either (a mint that is
 /// unwell still reports its wire version and network).
 ///

@@ -341,7 +341,7 @@ pub struct Balance {
 
 /// What the ESP mint accepts in one exchange or transfer (`exchange.max_items`
 /// and `transfer.max_items`), as its `GET /fees` says. The wallet does not
-/// keep a number of its own: until the limits are read (`http::sync_esp_limits`)
+/// keep a number of its own: until the limits are read (`mint_info::sync_esp_limits`)
 /// it checks nothing locally and the mint's own refusal decides. Not saved in
 /// the wallet file.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -389,7 +389,7 @@ impl Wallet {
     }
 
     /// The PSP's largest note size, if it has been read (see
-    /// `http::sync_psp_limits`). The wallet keeps no number of its own: until
+    /// `mint_info::sync_psp_limits`). The wallet keeps no number of its own: until
     /// it is read, a purchase is checked only for being a power of two and the
     /// PSP decides the top.
     pub fn psp_max_denomination(&self) -> Option<u64> {

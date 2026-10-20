@@ -211,7 +211,7 @@ impl Wallet {
 /// `GET /keys`. A printed keyset that is no longer live means the outputs
 /// expired before they were claimed.
 ///
-/// How the keys and the keysets are read (over HTTP, or over AIR) is the
+/// How the keys and the keysets are read (over AIR) is the
 /// caller's: `keys` and `keysets` are called only when needed.
 pub fn claim_keys_with(
     settlement_text: &str,

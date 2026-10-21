@@ -5,10 +5,13 @@
 //!
 //! **The PSP's** calls are its mint info ([`verify_psp`]), its keys, keysets and
 //! rotation ([`psp_keys`], [`psp_keysets`], [`psp_window`], and the calls built
-//! on them: [`sync_psp_limits`], [`psp_claim_keys`], [`rotation_sync`],
-//! [`reclaim_handoff`]) and its two POSTs, rollover and check-state
+//! on them: [`sync_psp_limits`], [`rotation_sync`], [`reclaim_handoff`]) and its
+//! two POSTs, rollover and check-state
 //! ([`psp_post`], and the calls built on it: [`rotation_sync`],
-//! [`reclaim_handoff`], [`check_handoff`], [`complete_import`]).
+//! [`reclaim_handoff`], [`check_handoff`], [`complete_import`]). **The PSP's
+//! delivery** is not a call: the PSP writes each purchase's signatures to the
+//! SPI's AIR server, and [`psp_pickup`] reads those records (the AIR server is
+//! `air.server` and `air.host`, as for every PSP call).
 //!
 //! **The ESP's** are its mint info ([`verify_esp`]), keysets ([`sync_esp_keysets`]),
 //! fees ([`sync_esp_limits`], [`fetch_redeem_fees`]), rotation ([`esp_window`])
@@ -41,6 +44,8 @@ use std::collections::BTreeMap;
 use mint_types::Amount;
 use secp256k1::PublicKey;
 use sp_wire::ServiceDid;
+use sp_wire::air_request::client::{self, ServerRef, block_on_new_runtime};
+use sp_wire::air_request::delivery;
 use sp_wire::air_request::{
     KIND_CHECK_STATE, KIND_EXCHANGE, KIND_FEES, KIND_FSP_ISSUE, KIND_FSP_SPEND, KIND_KEYS,
     KIND_KEYSETS, KIND_REDEEM, KIND_ROLLOVER, KIND_ROTATION, KIND_TRANSFER,
@@ -112,23 +117,149 @@ pub fn sync_psp_limits(wallet: &mut Wallet, air: &AirSettings) -> Result<(), Wal
     Ok(())
 }
 
-/// The keys to unblind a PSP settlement's signatures with (see
-/// [`crate::psp::claim_keys_with`]).
-pub fn psp_claim_keys(
+/// What picking up one pending purchase's record came to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PickedUp {
+    /// The pending purchase's id.
+    pub id: String,
+    pub what: Pickup,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Pickup {
+    /// The record was there: the notes were claimed (and the purchase cleared).
+    Claimed(crate::psp::Claimed),
+    /// The record said the PSP holds the payment, or rejected the purchase, and
+    /// nothing was signed. The purchase and its key are kept open until the
+    /// window closes ([`Wallet::close_expired`]).
+    Open(crate::store::OpenPurchase),
+    /// An open purchase from an earlier pickup, not read again: its record is
+    /// written once, and what settles it is not built yet.
+    StillOpen(crate::store::OpenPurchase),
+    /// The PSP has not written the record yet (a payment settles at 6
+    /// confirmations).
+    NotThere,
+    /// The purchase was made before purchases had a key of their own, so its
+    /// record cannot be opened. Nothing can be picked up for it.
+    NoKey,
+    /// The record was there and was not accepted (it did not open, was not the
+    /// PSP's, or did not match the purchase). Nothing changed.
+    Bad(String),
+}
+
+/// Read the PSP's record for every pending purchase that has none yet and apply
+/// it: the notes are claimed and the purchase cleared, or the purchase is marked
+/// open with what the PSP said (held, or rejected) and kept. A purchase that is
+/// open already is reported ([`Pickup::StillOpen`]) and not read. Each
+/// purchase's address is computed from the PSP's DID, the purchase's own reply
+/// DID and the purchase id; the record is opened with the purchase's one-off key
+/// and the PSP's signature is checked ([`delivery::open_record`]). A record that
+/// is not there yet is waited for, for `wait_secs` in all (0 reads once and
+/// returns). Reading again changes nothing: a purchase that was claimed is no
+/// longer pending, and one that is open is not read.
+///
+/// With no purchase to read nothing is asked of the network and the AIR settings
+/// are not needed. Otherwise they are, and a missing `air.server` or `air.host`
+/// is an error that names it. An unreachable AIR server is [`WalletError::Mint`]
+/// and changes nothing; a record that fails a check is that purchase's
+/// [`Pickup::Bad`] and the others are still picked up.
+pub fn psp_pickup(
     wallet: &mut Wallet,
     air: &AirSettings,
-    settlement_text: &str,
-) -> Result<BTreeMap<Amount, PublicKey>, WalletError> {
-    let wallet = std::cell::RefCell::new(wallet);
-    crate::psp::claim_keys_with(
-        settlement_text,
-        || {
-            let reply: sp_wire::keys::KeysResponse =
-                crate::air::fetch(&mut wallet.borrow_mut(), air, Party::Psp, KIND_KEYS)?;
-            Ok(reply.keys)
-        },
-        || crate::air::fetch(&mut wallet.borrow_mut(), air, Party::Psp, KIND_KEYSETS),
-    )
+    wait_secs: u64,
+) -> Result<Vec<PickedUp>, WalletError> {
+    struct Job {
+        id: String,
+        address: sp_wire::seal::PublicKey,
+        reply_key: sp_wire::seal::SecretKey,
+        psp: ServiceDid,
+        purchase: [u8; 32],
+    }
+    let mut out: Vec<PickedUp> = Vec::new();
+    let mut jobs: Vec<Job> = Vec::new();
+    for p in wallet.pending_purchases() {
+        if let Some(open) = &p.open {
+            out.push(PickedUp {
+                id: p.id.clone(),
+                what: Pickup::StillOpen(open.clone()),
+            });
+            continue;
+        }
+        let (Some(secret), Some(delivery_id)) = (&p.reply_secret, &p.delivery_id) else {
+            out.push(PickedUp {
+                id: p.id.clone(),
+                what: Pickup::NoKey,
+            });
+            continue;
+        };
+        let made = (|| -> Result<Job, String> {
+            let reply_key = sp_wire::air_request::addr::secret_from_hex(secret)
+                .map_err(|e| format!("the saved reply key: {e}"))?;
+            let purchase: [u8; 32] = hex::decode(delivery_id)
+                .ok()
+                .and_then(|b| b.try_into().ok())
+                .ok_or("the saved delivery id is not 32 bytes of hex")?;
+            let psp = ServiceDid::parse(&p.mint_did_pubkey)
+                .map_err(|e| format!("the PSP key the purchase was sealed to: {e}"))?;
+            let reply = sp_wire::air_request::addr::key_to_did(&reply_key.public_key());
+            Ok(Job {
+                id: p.id.clone(),
+                address: delivery::delivery_address(&psp, &reply, &purchase),
+                reply_key,
+                psp,
+                purchase,
+            })
+        })();
+        match made {
+            Ok(job) => jobs.push(job),
+            Err(why) => out.push(PickedUp {
+                id: p.id.clone(),
+                what: Pickup::Bad(why),
+            }),
+        }
+    }
+    if jobs.is_empty() {
+        return Ok(out);
+    }
+
+    let (name, host) = crate::config::Party::Psp
+        .address(air)
+        .map_err(WalletError::Invalid)?;
+    let server = ServerRef { name, host };
+    let addresses: Vec<_> = jobs.iter().map(|j| j.address.clone()).collect();
+    let read_secs = air.timeout_secs;
+    let found = block_on_new_runtime(|| async {
+        let client = client::connect(&server).await.map_err(|e| e.0)?;
+        delivery::read_records(&client, &addresses, read_secs, wait_secs)
+            .await
+            .map_err(|e| e.0)
+    })
+    .map_err(|e| WalletError::Mint(e.0))?
+    .map_err(|e| {
+        WalletError::Mint(format!(
+            "the PSP's records could not be read from the AIR server: {e}"
+        ))
+    })?;
+
+    for (job, sealed) in jobs.into_iter().zip(found) {
+        let what = match sealed {
+            None => Pickup::NotThere,
+            Some(bytes) => {
+                match delivery::open_record(&job.reply_key, &job.psp, &job.purchase, &bytes) {
+                    Err(e) => Pickup::Bad(format!("the record was not accepted: {e}")),
+                    Ok(opened) => match wallet.apply_delivery(&job.id, &opened.outcome) {
+                        Ok(crate::psp::Delivered::Claimed(c)) => Pickup::Claimed(c),
+                        Ok(crate::psp::Delivered::Open(open)) => Pickup::Open(open),
+                        // Applied by a copy of this wallet meanwhile.
+                        Ok(crate::psp::Delivered::AlreadyDone) => continue,
+                        Err(e) => Pickup::Bad(format!("the record could not be applied: {e}")),
+                    },
+                }
+            }
+        };
+        out.push(PickedUp { id: job.id, what });
+    }
+    Ok(out)
 }
 
 /// A POST to the PSP: `route` is `rollover` or `check-state`, `body` the request

@@ -22,7 +22,6 @@ use serde::{Deserialize, Serialize};
 use sp_wire::ServiceDid;
 use sp_wire::esp::exchange::ExchangeRequest;
 use sp_wire::esp::transfer::TransferRequest;
-use sp_wire::seal::SecretKey as DidSecretKey;
 
 use crate::blind::PendingOutput;
 use crate::error::WalletError;
@@ -84,9 +83,95 @@ impl StoredNote {
 pub struct PendingPurchase {
     /// SHA-256 of the sealed payload, as hex.
     pub id: String,
+    /// The purchase's reply DID, as hex: the public half of `reply_secret`. It
+    /// is in the payload, so the PSP knows it, and no other purchase has it.
     pub reply_did: String,
     pub mint_did_pubkey: String,
     pub outputs: Vec<PendingOutput>,
+    /// The one-off secret key of the reply DID, as hex. The PSP seals the
+    /// purchase's delivery record to the reply DID, and only this opens it. It is
+    /// made for this purchase alone (the PSP cannot link two purchases of one
+    /// wallet), saved here before the payload is returned, and deleted when the
+    /// purchase is fully reconciled (see `Wallet::apply_delivery`). It is never
+    /// part of a handoff: a purchase has no notes until it settles. `None` on a
+    /// purchase made before purchases had their own key: nothing can be
+    /// picked up for it.
+    #[serde(default)]
+    pub reply_secret: Option<String>,
+    /// What the PSP delivers this purchase under, as hex: the hash of the
+    /// unsealed payload (`sp_wire::air_request::delivery::purchase_id`). `None`
+    /// exactly when `reply_secret` is.
+    #[serde(default)]
+    pub delivery_id: Option<String>,
+    /// Set when the PSP's record said the payment is held or was rejected: the
+    /// purchase and its key stay until the PSP settles it or `open.open_until`
+    /// passes ([`Wallet::close_expired`]). `None` while nothing has been
+    /// delivered.
+    #[serde(default)]
+    pub open: Option<OpenPurchase>,
+}
+
+/// Why a paid purchase is still open, from the PSP's record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OpenKind {
+    /// The payment is held: not settled yet (the amount paid does not match what
+    /// was asked for, say).
+    Held,
+    /// The purchase was rejected and nothing was signed.
+    Rejected,
+}
+
+/// What the PSP said about a purchase it did not sign (see [`OpenKind`]), and
+/// until when it keeps the payment open.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenPurchase {
+    pub kind: OpenKind,
+    /// The PSP's reason.
+    pub reason: String,
+    /// What the PSP received, in satoshis and in USD cents at its price.
+    pub paid_sats: u64,
+    pub paid_cents: u64,
+    /// For a held payment: the units the purchase asked for, and how far the
+    /// payment is from covering them, in basis points (negative: short). 0 for a
+    /// rejection.
+    #[serde(default)]
+    pub requested_units: u64,
+    #[serde(default)]
+    pub over_under_bps: i64,
+    /// Unix seconds. If the payment is not settled by then the PSP forfeits it
+    /// and keeps the bitcoin; the wallet deletes the purchase and its key.
+    pub open_until: u64,
+}
+
+/// How long the wallet keeps a purchase's key when the PSP's record names no
+/// window for what is outstanding (outputs neither signed nor reported as
+/// dropped): the PSP's default reconciliation window.
+pub const OPEN_KEY_FALLBACK_SECS: u64 = 7 * 24 * 3600;
+
+/// The one-off key of a purchase that was claimed but may not be closed: the PSP
+/// owes the payer a credit, or part of the purchase was neither signed nor
+/// reported as dropped. The PSP will write a follow-up to the same key (its
+/// address and shape are not designed yet), so the key is kept until `open_until`
+/// ([`Wallet::close_expired`] deletes it then).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenReply {
+    /// The purchase's id (`PendingPurchase::id`).
+    pub id: String,
+    pub delivery_id: String,
+    pub mint_did_pubkey: String,
+    pub reply_secret: String,
+    /// What the PSP said it owes, in USD cents.
+    #[serde(default)]
+    pub credit_cents: u64,
+    /// Requested units that were neither signed nor reported as dropped.
+    #[serde(default)]
+    pub unaccounted_units: u64,
+    /// Unix seconds: when the PSP's window for the credit closes (from its
+    /// record), or, for outputs only unaccounted for, when the wallet gives up
+    /// ([`OPEN_KEY_FALLBACK_SECS`] after the record was applied). 0 in a file
+    /// from before: [`Wallet::close_expired`] gives it the fallback.
+    #[serde(default)]
+    pub open_until: u64,
 }
 
 /// An ESP exchange that has been built and has not been finished.
@@ -182,14 +267,13 @@ fn mint_info_kind() -> u8 {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct WalletData {
-    /// A stand-in reply DID for the command line, made on first use. An app
-    /// passes its own.
-    #[serde(default)]
-    pub reply_did: Option<String>,
     #[serde(default)]
     pub notes: Vec<StoredNote>,
     #[serde(default)]
     pub pending_purchases: Vec<PendingPurchase>,
+    /// The one-off keys of PSP purchases that were claimed but may still be open.
+    #[serde(default)]
+    pub open_replies: Vec<OpenReply>,
     #[serde(default)]
     pub pending_exchanges: Vec<PendingExchange>,
     #[serde(default)]
@@ -419,6 +503,11 @@ impl Wallet {
         &self.data.pending_purchases
     }
 
+    /// The keys kept for PSP purchases that may still be open.
+    pub fn open_replies(&self) -> &[OpenReply] {
+        &self.data.open_replies
+    }
+
     pub fn pending_exchanges(&self) -> &[PendingExchange] {
         &self.data.pending_exchanges
     }
@@ -517,21 +606,6 @@ impl Wallet {
     /// The write counter (see [`WalletData::version`]).
     pub fn version(&self) -> u64 {
         self.data.version
-    }
-
-    /// The reply DID the command line uses by default: 33 bytes, made once and
-    /// kept. It is only a stand-in until a wallet has a real AIR identity.
-    pub fn reply_did(&mut self) -> Result<[u8; 33], WalletError> {
-        if let Some(text) = &self.data.reply_did {
-            return parse_did(text);
-        }
-        let made = DidSecretKey::new().public_key().to_string();
-        let did = parse_did(&made)?;
-        self.update(|d| {
-            d.reply_did = Some(made.clone());
-            Ok(())
-        })?;
-        Ok(did)
     }
 
     pub fn balance(&self) -> Balance {
@@ -770,14 +844,37 @@ mod tests {
     }
 
     #[test]
-    fn the_reply_did_is_made_once_and_is_33_bytes() {
-        let dir = scratch("did");
+    fn a_wallet_file_from_before_one_off_purchase_keys_still_reads() {
+        let dir = scratch("old-purchase");
         let path = dir.join("wallet.json");
+        // an old file: the shared `reply_did` field (now ignored) and a pending
+        // purchase with no key of its own
+        fs::write(
+            &path,
+            format!(
+                r#"{{"reply_did": "{did}", "pending_purchases": [{{"id": "aa", "reply_did": "{did}",
+                    "mint_did_pubkey": "{did}", "outputs": []}}]}}"#,
+                did = "02".repeat(33)
+            ),
+        )
+        .unwrap();
         let mut w = Wallet::open(&path).unwrap();
-        let first = w.reply_did().unwrap();
-        assert!(first[0] == 2 || first[0] == 3);
-        assert_eq!(Wallet::open(&path).unwrap().reply_did().unwrap(), first);
-        assert_eq!(w.reply_did().unwrap(), first);
+        let p = &w.pending_purchases()[0];
+        assert_eq!(
+            (p.id.as_str(), p.reply_secret.clone(), p.delivery_id.clone()),
+            ("aa", None, None)
+        );
+        assert!(w.open_replies().is_empty());
+        // and it saves, without the ignored field
+        w.update(|d| {
+            d.finished.insert("x".into());
+            Ok(())
+        })
+        .unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(saved.get("reply_did").is_none());
+        assert!(saved["pending_purchases"][0].get("reply_did").is_some());
         fs::remove_dir_all(&dir).unwrap();
     }
 

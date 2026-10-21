@@ -12,8 +12,9 @@ use std::sync::{Arc, Mutex};
 
 use ecash_wallet::config::AirSettings;
 use ecash_wallet::mint_info::{
-    psp_claim_keys, psp_post, psp_window, rotation_sync, send_transfer, sync_esp_keysets,
+    psp_post, psp_window, rotation_sync, send_transfer, sync_esp_keysets,
 };
+use ecash_wallet::psp::Delivered;
 use ecash_wallet::store::{HandedNote, Handover, StoredNote, WalletData};
 use ecash_wallet::{Kind, Wallet};
 use esp_mint::exchange::{Burn, Psp};
@@ -438,14 +439,15 @@ fn esp_rolls_over_keeping_its_service_and_day() {
 }
 
 /// Settle one purchase at the PSP's current set, as psp-mint's service does,
-/// and return the text it prints.
+/// and return what it stores for the payer: the outcome that goes to the payer's
+/// AIR record.
 fn settle_now(
     m: &PspMint,
     dir: &Path,
     key: &sp_wire::seal::SecretKey,
     txid: &str,
     payload: Vec<u8>,
-) -> String {
+) -> sp_wire::air_request::delivery::Outcome {
     let (opened, ignored) = psp_mint::seal::open_payloads(
         key,
         vec![psp_mint::scan::Received {
@@ -466,7 +468,12 @@ fn settle_now(
         matches!(s, psp_mint::settle::Settlement::Issued(_)),
         "{s:?}"
     );
-    psp_mint::service::describe(&opened[0], &s).join("\n")
+    records
+        .get(txid)
+        .and_then(|r| r.delivery.as_ref())
+        .expect("psp-mint stored a delivery for the payer")
+        .outcome
+        .clone()
 }
 
 #[test]
@@ -476,36 +483,34 @@ fn purchases_around_a_psp_rotation_are_claimed_with_the_keys_of_the_set_that_sig
     let _ = m.note(1);
     let mint_key = sp_wire::seal::SecretKey::new();
     let mut w = Wallet::open(&dir.join("w.json")).unwrap();
-    let reply = w.reply_did().unwrap();
     // Both purchases are prepared before the rotation; `a` is settled before
     // it, `b` after it.
-    let a = w
-        .build_psp_payload(&[4], &reply, &mint_key.public_key())
-        .unwrap();
-    let b = w
-        .build_psp_payload(&[1], &reply, &mint_key.public_key())
-        .unwrap();
+    let a = w.build_psp_payload(&[4], &mint_key.public_key()).unwrap();
+    let b = w.build_psp_payload(&[1], &mint_key.public_key()).unwrap();
     let air = m.air();
     let old = psp_window(&mut w, &air).unwrap().current_id;
-    let text_a = settle_now(&m, &dir, &mint_key, "aa", a.payload);
+    let out_a = settle_now(&m, &dir, &mint_key, "aa", a.payload);
 
     m.set_clock(T + H);
     let win = psp_window(&mut w, &air).unwrap();
     assert_ne!(win.current_id, old);
-    let text_b = settle_now(&m, &dir, &mint_key, "bb", b.payload);
+    let out_b = settle_now(&m, &dir, &mint_key, "bb", b.payload);
 
-    // Each settlement names the set that signed it ...
-    assert_eq!(ecash_wallet::psp::parse_keyset(&text_a), Some(old.clone()));
-    assert_eq!(
-        ecash_wallet::psp::parse_keyset(&text_b),
-        Some(win.current_id.clone())
-    );
-    // ... and each is claimed with that set's keys: `a` with the previous
-    // set's, though the current set is another.
-    for text in [&text_a, &text_b] {
-        let keys = psp_claim_keys(&mut w, &air, text).unwrap();
-        let sigs = ecash_wallet::psp::parse_signatures(text).unwrap();
-        w.claim_psp(&w.ours(&sigs), &keys).unwrap();
+    // Each record names the set that signed it ...
+    let named = |out: &sp_wire::air_request::delivery::Outcome| match out {
+        sp_wire::air_request::delivery::Outcome::Signed(s) => s.clone(),
+        other => panic!("expected signatures, got {other:?}"),
+    };
+    assert_eq!(named(&out_a).keyset, old);
+    assert_eq!(named(&out_b).keyset, win.current_id);
+    // ... and carries that set's keys, so each is claimed from the record alone
+    // (no keys call): `a` with the old set's, though the current set is
+    // another.
+    for (id, out) in [(&a.id, &out_a), (&b.id, &out_b)] {
+        assert!(matches!(
+            w.apply_delivery(id, out).unwrap(),
+            Delivered::Claimed(_)
+        ));
     }
     assert_eq!(w.balance().psp, 5);
     let by_amount = |units: u64| {
@@ -526,13 +531,6 @@ fn purchases_around_a_psp_rotation_are_claimed_with_the_keys_of_the_set_that_sig
         "{log:?}"
     );
     assert_eq!(w.balance().psp, 5);
-
-    // After the next rotation the first set is retired: a settlement it
-    // signed can no longer be claimed, and the wallet says why.
-    m.set_clock(T + 2 * H);
-    let _ = psp_window(&mut w, &air).unwrap();
-    let err = psp_claim_keys(&mut w, &air, &text_a).unwrap_err();
-    assert!(err.to_string().contains("expired"), "{err}");
 }
 
 #[test]

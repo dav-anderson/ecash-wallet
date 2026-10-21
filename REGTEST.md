@@ -84,7 +84,7 @@ Set the same shell variable in every terminal below (T1 to T5). The mints take i
 
 ### 3. The PSP mint (T2)
 
-The log is teed to a file because the signatures are printed there, a development stand-in for delivery over the AIR. The first build takes a few minutes.
+The log is teed to a file so the settlement and delivery lines can be read back. The signatures also go to the payer over AIR as a record on the AIR server, which is how the wallet claims them (step 9). The first build takes a few minutes.
 
 ```
 cd ~/psp-mint
@@ -126,7 +126,7 @@ HEX=$(cargo run -q -- --regtest buy-psp --mint-key $MINT_KEY 4 1)
 echo ${#HEX}
 ```
 
-The wallet takes both mints' DIDs from the settings (the built-in ones are placeholders until the first SPI deploy). Expected: `66` (the mint's public key in hex), then `purchase <id>` and `199 bytes. Put the hex below in an OP_RETURN and pay the PSP.` (both on standard error, so they show on the screen but are not in `HEX`), then `398`. The payload is 117 bytes plus 82 for the encryption: 199 bytes, 398 hex characters.
+The wallet takes both mints' DIDs from the settings (the built-in ones are placeholders until the first SPI deploy). Expected: `66` (the mint's public key in hex), then `purchase <id>` and `199 bytes. Put the hex below in an OP_RETURN and pay the PSP.` and a sentence saying the notes arrive over AIR (both on standard error, so they show on the screen but are not in `HEX`), then `398`. The payload is 117 bytes plus 82 for the encryption: 199 bytes, 398 hex characters.
 
 ### 6. Pay the PSP (T4)
 
@@ -175,21 +175,22 @@ Expected in T4: `"confirmations": 6,`. Within one scan, T2 prints the settlement
   over/under: 91 bps
   signature <blind nonce hex> <signature hex>
   signature <blind nonce hex> <signature hex>
+delivery <txid>: record written
 ```
 
-The over/under is the payment against the request at the locked price: 613 sats at 82313.33 USD/BTC is about $0.5046, so about +91 basis points. That is within the 0.10 reconciliation target (`settle.payment_reconciliation_target`), so the mint keeps the extra and records no credit. Two signature lines are printed, one for the 4 and one for the 1. There is no credit, rejection or error message.
+The over/under is the payment against the request at the locked price: 613 sats at 82313.33 USD/BTC is about $0.5046, so about +91 basis points. That is within the 0.10 reconciliation target (`settle.payment_reconciliation_target`), so the mint keeps the extra and records no credit. Two signature lines are printed (a log; the payer gets the same signatures over AIR), one for the 4 and one for the 1, then `delivery <txid>: record written`. There is no credit, rejection or error message.
 
 ### 9. Claim the notes and check the balance (T4)
 
 ```
-cargo run -q -- --regtest claim-psp --file ~/psp-serve.log
+cargo run -q -- --regtest claim-psp
 cargo run -q -- --regtest balance
 ```
 
-Expected:
+Nothing is pasted: the wallet computes the record's address from its purchase and reads it. `claim-psp` waits up to 60 seconds for a record that is not there yet (`--wait SECONDS`). Expected:
 
 ```
-claimed 5 PSP in 2 note(s); 0 output(s) still waiting
+purchase <id>: claimed 5 PSP in 2 note(s)
 psp  5
 esp  0
 fsp  0
@@ -256,7 +257,8 @@ There is no change line, because the 1 PSP note is exactly the amount asked for.
 ### Notes
 
 - If `exchange` times out, run it again with `--resume <id>` (the id was printed). It sends the same request and gets the same answer, and nothing is burned twice.
-- The PSP prints every payer's signatures. `claim-psp` keeps only the ones for this wallet's pending outputs.
+- The PSP writes each payer's signatures to a record only that payer can find, so `claim-psp` reads its own purchases' records and no one else's. Any wallet command also picks up a delivery when it starts, so the line above may be printed by the command that ran first, and `claim-psp` then says there is nothing pending.
+- A payment the PSP holds (paid, but short beyond its reconciliation target) or rejects is delivered too, so the wallet shows `the PSP is holding the payment` or `the PSP rejected it`, with what was paid and the time it stays open until, and keeps the purchase and its key. When that time passes the PSP forfeits the payment and the next wallet command prints `its reconciliation window has closed` and deletes the purchase and the key. The PSP's window is `PSP_RECONCILIATION_WINDOW_DAYS` (7); set `1` on the PSP to see it close sooner.
 - Stop the servers with Ctrl-C in T2 and T3, and the node with `$CLI stop`.
 
 ## Regtest, ESP transfer
@@ -453,7 +455,7 @@ HEX=$(cargo run -q -- --regtest buy-psp --mint-key $MINT_KEY 2 1)
 echo ${#HEX}
 ```
 
-Expected: `66`, `purchase <id>`, `199 bytes. Put the hex below in an OP_RETURN and pay the PSP.`, and `398` (two outputs, the same size as in step 5). The purchase is 3 PSP and not 2 because of the dust limit: Bitcoin Core will not send an output below 294 sats (for this address type), which is about $0.24 at this price, so 2 PSP ($0.20) could only be paid by overpaying. 3 PSP ($0.30) is paid with 368 sats. `2>/dev/null` hides the banner `pubkey` prints on standard error.
+Expected: `66`, `purchase <id>`, `199 bytes. Put the hex below in an OP_RETURN and pay the PSP.` and a sentence saying the notes arrive over AIR, and `398` (two outputs, the same size as in step 5). The purchase is 3 PSP and not 2 because of the dust limit: Bitcoin Core will not send an output below 294 sats (for this address type), which is about $0.24 at this price, so 2 PSP ($0.20) could only be paid by overpaying. 3 PSP ($0.30) is paid with 368 sats. `2>/dev/null` hides the banner `pubkey` prints on standard error.
 
 ### 24. Pay and settle (T4)
 
@@ -473,17 +475,17 @@ $CLI -rpcwallet=payer generatetoaddress 6 $PAYER > /dev/null
 $CLI -rpcwallet=psp-regtest gettransaction $TXID | grep confirmations
 ```
 
-Expected in T4: `"confirmations": 6,`. Within a scan T2 prints the settlement (the price is locked and settled in one pass when all six blocks arrive at once): `<txid> confirmations=6 value_sats=368`, `over/under: 83 bps` (within the 0.10 reconciliation target, so no credit), `keyset <id>` and two `signature` lines.
+Expected in T4: `"confirmations": 6,`. Within a scan T2 prints the settlement (the price is locked and settled in one pass when all six blocks arrive at once): `<txid> confirmations=6 value_sats=368`, `over/under: 83 bps` (within the 0.10 reconciliation target, so no credit), `keyset <id>`, two `signature` lines and `delivery <txid>: record written`.
 
 ### 25. Claim and exchange (T4)
 
 ```
-cargo run -q -- --regtest claim-psp --file ~/psp-serve.log
+cargo run -q -- --regtest claim-psp
 cargo run -q -- --regtest exchange --service $SERVICE --psp 2
 cargo run -q -- --regtest balance
 ```
 
-Expected: `skipped 2 signature(s) that are not for this wallet` (the earlier purchase's, already claimed) and `claimed 3 PSP in 2 note(s); 0 output(s) still waiting`; then `received 200000000000 ESP in 1 note(s), redeemable after day 20742`. The balance shows ESP 4×10^11: 2×10^11 at day 20742 and 2×10^11 at day 21107, and `psp  1` (the 1 PSP note of the purchase is not exchanged).
+Expected: `purchase <id>: claimed 3 PSP in 2 note(s)` (the earlier purchase was claimed in step 9 and is not asked for again); then `received 200000000000 ESP in 1 note(s), redeemable after day 20742`. The balance shows ESP 4×10^11: 2×10^11 at day 20742 and 2×10^11 at day 21107, and `psp  1` (the 1 PSP note of the purchase is not exchanged).
 
 ### 26. Hand over, receive, and transfer the mature note (T4)
 

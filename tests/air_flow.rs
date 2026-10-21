@@ -26,8 +26,8 @@ use std::time::{Duration, Instant};
 use ecash_wallet::config::{AirSettings, BUILTIN_SPI_DID};
 use ecash_wallet::handoff::Standing;
 use ecash_wallet::mint_info::{
-    check_handoff, complete_import, psp_claim_keys, psp_keys, psp_keysets, psp_post, psp_window,
-    reclaim_handoff, rotation_sync, sync_psp_limits, verify_psp,
+    check_handoff, complete_import, psp_keys, psp_keysets, psp_post, psp_window, reclaim_handoff,
+    rotation_sync, sync_psp_limits, verify_psp,
 };
 use ecash_wallet::store::{PendingAirRequest, StoredNote, WalletData};
 use ecash_wallet::{Kind, Wallet, WalletError};
@@ -766,22 +766,6 @@ fn keys_keysets_rotation_limits_and_claim_keys_over_air_are_the_mints_own() {
     );
     assert!(wallet.psp_max_denomination().is_some());
 
-    // The keys to claim with: older output names no keyset (the keys of `/keys`),
-    // a named live keyset gives that keyset's keys, a retired one is refused.
-    let none = psp_claim_keys(&mut wallet, &air, "signature aa bb").unwrap();
-    assert_eq!(none, keys);
-    let named = psp_claim_keys(
-        &mut wallet,
-        &air,
-        &format!("keyset {}\nsignature aa bb", keysets.current),
-    )
-    .unwrap();
-    assert_eq!(named, keys);
-    match psp_claim_keys(&mut wallet, &air, "keyset 0123456789abcdef") {
-        Err(WalletError::Mint(why)) => assert!(why.contains("no longer live"), "{why}"),
-        other => panic!("expected a retired keyset to be refused, got {other:?}"),
-    }
-
     // The rotation sync reads the window over AIR; a wallet with no PSP notes has
     // nothing to roll over.
     let log = rotation_sync(&mut wallet, &air, Kind::Psp, RECORD).unwrap();
@@ -792,8 +776,8 @@ fn keys_keysets_rotation_limits_and_claim_keys_over_air_are_the_mints_own() {
         "every request ended with its answer"
     );
     assert!(open_wallet(&dir).air_requests().is_empty());
-    // Nothing is cached: each of the eight calls above was its own request.
-    wait_for_next(&state_dir, 8);
+    // Nothing is cached: each of the five calls above was its own request.
+    wait_for_next(&state_dir, 5);
     listener.stop().unwrap();
 }
 

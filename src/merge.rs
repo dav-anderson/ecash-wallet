@@ -23,6 +23,10 @@
 //!   either copy (`finished`) is not brought back as pending by the other.
 //!   A note is held by a pending request if either copy says so, and is free
 //!   again if the request is not pending any more.
+//! - **The one-off keys of PSP purchases that may still be open** (`open_replies`)
+//!   are united by purchase id, and `finished` does not drop them: the purchase
+//!   they belong to is finished (its notes were claimed), and the key is what
+//!   stays until its window closes (`Wallet::close_expired`).
 //! - **Everything keyed by a note or a mint** (key sets, epochs, the mints and
 //!   key sets last seen, the swap schedule) is united; where both have an entry
 //!   the local copy's is kept, because it is the one in use.
@@ -322,9 +326,15 @@ pub fn merge(local: &WalletData, stored: &WalletData) -> (WalletData, MergeRepor
     m.live_keysets = union_map(&local.live_keysets, &stored.live_keysets);
     m.esp_live_keysets = union_map(&local.esp_live_keysets, &stored.esp_live_keysets);
     m.swap_schedule = union_map(&local.swap_schedule, &stored.swap_schedule);
-    if m.reply_did.is_none() {
-        m.reply_did = stored.reply_did.clone();
-    }
+    // The one-off keys of purchases that may still be open: every one either copy
+    // holds (a key is not an ongoing request, so `finished` does not drop it: a
+    // claimed purchase is `finished` and its key is exactly what stays).
+    m.open_replies = union_list(
+        &local.open_replies,
+        &stored.open_replies,
+        |r| r.id.clone(),
+        &BTreeSet::new(),
+    );
     m.version = local.version.max(stored.version);
 
     let before = pending_request_ids(local, &local.handoffs_out);
@@ -418,6 +428,9 @@ mod tests {
             reply_did: "02".repeat(33),
             mint_did_pubkey: "03".repeat(33),
             outputs: vec![PendingOutput::new(1)],
+            reply_secret: None,
+            delivery_id: None,
+            open: None,
         }
     }
 
@@ -755,7 +768,6 @@ mod tests {
             .update(|d| {
                 d.live_keysets
                     .insert("http://m".into(), ("aaaaaaaaaaaaaaaa".into(), None));
-                d.reply_did = None;
                 Ok(())
             })
             .unwrap();
@@ -765,7 +777,6 @@ mod tests {
                     .insert("http://m".into(), ("bbbbbbbbbbbbbbbb".into(), None));
                 d.live_keysets
                     .insert("http://n".into(), ("cccccccccccccccc".into(), None));
-                d.reply_did = Some("02".repeat(33));
                 Ok(())
             })
             .unwrap();
@@ -773,7 +784,41 @@ mod tests {
         let live = &local.data().live_keysets;
         assert_eq!(live["http://m"].0, "aaaaaaaaaaaaaaaa");
         assert_eq!(live["http://n"].0, "cccccccccccccccc");
-        assert_eq!(local.data().reply_did, Some("02".repeat(33)));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_keys_of_open_purchases_are_united_and_survive_the_purchase_finishing() {
+        use crate::store::OpenReply;
+        let dir = scratch("open-replies");
+        let (mut local, mut stored, _) = diverged(&dir);
+        let reply = |id: &str| OpenReply {
+            id: id.into(),
+            delivery_id: "dd".repeat(32),
+            mint_did_pubkey: "03".repeat(33),
+            reply_secret: "ee".repeat(32),
+            credit_cents: 10,
+            unaccounted_units: 0,
+            open_until: 4_000_000_000,
+        };
+        local
+            .update(|d| {
+                d.open_replies.push(reply("one"));
+                // the purchase of this key ended, so its id is finished
+                d.finished.insert("one".into());
+                Ok(())
+            })
+            .unwrap();
+        stored
+            .update(|d| {
+                d.open_replies.push(reply("one"));
+                d.open_replies.push(reply("two"));
+                Ok(())
+            })
+            .unwrap();
+        local.merge_from(&stored.snapshot()).unwrap();
+        let ids: Vec<&str> = local.open_replies().iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["one", "two"]);
         fs::remove_dir_all(&dir).unwrap();
     }
 

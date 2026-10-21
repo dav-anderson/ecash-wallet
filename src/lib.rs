@@ -11,7 +11,8 @@
 //!   service that FSP fees are paid to.
 //! - [`store`]: the note file, which holds each note with its spend key, amount
 //!   and terms, and the requests waiting for a reply.
-//! - [`psp`]: buying PSP (`build_psp_payload`, `claim_psp`).
+//! - [`psp`]: buying PSP (`build_psp_payload`, `apply_delivery`): each purchase has a
+//!   one-off reply key of its own, and the PSP delivers the signatures over AIR.
 //! - [`split`]: ESP note sizes are powers of two; totals are split into them.
 //! - [`esp`]: exchanging PSP for ESP (`build_exchange`, `finish_exchange`).
 //! - [`transfer`]: handing ESP to the service it is named for

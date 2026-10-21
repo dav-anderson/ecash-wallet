@@ -73,6 +73,10 @@ name = "rotation_flow"
 required-features = ["air-listener-tests"]
 
 [[test]]
+name = "psp_delivery"
+required-features = ["air-listener-tests"]
+
+[[test]]
 name = "fsp_flow"
 required-features = ["air-listener-tests"]
 

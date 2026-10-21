@@ -12,18 +12,18 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ecash_wallet::psp::parse_signatures;
+use ecash_wallet::psp::Delivered;
 use ecash_wallet::{Kind, Wallet, WalletError};
 use esp_mint::exchange::{self, Burn, ExchangeError, Psp, Rejection};
 use esp_mint::responses::Responses;
 use esp_mint::terms::Terms;
 use mint_core::MintLogic;
-use mint_types::{Amount, BlindNonce, MintInput, Nonce};
+use mint_types::{Amount, MintInput, Nonce};
 use psp_mint::records::Records;
 use psp_mint::scan::Received;
 use psp_mint::settle::{self, Settlement};
-use secp256k1::PublicKey;
 use sp_wire::ServiceDid;
+use sp_wire::air_request::delivery::Outcome;
 use sp_wire::seal::SecretKey as DidSecretKey;
 
 const G_X: &str = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
@@ -112,8 +112,21 @@ impl Psp for LocalPsp<'_> {
     }
 }
 
+/// What psp-mint stored for the payer of `txid`: the outcome it writes to the
+/// payer's AIR record (`records::Delivery`). The wallet applies it as it would
+/// the opened record.
+fn delivery_of(records: &Records, txid: &str) -> Outcome {
+    records
+        .get(txid)
+        .and_then(|r| r.delivery.as_ref())
+        .expect("psp-mint stored a delivery for the payer")
+        .outcome
+        .clone()
+}
+
 /// What the PSP mint does with a payment that has 6 confirmations: open the
-/// payload, settle it, and return the signature lines it prints.
+/// payload, settle it, and return what it stores for the payer (the outcome of
+/// each purchase, which it writes to the payer's AIR record).
 fn settle_payment(
     logic: &MintLogic,
     records: &mut Records,
@@ -121,7 +134,7 @@ fn settle_payment(
     txid: &str,
     value_sats: u64,
     payload: Vec<u8>,
-) -> (usize, Vec<String>) {
+) -> (usize, Vec<Outcome>) {
     let (opened, ignored) = psp_mint::seal::open_payloads(
         mint_key,
         vec![Received {
@@ -131,16 +144,16 @@ fn settle_payment(
             payload: Some(payload),
         }],
     );
-    let mut lines = Vec::new();
+    let mut outcomes = Vec::new();
     for received in &opened {
         let settlement = settle::settle(logic, records, received, &mut || Ok(BTC_10K)).unwrap();
         assert!(
             matches!(settlement, Settlement::Issued(_)),
             "{settlement:?}"
         );
-        lines.extend(psp_mint::service::describe(received, &settlement));
+        outcomes.push(delivery_of(records, &received.txid));
     }
-    (ignored, lines)
+    (ignored, outcomes)
 }
 
 #[test]
@@ -155,9 +168,8 @@ fn buy_claim_and_exchange_end_to_end() {
     let mut wallet = Wallet::open(&wallet_file).unwrap();
 
     // buy 5 PSP as a 4 and a 1
-    let reply = wallet.reply_did().unwrap();
     let build = wallet
-        .build_psp_payload(&[4, 1], &reply, &mint_key.public_key())
+        .build_psp_payload(&[4, 1], &mint_key.public_key())
         .unwrap();
     assert_eq!(wallet.balance().pending_purchases, 1);
 
@@ -170,15 +182,21 @@ fn buy_claim_and_exchange_end_to_end() {
         .note_esp_keysets("esp", &esp_mint::rotation::keyset_id(&master), None)
         .unwrap();
 
-    let (ignored, lines) =
+    let (ignored, outcomes) =
         settle_payment(&psp, &mut records, &mint_key, "aa", 5_000, build.payload);
     assert_eq!(ignored, 0);
-    let text = lines.join("\n");
-    let signatures = parse_signatures(&text).unwrap();
-    assert_eq!(signatures.len(), 2);
+    assert_eq!(outcomes.len(), 1);
+    let Outcome::Signed(signed) = &outcomes[0] else {
+        panic!("expected signatures, got {:?}", outcomes[0]);
+    };
+    assert_eq!(signed.signatures.len(), 2);
 
-    let keys = psp.public_keys().clone();
-    let claim = wallet.claim_psp(&signatures, &keys).unwrap();
+    // the record's signatures and keysets are all the wallet needs
+    let Delivered::Claimed(claimed) = wallet.apply_delivery(&build.id, &outcomes[0]).unwrap()
+    else {
+        panic!("expected the purchase to be claimed");
+    };
+    let claim = claimed.claim;
     assert_eq!(claim.claimed_units, 5);
     assert_eq!(claim.still_pending, 0);
     let balance = wallet.balance();
@@ -196,8 +214,13 @@ fn buy_claim_and_exchange_end_to_end() {
         .unwrap();
     }
 
-    // a second claim of the same signatures finds nothing pending
-    assert!(wallet.claim_psp(&signatures, &keys).is_err());
+    // the same record again changes nothing
+    let before = wallet.balance();
+    assert_eq!(
+        wallet.apply_delivery(&build.id, &outcomes[0]).unwrap(),
+        Delivered::AlreadyDone
+    );
+    assert_eq!(wallet.balance(), before);
 
     // Exchange 3 PSP for ESP bound to the service. The wallet holds a 4 and a 1,
     // so it spends the 4 and asks the mint for all of it: 3 PSP of ESP for the
@@ -335,10 +358,9 @@ fn a_payload_sealed_to_another_key_is_ignored_and_the_wallet_keeps_waiting() {
     let psp = psp_mint::mint::open(&dir.join("psp"), Amount::from_units(1024)).unwrap();
     let mut records = Records::open(&dir.join("psp").join("settlements.json")).unwrap();
     let mut wallet = Wallet::open(&dir.join("wallet.json")).unwrap();
-    let reply = wallet.reply_did().unwrap();
 
     let build = wallet
-        .build_psp_payload(&[1], &reply, &wrong_key.public_key())
+        .build_psp_payload(&[1], &wrong_key.public_key())
         .unwrap();
     let (opened, ignored) = psp_mint::seal::open_payloads(
         &mint_key,
@@ -364,9 +386,8 @@ fn a_tampered_payload_is_ignored_at_every_byte() {
     let dir = scratch("tamper");
     let mint_key = DidSecretKey::new();
     let mut wallet = Wallet::open(&dir.join("wallet.json")).unwrap();
-    let reply = wallet.reply_did().unwrap();
     let build = wallet
-        .build_psp_payload(&[2, 1], &reply, &mint_key.public_key())
+        .build_psp_payload(&[2, 1], &mint_key.public_key())
         .unwrap();
     for at in 0..build.payload.len() {
         let mut bad = build.payload.clone();
@@ -396,15 +417,28 @@ fn an_exchange_without_enough_psp_is_refused_before_anything_is_reserved() {
 }
 
 #[test]
-fn signatures_for_outputs_the_wallet_did_not_ask_for_change_nothing() {
+fn a_record_for_a_purchase_the_wallet_does_not_hold_changes_nothing() {
     let dir = scratch("stray");
     let mut wallet = Wallet::open(&dir.join("wallet.json")).unwrap();
-    let stray: Vec<(BlindNonce, PublicKey)> = vec![(
-        BlindNonce(PublicKey::from_slice(&hex::decode(format!("02{G_X}")).unwrap()).unwrap()),
-        PublicKey::from_slice(&hex::decode(format!("02{G_X}")).unwrap()).unwrap(),
-    )];
-    let keys = Default::default();
-    assert!(wallet.claim_psp(&stray, &keys).is_err());
+    let stray = Outcome::Signed(sp_wire::air_request::delivery::Signed {
+        keyset: "0123456789abcdef".to_string(),
+        signatures: vec![sp_wire::air_request::delivery::SignedOutput {
+            blind_nonce: format!("02{G_X}"),
+            signature: format!("02{G_X}"),
+        }],
+        keysets: sp_wire::psp::KeysetsResponse {
+            current: "0123456789abcdef".to_string(),
+            previous: None,
+            keysets: Default::default(),
+        },
+        skipped_units: 0,
+        credit_cents: 0,
+        open_until: 0,
+    });
+    assert_eq!(
+        wallet.apply_delivery("no-such-purchase", &stray).unwrap(),
+        Delivered::AlreadyDone
+    );
     assert_eq!(wallet.balance().notes, 0);
     fs::remove_dir_all(&dir).unwrap();
 }

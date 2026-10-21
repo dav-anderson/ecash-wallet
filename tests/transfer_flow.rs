@@ -12,7 +12,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ecash_wallet::psp::parse_signatures;
+use ecash_wallet::psp::Delivered;
 use ecash_wallet::{Kind, Wallet, WalletError};
 use esp_mint::exchange::{self, Burn, Psp};
 use esp_mint::keys::MasterSecret;
@@ -26,6 +26,7 @@ use psp_mint::scan::Received;
 use psp_mint::settle::{self, Settlement};
 use secp256k1::{Keypair, SECP256K1, SecretKey};
 use sp_wire::ServiceDid;
+use sp_wire::air_request::delivery::Outcome;
 use sp_wire::seal::SecretKey as DidSecretKey;
 
 const G_X: &str = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
@@ -128,8 +129,20 @@ impl Psp for LocalPsp<'_> {
     }
 }
 
+/// What psp-mint stored for the payer of `txid`: the outcome it writes to the
+/// payer's AIR record (`records::Delivery`). The wallet applies it as it would
+/// the opened record.
+fn delivery_of(records: &Records, txid: &str) -> Outcome {
+    records
+        .get(txid)
+        .and_then(|r| r.delivery.as_ref())
+        .expect("psp-mint stored a delivery for the payer")
+        .outcome
+        .clone()
+}
+
 /// What the PSP mint does with a payment that has 6 confirmations: open the
-/// payload, settle it, and return the signature lines it prints.
+/// payload, settle it, and return what it stores for the payer.
 fn settle_payment(
     logic: &MintLogic,
     records: &mut Records,
@@ -137,7 +150,7 @@ fn settle_payment(
     txid: &str,
     value_sats: u64,
     payload: Vec<u8>,
-) -> Vec<String> {
+) -> Vec<Outcome> {
     let (opened, ignored) = psp_mint::seal::open_payloads(
         mint_key,
         vec![Received {
@@ -148,16 +161,16 @@ fn settle_payment(
         }],
     );
     assert_eq!(ignored, 0);
-    let mut lines = Vec::new();
+    let mut outcomes = Vec::new();
     for received in &opened {
         let settlement = settle::settle(logic, records, received, &mut || Ok(BTC_10K)).unwrap();
         assert!(
             matches!(settlement, Settlement::Issued(_)),
             "{settlement:?}"
         );
-        lines.extend(psp_mint::service::describe(received, &settlement));
+        outcomes.push(delivery_of(records, &received.txid));
     }
-    lines
+    outcomes
 }
 
 /// Exchange `psp_units` PSP for ESP bound to the service, through the real
@@ -209,14 +222,14 @@ fn exchange_hand_over_and_transfer_end_to_end() {
     // The app buys 5 PSP as a 4 and a 1 and exchanges them for ESP bound to the
     // service: 3 PSP asked for and 1 PSP of change from the 4, then the last 1.
     // It ends up holding 5 PSP of ESP notes, each a power of two.
-    let reply = app.reply_did().unwrap();
     let build = app
-        .build_psp_payload(&[4, 1], &reply, &mint_key.public_key())
+        .build_psp_payload(&[4, 1], &mint_key.public_key())
         .unwrap();
-    let lines = settle_payment(&psp, &mut records, &mint_key, "aa", 5_000, build.payload);
-    let signatures = parse_signatures(&lines.join("\n")).unwrap();
-    let keys = psp.public_keys().clone();
-    app.claim_psp(&signatures, &keys).unwrap();
+    let outcomes = settle_payment(&psp, &mut records, &mint_key, "aa", 5_000, build.payload);
+    assert!(matches!(
+        app.apply_delivery(&build.id, &outcomes[0]).unwrap(),
+        Delivered::Claimed(_)
+    ));
     exchange_psp(&mut app, &psp, &esp, &master, &mut responses, 3);
     exchange_psp(&mut app, &psp, &esp, &master, &mut responses, 1);
     let b = app.balance();

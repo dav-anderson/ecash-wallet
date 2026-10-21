@@ -434,6 +434,7 @@ fn a_record_for_a_purchase_the_wallet_does_not_hold_changes_nothing() {
         skipped_units: 0,
         credit_cents: 0,
         open_until: 0,
+        rules: None,
     });
     assert_eq!(
         wallet.apply_delivery("no-such-purchase", &stray).unwrap(),

@@ -662,6 +662,7 @@ mod tests {
             skipped_units,
             credit_cents,
             open_until: 0,
+            rules: None,
         })
     }
 
@@ -853,6 +854,7 @@ mod tests {
             paid_sats: 5_000,
             paid_cents: 50,
             open_until,
+            rules: None,
         })
     }
 
@@ -864,6 +866,7 @@ mod tests {
             requested_units: 5,
             over_under_bps: -8_000,
             open_until,
+            rules: None,
         })
     }
 

@@ -214,11 +214,12 @@ pub struct HandedNote {
     pub keyset: String,
 }
 
-/// ESP notes an app has handed to a service. It carries each note's spend
-/// secret, so whoever holds it holds the notes until the service swaps them
-/// (see `transfer.rs`). The notes name the service, and only the service can ask
-/// the mint to move them. Delivery to the service is an AIR message, which is
-/// deferred: for now the command line writes this to a file.
+/// ESP notes handed to a service, with each note's spend secret, so whoever holds
+/// it holds the notes. The wallet makes one when `fsp issue` hands ESP to an FSP
+/// mint (the wallet keeps it in `handovers` as a record), and fsp-mint's
+/// `export-esp` writes the same shape to a file for the service's wallet to
+/// `receive` (see `transfer.rs`). The notes name the service, and only the service
+/// can ask the mint to move them or redeem them.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Handover {
     pub service: ServiceDid,

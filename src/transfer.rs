@@ -1,28 +1,38 @@
-//! ESP transfer to the service a note is named for.
+//! ESP transfer, as the service a note is named for.
 //!
 //! An ESP note names one service, and only that service can redeem it or move
-//! it. An app that pays a service hands over whole notes together with their
-//! spend secrets ([`Wallet::hand_over_esp`]). The service takes them in
-//! ([`Wallet::receive_handover`]) and swaps them at the ESP mint for fresh notes
-//! that only it holds ([`Wallet::build_transfer`], then the ESP mint's
-//! `/transfer`, then [`Wallet::finish_transfer`]). The new notes have the same
-//! service, the same redeemable-after day and the same total. Nothing is burned
-//! out of circulation and no value is created.
+//! it. The service swaps notes it holds at the ESP mint for fresh notes that only
+//! it controls ([`Wallet::build_transfer`], then the ESP mint's `/transfer`, then
+//! [`Wallet::finish_transfer`]). The new notes have the same service, the same
+//! redeemable-after day and the same total. Nothing is burned out of circulation
+//! and no value is created.
+//!
+//! **What is left here, and why.** The stand-alone `hand-over` and `transfer`
+//! commands, `Wallet::hand_over_esp`, `cancel_transfer` and
+//! `mark_spent_in_transfer` are gone: they passed ESP between two terminals before
+//! AIR, and FSP issue now carries the ESP hand-over to fsp-mint over AIR
+//! (`fsp.rs`). Still here:
+//!
+//! - [`Wallet::receive_handover`], behind the `receive` command: the service takes
+//!   in the ESP that fsp-mint's `export-esp` wrote (a [`Handover`] file), and the
+//!   integration tests use it to give a wallet ESP notes.
+//! - [`Wallet::build_transfer`] and [`Wallet::finish_transfer`], the service's swap
+//!   at the ESP mint (sent with `mint_info::send_transfer`), which only the
+//!   integration tests use, to play the service against esp-mint
+//!   (`esp_air_flow`, `rotation_flow`). They are `#[doc(hidden)]`: not an API
+//!   anyone is meant to build on, and no command calls them. They stay in the
+//!   library, and not in `tests/`, because they write through `Wallet::update`,
+//!   which is private to the crate.
+//! - `pick_exact`, which `fsp.rs` uses to choose the ESP notes of a hand-over.
 //!
 //! A note can be swapped once, so a second presentation of the same notes fails
-//! at the mint. The app cannot move ESP to another service or to a peer: the
-//! request must be signed by the service's key, and the mint checks each note
-//! against that service's terms.
+//! at the mint. The request must be signed by the service's key, and the mint
+//! checks each note against that service's terms.
 //!
-//! The swap is exact, and ESP notes cannot be split by their holder, so an app
-//! can hand over only a set of whole notes whose total is exactly the amount. To
-//! make that easy, exchange in the sizes you will pay (`exchange --amounts`).
-//! Every ESP note is a power of two (the mint refuses anything else), so the
-//! new notes of a transfer are too: by default the same sizes as the old ones,
-//! and any other sizes given must be powers of two.
-//!
-//! Handing the notes to the service is an AIR message, which is deferred. Until
-//! then [`Handover`] is a value the command line writes to a file.
+//! The swap is exact, and ESP notes cannot be split by their holder. Every ESP
+//! note is a power of two (the mint refuses anything else), so the new notes of a
+//! transfer are too: by default the same sizes as the old ones, and any other
+//! sizes given must be powers of two.
 
 use std::collections::{BTreeSet, HashSet};
 
@@ -34,7 +44,7 @@ use sp_wire::esp::transfer::{self, TransferRequest, TransferResponse};
 
 use crate::blind::PendingOutput;
 use crate::error::WalletError;
-use crate::store::{HandedNote, Handover, Kind, PendingTransfer, StoredNote, StoredTerms, Wallet};
+use crate::store::{Handover, Kind, PendingTransfer, StoredNote, StoredTerms, Wallet};
 
 /// How many search steps to spend looking for an exact set of notes.
 const SEARCH_BUDGET: u32 = 100_000;
@@ -137,7 +147,7 @@ fn pick_day(notes: &[&StoredNote], asked: Option<u64>) -> Result<u64, WalletErro
             n => {
                 let list: Vec<String> = days.iter().map(u64::to_string).collect();
                 Err(WalletError::Invalid(format!(
-                    "this wallet holds ESP for that service with {n} different redeemable-after days ({}). A transfer covers one day: pick one with --day",
+                    "this wallet holds ESP for that service with {n} different redeemable-after days ({}). A transfer covers one day: name one",
                     list.join(", ")
                 )))
             }
@@ -146,77 +156,6 @@ fn pick_day(notes: &[&StoredNote], asked: Option<u64>) -> Result<u64, WalletErro
 }
 
 impl Wallet {
-    /// Hand ESP to a service: whole notes bound to `service`, with the same
-    /// redeemable-after day, that add up to exactly `esp_units`.
-    ///
-    /// The notes leave the wallet and the [`Handover`] is kept in the wallet's
-    /// record of handovers as well as returned, because it holds the only copy of
-    /// the notes' spend secrets. Give `day` when the wallet has ESP for the
-    /// service with more than one day. If no set of notes adds up exactly the
-    /// call fails and the wallet is unchanged.
-    pub fn hand_over_esp(
-        &mut self,
-        service: ServiceDid,
-        esp_units: u128,
-        day: Option<u64>,
-    ) -> Result<Handover, WalletError> {
-        if esp_units == 0 {
-            return Err(WalletError::Invalid("there is nothing to hand over".into()));
-        }
-        let free: Vec<&StoredNote> = self
-            .notes()
-            .iter()
-            .filter(|n| is_free_esp_for(n, &service))
-            .collect();
-        let day = pick_day(&free, day)?;
-        let mut candidates: Vec<&StoredNote> = free
-            .into_iter()
-            .filter(|n| {
-                n.terms
-                    .as_ref()
-                    .is_some_and(|t| t.redeemable_after_day == day)
-            })
-            .collect();
-        candidates.sort_by(|a, b| b.amount.cmp(&a.amount).then_with(|| a.id().cmp(&b.id())));
-        let sizes: Vec<u64> = candidates.iter().map(|n| n.amount).collect();
-        let Some(picked) = pick_exact(&sizes, esp_units) else {
-            let held: u128 = sizes.iter().map(|&a| u128::from(a)).sum();
-            return Err(WalletError::NotEnough(format!(
-                "no set of this wallet's ESP notes for that service and day adds up to exactly {esp_units} ESP units (it holds {held} in notes of {sizes:?}). A transfer is exact and a note cannot be split, so ask for an amount the notes add up to"
-            )));
-        };
-        if let Some(max) = self.esp_limits().transfer_max_items {
-            if picked.len() > max {
-                return Err(WalletError::Invalid(format!(
-                    "that would take more than the {max} notes the mint takes in one transfer (its transfer.max_items)"
-                )));
-            }
-        }
-        let chosen: Vec<StoredNote> = picked.iter().map(|&i| candidates[i].clone()).collect();
-        let handover = Handover {
-            service,
-            redeemable_after_day: day,
-            notes: chosen
-                .iter()
-                .map(|n| -> Result<HandedNote, WalletError> {
-                    Ok(HandedNote {
-                        amount: n.amount,
-                        note: n.note,
-                        spend_secret: n.spend_secret,
-                        keyset: self.esp_keyset_of(n)?,
-                    })
-                })
-                .collect::<Result<_, _>>()?,
-        };
-        let ids: Vec<String> = chosen.iter().map(StoredNote::id).collect();
-        self.update(|d| {
-            d.notes.retain(|n| !ids.contains(&n.id()));
-            d.handovers.push(handover.clone());
-            Ok(())
-        })?;
-        Ok(handover)
-    }
-
     /// Take a [`Handover`] into this wallet, as the service. Returns how many
     /// notes were taken and what they are worth. A note whose secret does not
     /// match its nonce, or that the wallet already holds, is refused and nothing
@@ -289,6 +228,7 @@ impl Wallet {
     /// input is signed over the transfer digest with the note's own key, and the
     /// request is signed with the service's key. The old notes are reserved until
     /// the transfer is finished or cancelled.
+    #[doc(hidden)]
     pub fn build_transfer(
         &mut self,
         service_secret: &SecretKey,
@@ -409,6 +349,7 @@ impl Wallet {
 
     /// Turn the mint's reply into the service's new ESP notes and drop the old
     /// ones. Call it once, with the reply to the request `id` names.
+    #[doc(hidden)]
     pub fn finish_transfer(
         &mut self,
         id: &str,
@@ -474,58 +415,12 @@ impl Wallet {
             redeemable_after_day: response.redeemable_after_day,
         })
     }
-
-    /// The mint refused transfer `id` because the notes at `inputs` (positions
-    /// in the request) are spent. Nothing was burned. Those notes go to the
-    /// spent record, the others are free again, and the pending transfer is
-    /// dropped. Without this the wallet would offer the spent notes again on
-    /// every transfer and be refused each time.
-    pub fn mark_spent_in_transfer(
-        &mut self,
-        id: &str,
-        inputs: &[usize],
-    ) -> Result<crate::esp::SpentReport, WalletError> {
-        self.update(|d| {
-            let pending = d
-                .pending_transfers
-                .iter()
-                .find(|p| p.id == id)
-                .ok_or_else(|| WalletError::Unknown(format!("no pending transfer {id}")))?;
-            let count = pending.input_ids.len();
-            if inputs.is_empty() || inputs.iter().any(|&i| i >= count) {
-                return Err(WalletError::Invalid(format!(
-                    "the mint named notes {inputs:?}, but the request has {count} notes"
-                )));
-            }
-            let spent_ids: Vec<String> = inputs
-                .iter()
-                .map(|&i| pending.input_ids[i].clone())
-                .collect();
-            d.pending_transfers.retain(|p| p.id != id);
-            Ok(Wallet::retire_reserved(d, id, &spent_ids))
-        })
-    }
-
-    pub fn cancel_transfer(&mut self, id: &str) -> Result<(), WalletError> {
-        self.update(|d| {
-            let before = d.pending_transfers.len();
-            d.pending_transfers.retain(|p| p.id != id);
-            if d.pending_transfers.len() == before {
-                return Err(WalletError::Unknown(format!("no pending transfer {id}")));
-            }
-            for note in d.notes.iter_mut() {
-                if note.reserved_by.as_deref() == Some(id) {
-                    note.reserved_by = None;
-                }
-            }
-            Ok(())
-        })
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::HandedNote;
     use std::fs;
     use std::path::PathBuf;
 
@@ -634,118 +529,32 @@ mod tests {
         assert_eq!(pick_exact(&big, u128::from(u64::MAX) + 1), None);
     }
 
-    #[test]
-    fn handing_over_takes_an_exact_set_and_keeps_a_record() {
-        let (mut w, dir) = wallet_with(
-            "hand",
-            vec![
-                esp_note(4 * ONE, service(), DAY),
-                esp_note(ONE, service(), DAY),
-                esp_note(ONE, service(), DAY),
-            ],
-        );
-        let handover = w
-            .hand_over_esp(service(), u128::from(4 * ONE), None)
-            .unwrap();
-        assert_eq!(handover.service, service());
-        assert_eq!(handover.redeemable_after_day, DAY);
-        let handed: u128 = handover.notes.iter().map(|n| u128::from(n.amount)).sum();
-        assert_eq!(handed, u128::from(4 * ONE));
-        let b = w.balance();
-        assert_eq!(b.esp, u128::from(2 * ONE));
-        assert_eq!((b.notes, b.handed_over), (2, 1));
-        assert_eq!(w.handovers(), std::slice::from_ref(&handover));
-        // the record is on disk
-        let again = Wallet::open(&dir.join("wallet.json")).unwrap();
-        assert_eq!(again.handovers(), &[handover]);
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn an_amount_the_notes_cannot_make_is_refused_and_the_wallet_is_unchanged() {
-        let (mut w, dir) = wallet_with(
-            "inexact",
-            vec![
-                esp_note(4 * ONE, service(), DAY),
-                esp_note(ONE, service(), DAY),
-            ],
-        );
-        let before = w.balance();
-        for units in [
-            u128::from(ONE + ONE / 2),
-            u128::from(2 * ONE),
-            u128::from(6 * ONE),
-        ] {
-            let err = w.hand_over_esp(service(), units, None).unwrap_err();
-            assert!(matches!(err, WalletError::NotEnough(_)), "{err}");
+    /// What an app would hand to the service: `notes` as a [`Handover`].
+    fn handover_of(notes: &[StoredNote], day: u64) -> Handover {
+        Handover {
+            service: service(),
+            redeemable_after_day: day,
+            notes: notes
+                .iter()
+                .map(|n| HandedNote {
+                    amount: n.amount,
+                    note: n.note,
+                    spend_secret: n.spend_secret,
+                    keyset: "ab".repeat(8),
+                })
+                .collect(),
         }
-        assert!(matches!(
-            w.hand_over_esp(service(), 0, None),
-            Err(WalletError::Invalid(_))
-        ));
-        assert_eq!(w.balance(), before);
-        assert!(w.handovers().is_empty());
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn only_notes_for_that_service_are_handed_over() {
-        let (mut w, dir) = wallet_with("service", vec![esp_note(ONE, other_service(), DAY)]);
-        let err = w
-            .hand_over_esp(service(), u128::from(ONE), None)
-            .unwrap_err();
-        assert!(matches!(err, WalletError::NotEnough(_)), "{err}");
-        assert_eq!(w.balance().notes, 1);
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn more_than_one_day_needs_a_day_to_be_named() {
-        let (mut w, dir) = wallet_with(
-            "days",
-            vec![
-                esp_note(ONE, service(), DAY),
-                esp_note(ONE, service(), DAY + 1),
-            ],
-        );
-        let err = w
-            .hand_over_esp(service(), u128::from(ONE), None)
-            .unwrap_err();
-        assert!(matches!(err, WalletError::Invalid(_)), "{err}");
-        assert_eq!(w.balance().notes, 2);
-        let handover = w
-            .hand_over_esp(service(), u128::from(ONE), Some(DAY + 1))
-            .unwrap();
-        assert_eq!(handover.redeemable_after_day, DAY + 1);
-        assert!(
-            w.hand_over_esp(service(), u128::from(ONE), Some(DAY + 7))
-                .is_err()
-        );
-        assert_eq!(w.balance().notes, 1);
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn reserved_notes_are_not_handed_over() {
-        let mut held = esp_note(ONE, service(), DAY);
-        held.reserved_by = Some("abc".into());
-        let (mut w, dir) = wallet_with("reserved", vec![held]);
-        assert!(w.hand_over_esp(service(), u128::from(ONE), None).is_err());
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn a_service_takes_a_handover_in() {
-        let (mut app, app_dir) = wallet_with(
-            "app",
-            vec![
+        let handover = handover_of(
+            &[
                 esp_note(2 * ONE, service(), DAY),
                 esp_note(ONE, service(), DAY),
             ],
+            DAY,
         );
-        let handover = app
-            .hand_over_esp(service(), 3 * u128::from(ONE), None)
-            .unwrap();
         let svc_dir = scratch("svc");
         let mut svc = Wallet::open(&svc_dir.join("wallet.json")).unwrap();
         let (count, units) = svc.receive_handover(&handover).unwrap();
@@ -760,14 +569,12 @@ mod tests {
         // the same handover again is refused, and changes nothing
         assert!(svc.receive_handover(&handover).is_err());
         assert_eq!(svc.balance(), b);
-        fs::remove_dir_all(&app_dir).unwrap();
         fs::remove_dir_all(&svc_dir).unwrap();
     }
 
     #[test]
     fn a_handover_with_a_secret_that_does_not_match_is_refused() {
-        let (mut app, app_dir) = wallet_with("mismatch-app", vec![esp_note(ONE, service(), DAY)]);
-        let mut handover = app.hand_over_esp(service(), u128::from(ONE), None).unwrap();
+        let mut handover = handover_of(&[esp_note(ONE, service(), DAY)], DAY);
         handover.notes[0].spend_secret = key(9);
         let svc_dir = scratch("mismatch-svc");
         let mut svc = Wallet::open(&svc_dir.join("wallet.json")).unwrap();
@@ -778,36 +585,7 @@ mod tests {
         assert_eq!(svc.balance().notes, 0);
         handover.notes.clear();
         assert!(svc.receive_handover(&handover).is_err());
-        fs::remove_dir_all(&app_dir).unwrap();
         fs::remove_dir_all(&svc_dir).unwrap();
-    }
-
-    #[test]
-    fn a_transfer_refused_for_a_spent_note_retires_it_and_frees_the_others() {
-        let notes = vec![
-            esp_note(4 * ONE, service(), DAY),
-            esp_note(ONE, service(), DAY),
-            esp_note(2 * ONE, service(), DAY),
-        ];
-        let (mut w, dir) = wallet_with("spent-in-transfer", notes);
-        let built = w.build_transfer(&key(1), None, None).unwrap();
-        assert_eq!(w.pending_transfers().len(), 1);
-        let spent_id = w.pending_transfers()[0].input_ids[1].clone();
-        // an index past the request is refused and changes nothing
-        assert!(w.mark_spent_in_transfer(&built.id, &[3]).is_err());
-        assert_eq!(w.pending_transfers().len(), 1);
-        let report = w.mark_spent_in_transfer(&built.id, &[1]).unwrap();
-        assert_eq!((report.marked_spent, report.freed), (1, 2));
-        assert_eq!(w.spent_notes().len(), 1);
-        assert_eq!(w.spent_notes()[0].id(), spent_id);
-        assert_eq!(w.notes().len(), 2);
-        assert!(w.notes().iter().all(|n| n.reserved_by.is_none()));
-        assert!(w.pending_transfers().is_empty());
-        // the next transfer does not offer the spent note again
-        let next = w.build_transfer(&key(1), None, None).unwrap();
-        assert_eq!(next.request.inputs.len(), 2);
-        assert!(!w.pending_transfers()[0].input_ids.contains(&spent_id));
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -978,20 +756,6 @@ mod tests {
 
         assert_eq!(w.balance(), before);
         assert_eq!(w.pending_transfers().len(), 1);
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn a_cancelled_transfer_frees_its_notes() {
-        let (mut w, dir) = wallet_with("cancel", vec![esp_note(ONE, service(), DAY)]);
-        let built = w.build_transfer(&key(1), None, None).unwrap();
-        assert_eq!(w.balance().reserved, 1);
-        w.cancel_transfer(&built.id).unwrap();
-        let b = w.balance();
-        assert_eq!((b.reserved, b.pending_transfers, b.notes), (0, 0, 1));
-        assert!(w.cancel_transfer(&built.id).is_err());
-        // and the notes can be used again
-        assert!(w.build_transfer(&key(1), None, None).is_ok());
         fs::remove_dir_all(&dir).unwrap();
     }
 

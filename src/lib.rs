@@ -15,9 +15,9 @@
 //!   one-off reply key of its own, and the PSP delivers the signatures over AIR.
 //! - [`split`]: ESP note sizes are powers of two; totals are split into them.
 //! - [`esp`]: exchanging PSP for ESP (`build_exchange`, `finish_exchange`).
-//! - [`transfer`]: handing ESP to the service it is named for
-//!   (`hand_over_esp`), receiving it (`receive_handover`), and the service's swap
-//!   at the ESP mint (`build_transfer`, `finish_transfer`).
+//! - [`transfer`]: the service taking in the ESP an FSP mint kept for it
+//!   (`receive_handover`, behind `receive`), and the service's swap at the ESP
+//!   mint (`build_transfer`, `finish_transfer`: used by the tests only).
 //! - [`redeem`]: redeeming ESP with the Issuer.
 //! - [`fsp`]: FSP from a service's fsp-mint: issue from ESP, spend with change,
 //!   automatic rollover to the current keyset, and the ESP schedule.

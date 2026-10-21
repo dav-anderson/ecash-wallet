@@ -10,7 +10,6 @@ use ecash_wallet::config::{self, AirSettings};
 use ecash_wallet::esp::ExchangeBuild;
 use ecash_wallet::redeem::{EntryOutcome, RedeemOutcome, RedemptionState};
 use ecash_wallet::store::Handover;
-use ecash_wallet::transfer::TransferBuild;
 use ecash_wallet::{Wallet, WalletError};
 use secp256k1::SecretKey;
 use sp_wire::ServiceDid;
@@ -62,21 +61,12 @@ ecash-wallet [--wallet FILE] [--config FILE] [--regtest|--signet|--testnet] <com
       the same terms. ESP notes are powers of two: the wallet splits the amount
       (and the change) into the fewest of them. --amounts picks other sizes,
       each a power of two, adding up to the same total.
-  hand-over --service DID (--esp UNITS | --psp N) [--day D] --out FILE
-      Hand whole ESP notes bound to a service to that service, worth exactly
-      UNITS ESP units (or N PSP). Notes cannot be split, so the wallet needs a
-      set that adds up to the amount. The notes leave this wallet and are
-      written, with their spend secrets, to FILE (private: keep it so). FILE is
-      a development stand-in for an AIR message to the service.
   receive FILE
-      As the service: take a hand-over file into this wallet.
-  transfer --service-key HEX [--day D] [--amounts A,B,C] [--resume ID]
-      As the service (HEX is its 32 byte secret key): swap every free ESP note
-      this wallet holds for that service and day for fresh notes only it
-      controls, with the same service, the same day and the same total.
-      The new notes are powers of two, the fewest that make the total.
-      --amounts picks other sizes (each a power of two, same total).
-      --resume sends a pending request again.
+      As the service: take the ESP that fsp-mint's `export-esp` wrote (a file
+      per redeemable-after day, with the notes' spend secrets) into this wallet,
+      so it can be redeemed. This is its only use: the wallet no longer writes
+      such files (the old `hand-over` and `transfer` commands are gone; `fsp
+      issue` carries the ESP to the FSP mint over AIR).
   balance
       What the wallet holds and what is waiting.
   handoff export-psp --to DID --psp N [--out FILE]
@@ -180,7 +170,7 @@ regtest/).
 
 The PSP and the ESP are reached over AIR only: their mint info (which network and
 wire version), keys, keysets, rotation window, fees, rollover, check-state,
-exchange, transfer and redeem are all AIR requests. config.toml's [air] section
+exchange and redeem are all AIR requests. config.toml's [air] section
 (or ECASH_AIR_SERVER and ECASH_AIR_HOST) must name the AIR server and its host;
 without them a command that talks to the PSP or the ESP fails, saying which
 setting is missing. The PSP and the ESP each have their own DID, built in
@@ -690,72 +680,17 @@ fn write_private(path: &std::path::Path, text: &str) -> Result<(), std::io::Erro
     file.sync_all()
 }
 
-fn hand_over(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
-    let service = service_did(
-        &args
-            .flag("--service")?
-            .ok_or_else(|| WalletError::Invalid("--service DID is required".into()))?,
-    )?;
-    let units: u128 = match (args.flag("--esp")?, args.flag("--psp")?) {
-        (Some(esp), None) => esp.trim().parse::<u128>().map_err(|_| {
-            WalletError::Invalid(format!(
-                "--esp must be a whole number of ESP units, got `{esp}`"
-            ))
-        })?,
-        (None, Some(psp)) => u128::from(number(&psp, "--psp")?) * u128::from(ESP_PER_PSP),
-        _ => {
-            return Err(WalletError::Invalid(
-                "give exactly one of --esp UNITS or --psp N".into(),
-            ));
-        }
-    };
-    let day = match args.flag("--day")? {
-        Some(d) => Some(number(&d, "--day")?),
-        None => None,
-    };
-    let out = args
-        .flag("--out")?
-        .ok_or_else(|| WalletError::Invalid("--out FILE is required".into()))?;
-    args.done()?;
-    let path = PathBuf::from(&out);
-    if path.exists() {
-        return Err(WalletError::Invalid(format!(
-            "{out} already exists. Pick a new file name"
-        )));
-    }
-    // The mint's note limit is read when it can be; a hand-over works offline,
-    // and then the mint's own check decides.
-    if let Err(e) = ecash_wallet::mint_info::sync_esp_limits(wallet, &air_settings()) {
-        eprintln!("the mint's note limit was not read ({e}); the mint will check it");
-    }
-    let handover = wallet.hand_over_esp(service, units, day)?;
-    let text = serde_json::to_string_pretty(&handover)
-        .map_err(|e| WalletError::Invalid(format!("could not write the hand-over: {e}")))?;
-    write_private(&path, &text).map_err(|e| {
-        WalletError::Invalid(format!(
-            "the notes were handed over and are kept in the wallet file, but writing {out} failed: {e}"
-        ))
-    })?;
-    let handed: u128 = handover.notes.iter().map(|n| u128::from(n.amount)).sum();
-    println!(
-        "handed over {handed} ESP in {} note(s), redeemable after day {}",
-        handover.notes.len(),
-        handover.redeemable_after_day
-    );
-    println!(
-        "wrote {out}. It holds the notes' spend secrets: give it to the service, and keep it private"
-    );
-    Ok(())
-}
-
+/// Take the ESP an FSP mint kept for this service (`fsp-mint export-esp`) into
+/// the wallet.
 fn receive(wallet: &mut Wallet, args: Args) -> Result<(), WalletError> {
     let rest = args.rest();
     let [path] = rest.as_slice() else {
         return Err(WalletError::Invalid("receive takes one file".into()));
     };
     let text = std::fs::read_to_string(path)?;
-    let handover: Handover = serde_json::from_str(&text)
-        .map_err(|e| WalletError::Invalid(format!("{path}: not a hand-over file: {e}")))?;
+    let handover: Handover = serde_json::from_str(&text).map_err(|e| {
+        WalletError::Invalid(format!("{path}: not a file from fsp-mint export-esp: {e}"))
+    })?;
     let (count, units) = wallet.receive_handover(&handover)?;
     println!(
         "received {units} ESP in {count} note(s) for {}, redeemable after day {}",
@@ -763,95 +698,6 @@ fn receive(wallet: &mut Wallet, args: Args) -> Result<(), WalletError> {
         handover.redeemable_after_day
     );
     Ok(())
-}
-
-fn transfer(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
-    let base = esp_base(wallet)?;
-    let resume = args.flag("--resume")?;
-    // The service key signs a new transfer (not needed with --resume).
-    let key = args
-        .flag("--service-key")?
-        .map(|k| secret_key(&k))
-        .transpose()?;
-    let built: TransferBuild = match resume {
-        Some(id) => {
-            args.done()?;
-            let pending = wallet
-                .pending_transfers()
-                .iter()
-                .find(|p| p.id == id)
-                .ok_or_else(|| WalletError::Unknown(format!("no pending transfer {id}")))?;
-            TransferBuild {
-                id: pending.id.clone(),
-                request: pending.request.clone(),
-                esp_units: pending
-                    .request
-                    .inputs
-                    .iter()
-                    .map(|i| u128::from(i.amount.units))
-                    .sum(),
-            }
-        }
-        None => {
-            let key =
-                key.ok_or_else(|| WalletError::Invalid("--service-key HEX is required".into()))?;
-            let day = match args.flag("--day")? {
-                Some(d) => Some(number(&d, "--day")?),
-                None => None,
-            };
-            let amounts = match args.flag("--amounts")? {
-                Some(list) => Some(
-                    list.split(',')
-                        .map(|a| number(a, "an amount"))
-                        .collect::<Result<Vec<_>, _>>()?,
-                ),
-                None => None,
-            };
-            args.done()?;
-            ecash_wallet::mint_info::sync_esp_keysets(wallet, &air_settings(), &base)?;
-            ecash_wallet::mint_info::sync_esp_limits(wallet, &air_settings())?;
-            wallet.build_transfer(&key, day, amounts.as_deref())?
-        }
-    };
-    eprintln!(
-        "transfer {} ({} ESP in {} note(s))",
-        built.id,
-        built.esp_units,
-        built.request.inputs.len()
-    );
-    match ecash_wallet::mint_info::send_transfer(wallet, &air_settings(), &built.request) {
-        Ok(response) => {
-            let done = wallet.finish_transfer(&built.id, &response)?;
-            println!(
-                "transferred {} ESP to {} new note(s) that only this service controls, redeemable after day {}",
-                done.esp_units,
-                done.notes.len(),
-                done.redeemable_after_day
-            );
-            Ok(())
-        }
-        Err(WalletError::SpentElsewhere { why, inputs }) => {
-            // Some notes are spent. They leave the balance; the others are free.
-            let report = wallet.mark_spent_in_transfer(&built.id, &inputs)?;
-            eprintln!(
-                "{} note(s) were spent by a different request and are marked spent in the wallet. {} other note(s) are free again",
-                report.marked_spent, report.freed
-            );
-            Err(WalletError::SpentElsewhere { why, inputs })
-        }
-        Err(WalletError::Refused(why)) => {
-            // Nothing was burned, so the notes go back to the wallet.
-            wallet.cancel_transfer(&built.id)?;
-            Err(WalletError::Refused(why))
-        }
-        Err(e) => {
-            eprintln!(
-                "the outcome is unknown. Send the same request again with: transfer --resume {}",
-                built.id
-            );
-            Err(e)
-        }
-    }
 }
 
 /// ESP units as US dollars ($1 = 10^12 units; 1 PSP is $0.10 = 10^11 units), all
@@ -1870,7 +1716,7 @@ fn config_command(loaded: &config::Loaded, args: Args) -> Result<(), WalletError
     println!("Storage settings only: nothing reads or writes the AIR for storage yet.");
     let air = &loaded.settings.air;
     println!(
-        "PSP and ESP calls (mint info, keys, keysets, rotation, fees, rollover, check-state, exchange, transfer, redeem): over AIR only, through air.server and air.host"
+        "PSP and ESP calls (mint info, keys, keysets, rotation, fees, rollover, check-state, exchange, redeem): over AIR only, through air.server and air.host"
     );
     println!(
         "FSP mint calls (mint info, keys, rotation, fees, issue, spend): over AIR only, through the air.fsp entry of the service ({} entries)",
@@ -1946,9 +1792,7 @@ fn run(raw: Vec<String>) -> Result<(), WalletError> {
         "buy-psp" => buy_psp(&mut wallet, args),
         "claim-psp" => claim_psp(&mut wallet, args),
         "exchange" => exchange(&mut wallet, args),
-        "hand-over" => hand_over(&mut wallet, args),
         "receive" => receive(&mut wallet, args),
-        "transfer" => transfer(&mut wallet, args),
         "redeem" => redeem(&mut wallet, args),
         "balance" => balance(&wallet, args),
         "send-psp" | "receive-psp" | "sent" => Err(WalletError::Invalid(format!(

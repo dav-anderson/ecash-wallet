@@ -20,7 +20,7 @@
 //!
 //! **A held or rejected payment stays open.** The PSP has the bitcoin and signed
 //! nothing, so the purchase and its key are kept ([`Delivered::Open`]) for the
-//! window the record names (`open_until`; 7 days by default at the PSP). The
+//! window the record names (`open_until`; 14 days by default at the PSP). The
 //! corrected request or credit that would settle it is not designed yet. If it is
 //! not settled by `open_until` the PSP forfeits the payment, and the wallet
 //! deletes the purchase and the key. A purchase the PSP says it owes a credit on

@@ -260,7 +260,7 @@ There is no change line, because the 1 PSP note is exactly the amount asked for.
 
 - If `exchange` times out, run it again with `--resume <id>` (the id was printed). It sends the same request and gets the same answer, and nothing is burned twice.
 - The PSP writes each payer's signatures to a record only that payer can find, so `claim-psp` reads its own purchases' records and no one else's. Any wallet command also picks up a delivery when it starts, so the line above may be printed by the command that ran first, and `claim-psp` then says there is nothing pending.
-- A payment the PSP holds (paid, but short beyond its reconciliation target) or rejects is delivered too, so the wallet shows `the PSP is holding the payment` or `the PSP rejected it`, with what was paid and the time it stays open until, and keeps the purchase and its key. When that time passes the PSP forfeits the payment and the next wallet command prints `its reconciliation window has closed` and deletes the purchase and the key. The PSP's window is `PSP_RECONCILIATION_WINDOW_DAYS` (7); set `1` on the PSP to see it close sooner.
+- A payment the PSP holds (paid, but short beyond its reconciliation target) or rejects is delivered too, so the wallet shows `the PSP is holding the payment` or `the PSP rejected it`, with what was paid and the time it stays open until, and keeps the purchase and its key. When that time passes the PSP forfeits the payment and the next wallet command prints `its reconciliation window has closed` and deletes the purchase and the key. The PSP's window is `PSP_RECONCILIATION_WINDOW_DAYS` (14); set `1` on the PSP to see it close sooner.
 - Stop the servers with Ctrl-C in T2 and T3, and the node with `$CLI stop`.
 
 ## Regtest, restart on the new build

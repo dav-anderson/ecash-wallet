@@ -145,8 +145,8 @@ pub struct OpenPurchase {
 
 /// How long the wallet keeps a purchase's key when the PSP's record names no
 /// window for what is outstanding (outputs neither signed nor reported as
-/// dropped): the PSP's default reconciliation window.
-pub const OPEN_KEY_FALLBACK_SECS: u64 = 7 * 24 * 3600;
+/// dropped): 14 days, the PSP's default reconciliation window.
+pub const OPEN_KEY_FALLBACK_SECS: u64 = 14 * 24 * 3600;
 
 /// The one-off key of a purchase that was claimed but may not be closed: the PSP
 /// owes the payer a credit, or part of the purchase was neither signed nor

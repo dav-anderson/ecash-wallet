@@ -225,7 +225,7 @@ impl Wallet {
     ///   The purchase is cleared. Its key is deleted with it unless the purchase
     ///   may still be open: the PSP owes a credit, or some output was neither
     ///   signed nor reported as dropped. Then the key is kept in `open_replies`
-    ///   until the record's `open_until` (or, with none named, a week from now),
+    ///   until the record's `open_until` (or, with none named, 14 days from now),
     ///   because the PSP will write a follow-up sealed to it.
     /// - **Held or Refused.** The purchase and its key are kept, marked open with
     ///   what the PSP said ([`Delivered::Open`]). Nothing is cleared until the

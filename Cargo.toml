@@ -36,9 +36,9 @@ rand = "0.8.5"
 mint-core = { git = "https://github.com/dav-anderson/mint-core.git", tag = "v0.2.0" }
 # The tests run real mints in the process. They are dev-dependencies only: the
 # library and the command line link none of them.
-psp-mint = { git = "https://github.com/dav-anderson/psp-mint.git", tag = "v0.5.0" }
-esp-mint = { git = "https://github.com/dav-anderson/esp-mint.git", tag = "v0.7.0" }
-fsp-mint = { git = "https://github.com/dav-anderson/fsp-mint.git", tag = "v0.6.0" }
+psp-mint = { git = "https://github.com/dav-anderson/psp-mint.git", tag = "v0.6.0" }
+esp-mint = { git = "https://github.com/dav-anderson/esp-mint.git", tag = "v0.8.0" }
+fsp-mint = { git = "https://github.com/dav-anderson/fsp-mint.git", tag = "v0.7.0" }
 axum = "0.8"
 # Only `redeem_flow` uses it, to call the in-process ESP mint's operator (admin)
 # routes. The wallet itself makes no HTTP call.

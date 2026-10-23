@@ -455,19 +455,6 @@ impl Wallet {
         report
     }
 
-    /// The held notes a pending request reserved, in the request's order.
-    pub(crate) fn reserved_notes(&self, ids: &[String]) -> Result<Vec<StoredNote>, WalletError> {
-        ids.iter()
-            .map(|nid| {
-                self.notes()
-                    .iter()
-                    .find(|n| &n.id() == nid)
-                    .cloned()
-                    .ok_or_else(|| WalletError::Corrupt(format!("reserved note {nid} is missing")))
-            })
-            .collect()
-    }
-
     /// Drop a pending exchange and free its PSP notes. Only safe when the mint
     /// refused the request, so nothing was burned. After a fault whose outcome is
     /// unknown, resend the same request instead.
@@ -491,9 +478,15 @@ impl Wallet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::expect;
     use crate::store::Wallet;
     use std::fs;
     use std::path::PathBuf;
+
+    /// Open a wallet file of the test network.
+    fn open_wallet(path: &std::path::Path) -> Result<crate::Wallet, crate::WalletError> {
+        crate::Wallet::open(path, "regtest")
+    }
 
     const G_X: &str = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
 
@@ -519,7 +512,7 @@ mod tests {
     /// checked here, only the selection and the request.
     fn wallet_with(name: &str, sizes: &[u64]) -> (Wallet, PathBuf) {
         let dir = scratch(name);
-        let mut w = Wallet::open(&dir.join("wallet.json")).unwrap();
+        let mut w = open_wallet(&dir.join("wallet.json")).unwrap();
         let sk = secp256k1::SecretKey::new(&mut rand::rngs::OsRng);
         let notes: Vec<StoredNote> = sizes
             .iter()
@@ -727,19 +720,23 @@ mod tests {
     #[test]
     fn the_asked_for_split_must_add_up_exactly() {
         let (mut w, dir) = wallet_with("split", &[2]);
+        // powers of two that add up to too little, and to too much
+        let e = expect::invalid(w.build_exchange(2, service(), Some(&pieces(&[100_000_000_000]))));
         assert!(
-            w.build_exchange(2, service(), Some(&[100_000_000_000]))
-                .is_err()
+            e.contains("add up to 100000000000 units but 2 PSP is 200000000000"),
+            "{e}"
         );
+        let mut too_much = pieces(&[200_000_000_000]);
+        too_much.push(1);
+        let e = expect::invalid(w.build_exchange(2, service(), Some(&too_much)));
         assert!(
-            w.build_exchange(2, service(), Some(&[100_000_000_000, 100_000_000_001]))
-                .is_err()
+            e.contains("add up to 200000000001 units but 2 PSP is 200000000000"),
+            "{e}"
         );
-        assert!(w.build_exchange(2, service(), Some(&[])).is_err());
-        assert!(
-            w.build_exchange(2, service(), Some(&[0, 200_000_000_000]))
-                .is_err()
-        );
+        let e = expect::invalid(w.build_exchange(2, service(), Some(&[])));
+        assert!(e.contains("needs at least one ESP note"), "{e}");
+        let e = expect::invalid(w.build_exchange(2, service(), Some(&[0, 200_000_000_000])));
+        assert!(e.contains("an ESP note cannot be zero"), "{e}");
         assert!(w.pending_exchanges().is_empty());
         // a size that is not a power of two is refused, though the total is right
         let e = w
@@ -786,7 +783,10 @@ mod tests {
             w.build_exchange(4, service(), None),
             Err(WalletError::NotEnough(_))
         ));
-        assert!(w.cancel_exchange("nope").is_err());
+        assert_eq!(w.balance().reserved, 1, "the note is held for the exchange");
+        let e = expect::unknown(w.cancel_exchange("nope"));
+        assert!(e.contains("no pending exchange nope"), "{e}");
+        assert_eq!(w.balance().reserved, 1, "a refused cancel frees nothing");
         w.cancel_exchange(&first.id).unwrap();
         assert_eq!(w.balance().reserved, 0);
         assert!(w.pending_exchanges().is_empty());
@@ -840,7 +840,7 @@ mod tests {
         assert!(w.build_exchange(3, service(), None).is_ok());
 
         // and the record survives a reopen
-        let again = Wallet::open(w.path()).unwrap();
+        let again = open_wallet(w.path()).unwrap();
         assert_eq!(again.spent_notes().len(), 1);
         assert_eq!(again.balance().psp, 3);
         fs::remove_dir_all(&dir).unwrap();
@@ -892,7 +892,7 @@ mod tests {
     fn the_pending_exchange_survives_a_reopen_with_the_same_request() {
         let (mut w, dir) = wallet_with("reopen", &[4]);
         let built = w.build_exchange(4, service(), None).unwrap();
-        let again = Wallet::open(w.path()).unwrap();
+        let again = open_wallet(w.path()).unwrap();
         assert_eq!(again.pending_exchanges().len(), 1);
         assert_eq!(again.pending_exchanges()[0].id, built.id);
         assert_eq!(
@@ -944,7 +944,6 @@ mod tests {
         let (mut w, dir2) = wallet_with("limit2", &[2]);
         w.set_esp_limits(crate::store::EspLimits {
             exchange_max_items: Some(1),
-            transfer_max_items: None,
         });
         let e = w
             .build_exchange(2, service(), Some(&amounts))

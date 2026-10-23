@@ -57,6 +57,10 @@ name = "ecash-wallet"
 path = "src/main.rs"
 
 [[test]]
+name = "flow"
+required-features = ["air-listener-tests"]
+
+[[test]]
 name = "redeem_flow"
 required-features = ["air-listener-tests"]
 
@@ -74,6 +78,10 @@ required-features = ["air-listener-tests"]
 
 [[test]]
 name = "psp_delivery"
+required-features = ["air-listener-tests"]
+
+[[test]]
+name = "psp_reconcile"
 required-features = ["air-listener-tests"]
 
 [[test]]

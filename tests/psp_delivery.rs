@@ -19,28 +19,23 @@ mod common;
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use ecash_wallet::config::AirSettings;
 use ecash_wallet::mint_info::{PickedUp, Pickup, psp_pickup};
-use ecash_wallet::psp::PurchaseBuild;
+use ecash_wallet::psp::{Loss, LossKind, PurchaseBuild};
 use ecash_wallet::store::{OpenKind, PendingPurchase};
 use ecash_wallet::{Wallet, WalletError};
-use mint_core::MintLogic;
 use mint_types::{Amount, MintInput};
 use psp_mint::delivery::{Deliverer, Report};
-use psp_mint::records::Records;
-use psp_mint::scan::Received;
-use psp_mint::settle::{self, Settlement};
+use psp_mint::settle::Settlement;
 use sp_wire::ServiceDid;
 use sp_wire::air_request::addr;
 use sp_wire::air_request::client::{self, ServerRef, block_on_new_runtime};
 use sp_wire::air_request::delivery::{self as wire, Outcome, Refused, Written};
 use sp_wire::seal::SecretKey as DidKey;
 
-/// $10,000 per BTC in cents: a PSP is $0.10, so 5,000 sats is exactly 5 PSP.
-const BTC_10K: u64 = 1_000_000;
+use common::{PspMint, open_wallet, scratch};
 
 /// An AIR server that nothing answers: the right name, a host nobody is at (an
 /// address reserved for documentation), so a connection fails or times out.
@@ -55,30 +50,20 @@ fn down(server: &ServerRef) -> ServerRef {
 /// own.
 struct Env {
     dir: PathBuf,
-    logic: MintLogic,
-    records: Records,
+    psp: PspMint,
     mint_key: DidKey,
     wallet_path: PathBuf,
     wallet: Wallet,
 }
 
 fn env(name: &str) -> Env {
-    static N: AtomicU64 = AtomicU64::new(0);
-    let dir = std::env::temp_dir().join(format!(
-        "ecash-wallet-psp-delivery-{}-{name}-{}",
-        std::process::id(),
-        N.fetch_add(1, Ordering::Relaxed)
-    ));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    let logic = psp_mint::mint::open(&dir.join("psp"), Amount::from_units(1024)).unwrap();
-    let records = Records::open(&dir.join("psp").join("settlements.json")).unwrap();
+    let dir = scratch(&format!("psp-delivery-{name}"));
+    let psp = PspMint::open(&dir.join("psp"));
     let wallet_path = dir.join("wallet.json");
-    let wallet = Wallet::open(&wallet_path).unwrap();
+    let wallet = open_wallet(&wallet_path).unwrap();
     Env {
         dir,
-        logic,
-        records,
+        psp,
         mint_key: DidKey::new(),
         wallet_path,
         wallet,
@@ -105,20 +90,7 @@ impl Env {
     /// The mint opens a payment of `sats` carrying `payload` and settles it at 6
     /// confirmations.
     fn settle(&mut self, txid: &str, sats: u64, payload: Vec<u8>) -> Settlement {
-        let (opened, ignored) = psp_mint::seal::open_payloads(
-            &self.mint_key,
-            vec![Received {
-                txid: txid.to_string(),
-                confirmations: 6,
-                value_sats: sats,
-                payload: Some(payload),
-            }],
-        );
-        assert_eq!(ignored, 0);
-        settle::settle(&self.logic, &mut self.records, &opened[0], &mut || {
-            Ok(BTC_10K)
-        })
-        .unwrap()
+        self.psp.pay(&self.mint_key, txid, sats, payload)
     }
 
     fn deliverer(&self, server: &ServerRef) -> Deliverer {
@@ -142,11 +114,8 @@ impl Env {
 
 /// The reply DID and the purchase id the wallet holds for a pending purchase.
 fn identity(p: &PendingPurchase) -> (ServiceDid, [u8; 32]) {
-    let key = addr::secret_from_hex(p.reply_secret.as_ref().expect("a reply key")).unwrap();
-    let purchase = hex::decode(p.delivery_id.as_ref().expect("a delivery id"))
-        .unwrap()
-        .try_into()
-        .unwrap();
+    let key = addr::secret_from_hex(&p.reply_secret).unwrap();
+    let purchase = hex::decode(&p.delivery_id).unwrap().try_into().unwrap();
     (addr::key_to_did(&key.public_key()), purchase)
 }
 
@@ -165,6 +134,11 @@ fn plant(server: &ServerRef, cell: &DidKey, sealed: &[u8]) {
     assert_eq!(written, Written::Created);
 }
 
+/// The purchase ids of the payments a `close_expired` gave up.
+fn ids(lost: &[Loss]) -> Vec<String> {
+    lost.iter().map(|l| l.id.clone()).collect()
+}
+
 fn only(found: &[PickedUp]) -> &Pickup {
     assert_eq!(found.len(), 1, "{found:?}");
     &found[0].what
@@ -172,11 +146,11 @@ fn only(found: &[PickedUp]) -> &Pickup {
 
 #[test]
 fn a_settled_purchase_is_delivered_and_claimed_with_no_paste() {
-    let server = common::server();
+    let server = common::air::server();
     let mut e = env("claim");
-    let build = e.buy(&[4, 1]);
+    let build = e.buy(&[32, 16, 2]);
     assert_eq!(e.wallet.balance().pending_purchases, 1);
-    let settled = e.settle("aa", 5_000, build.payload.clone());
+    let settled = e.settle("aa", 50_000, build.payload.clone());
     assert!(matches!(settled, Settlement::Issued(_)), "{settled:?}");
 
     // the PSP has not written anything yet: the wallet finds nothing and keeps
@@ -185,25 +159,29 @@ fn a_settled_purchase_is_delivered_and_claimed_with_no_paste() {
     assert_eq!(e.wallet.balance().pending_purchases, 1);
 
     let mut deliverer = e.deliverer(&server);
-    let report = deliverer.pass(&mut e.records, Instant::now());
+    let report = deliverer.pass_shared(&e.psp.records, Instant::now());
     assert_eq!((report.delivered, report.failed), (1, 0), "{report:?}");
-    assert!(e.records.undelivered().is_empty());
+    assert!(e.psp.records.lock().unwrap().undelivered().is_empty());
 
     let found = e.pickup(&server);
     let Pickup::Claimed(claimed) = only(&found) else {
         panic!("expected the notes to be claimed: {found:?}");
     };
-    assert_eq!(claimed.claim.claimed_units, 5);
+    assert_eq!(claimed.claim.claimed_units, 50);
     assert_eq!(claimed.claim.still_pending, 0);
     assert!(!claimed.key_kept, "nothing is owed, so the key is dropped");
     let balance = e.wallet.balance();
-    assert_eq!((balance.psp, balance.pending_purchases), (5, 0));
+    assert_eq!((balance.psp, balance.pending_purchases), (50, 0));
     assert!(e.wallet.open_replies().is_empty());
 
     // every note passes the mint's own check
     let dummy = secp256k1::schnorr::Signature::from_slice(&[0u8; 64]).unwrap();
     for stored in e.wallet.notes() {
-        e.logic
+        e.psp
+            .state
+            .logic
+            .lock()
+            .unwrap()
             .verify_note(&MintInput {
                 amount: Amount::from_units(stored.amount),
                 note: stored.note,
@@ -213,7 +191,7 @@ fn a_settled_purchase_is_delivered_and_claimed_with_no_paste() {
     }
 
     // it was saved: a reopened wallet is the same
-    let reopened = Wallet::open(&e.wallet_path).unwrap();
+    let reopened = open_wallet(&e.wallet_path).unwrap();
     assert_eq!(reopened.balance(), e.wallet.balance());
     assert_eq!(Env::note_ids(&reopened), Env::note_ids(&e.wallet));
     fs::remove_dir_all(&e.dir).unwrap();
@@ -221,28 +199,33 @@ fn a_settled_purchase_is_delivered_and_claimed_with_no_paste() {
 
 #[test]
 fn reading_the_same_record_twice_changes_nothing() {
-    let server = common::server();
+    let server = common::air::server();
     let mut e = env("twice");
-    let build = e.buy(&[2, 1]);
+    let build = e.buy(&[32, 16, 2]);
     // a copy of the wallet as it was before the pickup (another device, or a
     // restored backup)
     let copy_path = e.dir.join("copy.json");
     fs::copy(&e.wallet_path, &copy_path).unwrap();
 
-    e.settle("aa", 3_000, build.payload);
+    e.settle("aa", 50_000, build.payload);
     let mut deliverer = e.deliverer(&server);
-    assert_eq!(deliverer.pass(&mut e.records, Instant::now()).delivered, 1);
+    assert_eq!(
+        deliverer
+            .pass_shared(&e.psp.records, Instant::now())
+            .delivered,
+        1
+    );
 
     let found = e.pickup(&server);
     assert!(matches!(only(&found), Pickup::Claimed(_)), "{found:?}");
     let balance = e.wallet.balance();
     let notes = Env::note_ids(&e.wallet);
-    assert_eq!(balance.psp, 3);
+    assert_eq!(balance.psp, 50);
 
     // the record is still there (the cell is write-once), and the copy claims the
     // very same notes from it
     let air = e.air(&server);
-    let mut copy = Wallet::open(&copy_path).unwrap();
+    let mut copy = open_wallet(&copy_path).unwrap();
     let found = psp_pickup(&mut copy, &air, 0).unwrap();
     assert!(matches!(only(&found), Pickup::Claimed(_)), "{found:?}");
     assert_eq!(copy.balance(), balance);
@@ -257,7 +240,7 @@ fn reading_the_same_record_twice_changes_nothing() {
 
 #[test]
 fn a_rejection_is_delivered_and_the_purchase_is_kept_open_until_its_window_closes() {
-    let server = common::server();
+    let server = common::air::server();
     let mut e = env("reject");
     // 2048 is a power of two the wallet may ask for (it does not know the PSP's
     // largest note), and a size this mint has no key for: it rejects the whole
@@ -267,7 +250,7 @@ fn a_rejection_is_delivered_and_the_purchase_is_kept_open_until_its_window_close
     assert!(matches!(settled, Settlement::Rejected(_)), "{settled:?}");
 
     let mut deliverer = e.deliverer(&server);
-    let report = deliverer.pass(&mut e.records, Instant::now());
+    let report = deliverer.pass_shared(&e.psp.records, Instant::now());
     assert_eq!((report.delivered, report.failed), (1, 0), "{report:?}");
 
     let found = e.pickup(&server);
@@ -287,7 +270,7 @@ fn a_rejection_is_delivered_and_the_purchase_is_kept_open_until_its_window_close
         (0, 0, 1)
     );
     let kept = &e.wallet.pending_purchases()[0];
-    assert!(kept.reply_secret.is_some());
+    assert!(!kept.reply_secret.is_empty());
     assert_eq!(kept.open.as_ref(), Some(&open));
 
     // reading again does not ask the server: it may be down, and the purchase is
@@ -297,7 +280,7 @@ fn a_rejection_is_delivered_and_the_purchase_is_kept_open_until_its_window_close
     assert_eq!(only(&again), &Pickup::StillOpen(open.clone()));
 
     // the open purchase is saved
-    let reopened = Wallet::open(&e.wallet_path).unwrap();
+    let reopened = open_wallet(&e.wallet_path).unwrap();
     assert_eq!(reopened.pending_purchases()[0].open.as_ref(), Some(&open));
 
     // inside the window nothing is deleted, and nothing is written
@@ -312,35 +295,47 @@ fn a_rejection_is_delivered_and_the_purchase_is_kept_open_until_its_window_close
     // when the window closes the PSP forfeits the payment, and the wallet deletes
     // the purchase and its key
     assert_eq!(
-        e.records.forfeit_expired(open.open_until).unwrap(),
+        e.psp
+            .records
+            .lock()
+            .unwrap()
+            .forfeit_expired(open.open_until)
+            .unwrap(),
         vec!["aa"]
     );
-    assert_eq!(
-        e.wallet.close_expired(open.open_until).unwrap(),
-        vec![build.id.clone()]
+    let lost = e.wallet.close_expired(open.open_until).unwrap();
+    assert_eq!(ids(&lost), vec![build.id.clone()]);
+    assert_eq!(lost[0].kind, LossKind::Rejected);
+    // the user is told it plainly: the payment was forfeited, the funds are lost,
+    // and how much
+    let said = lost[0].forfeited();
+    assert!(
+        said.contains("forfeited") && said.contains("lost"),
+        "{said}"
     );
+    assert!(said.contains("5000 sat, 0.50 USD"), "{said}");
     assert_eq!(e.wallet.balance().pending_purchases, 0);
     assert!(e.wallet.open_replies().is_empty());
     assert!(e.pickup(&server).is_empty());
-    let reopened = Wallet::open(&e.wallet_path).unwrap();
+    let reopened = open_wallet(&e.wallet_path).unwrap();
     assert!(reopened.pending_purchases().is_empty());
     fs::remove_dir_all(&e.dir).unwrap();
 }
 
 #[test]
 fn a_held_payment_is_delivered_with_what_was_paid_and_closed_with_the_psps_forfeit() {
-    let server = common::server();
+    let server = common::air::server();
     let mut e = env("held");
-    let build = e.buy(&[4, 1]);
-    // 1,000 sats is 1 unit of the 5 asked: short beyond the target, so nothing is
-    // signed and the PSP holds the payment
-    let settled = e.settle("aa", 1_000, build.payload);
+    let build = e.buy(&[32, 16, 2]);
+    // 10,000 sats is 10 units of the 50 asked: short beyond the target, so nothing
+    // is signed and the PSP holds the payment
+    let settled = e.settle("aa", 10_000, build.payload);
     assert!(
         matches!(settled, Settlement::PaidUnsettled(_)),
         "{settled:?}"
     );
     let mut deliverer = e.deliverer(&server);
-    let report = deliverer.pass(&mut e.records, Instant::now());
+    let report = deliverer.pass_shared(&e.psp.records, Instant::now());
     assert_eq!((report.delivered, report.failed), (1, 0), "{report:?}");
 
     let found = e.pickup(&server);
@@ -348,8 +343,10 @@ fn a_held_payment_is_delivered_with_what_was_paid_and_closed_with_the_psps_forfe
         panic!("expected an open purchase: {found:?}");
     };
     assert_eq!(held.kind, OpenKind::Held);
-    assert_eq!((held.paid_sats, held.paid_cents), (1_000, 10));
-    assert_eq!(held.requested_units, 5);
+    assert_eq!((held.paid_sats, held.paid_cents), (10_000, 100));
+    assert_eq!(held.requested_units, 50);
+    // what the PSP will issue for the payment, in the rules it stored
+    assert_eq!(held.rules.due_units, 10);
     assert!(held.over_under_bps < 0, "short: {}", held.over_under_bps);
     assert_eq!(e.wallet.balance().pending_purchases, 1);
     assert_eq!(e.wallet.balance().psp, 0);
@@ -357,7 +354,10 @@ fn a_held_payment_is_delivered_with_what_was_paid_and_closed_with_the_psps_forfe
     // one tick before the window closes the PSP has not forfeited it and the
     // wallet keeps the purchase; at the end both let go
     assert!(
-        e.records
+        e.psp
+            .records
+            .lock()
+            .unwrap()
             .forfeit_expired(held.open_until - 1)
             .unwrap()
             .is_empty()
@@ -370,32 +370,44 @@ fn a_held_payment_is_delivered_with_what_was_paid_and_closed_with_the_psps_forfe
     );
     assert_eq!(e.wallet.balance().pending_purchases, 1);
     assert_eq!(
-        e.records.forfeit_expired(held.open_until).unwrap(),
+        e.psp
+            .records
+            .lock()
+            .unwrap()
+            .forfeit_expired(held.open_until)
+            .unwrap(),
         vec!["aa"]
     );
-    assert_eq!(e.wallet.close_expired(held.open_until).unwrap().len(), 1);
+    let lost = e.wallet.close_expired(held.open_until).unwrap();
+    assert_eq!(ids(&lost), vec![build.id.clone()]);
+    assert_eq!(lost[0].kind, LossKind::Held);
     assert_eq!(e.wallet.balance().pending_purchases, 0);
     fs::remove_dir_all(&e.dir).unwrap();
 }
 
 #[test]
 fn a_credit_keeps_the_key_until_the_psps_window_for_it_closes() {
-    let server = common::server();
+    let server = common::air::server();
     let mut e = env("credit");
-    let build = e.buy(&[4, 1]);
-    // 6,000 sats is 60 cents for 50: 20% over, so 10 cents are credited
-    let settled = e.settle("aa", 6_000, build.payload);
+    let build = e.buy(&[32, 16, 2]);
+    // 60,000 sats is 600 cents for 500: 20% over, so 100 cents are credited
+    let settled = e.settle("aa", 60_000, build.payload);
     assert!(matches!(settled, Settlement::Issued(_)), "{settled:?}");
     let mut deliverer = e.deliverer(&server);
-    assert_eq!(deliverer.pass(&mut e.records, Instant::now()).delivered, 1);
+    assert_eq!(
+        deliverer
+            .pass_shared(&e.psp.records, Instant::now())
+            .delivered,
+        1
+    );
 
     let found = e.pickup(&server);
     let Pickup::Claimed(claimed) = only(&found) else {
         panic!("expected the notes to be claimed: {found:?}");
     };
-    assert_eq!(claimed.credit_cents, 10);
+    assert_eq!(claimed.credit_cents, 100);
     assert!(claimed.key_kept);
-    assert_eq!(e.wallet.balance().psp, 5);
+    assert_eq!(e.wallet.balance().psp, 50);
 
     // the kept key lasts as long as the PSP's window, which is in the record
     let [kept] = e.wallet.open_replies() else {
@@ -403,36 +415,41 @@ fn a_credit_keeps_the_key_until_the_psps_window_for_it_closes() {
     };
     let until = kept.open_until;
     assert!(until > addr::now_secs());
-    let record = e.records.get("aa").unwrap().open_until;
+    let record = e.psp.records.lock().unwrap().get("aa").unwrap().open_until;
     assert_eq!(record, Some(until), "the same time the PSP forfeits at");
     assert!(e.wallet.close_expired(until - 1).unwrap().is_empty());
     assert_eq!(e.wallet.open_replies().len(), 1);
-    assert_eq!(e.wallet.close_expired(until).unwrap(), vec![build.id]);
+    let lost = e.wallet.close_expired(until).unwrap();
+    assert_eq!(ids(&lost), vec![build.id]);
+    assert_eq!(lost[0].kind, LossKind::Credit);
     assert!(e.wallet.open_replies().is_empty());
     // the notes were claimed, and stay
-    assert_eq!(e.wallet.balance().psp, 5);
+    assert_eq!(e.wallet.balance().psp, 50);
     fs::remove_dir_all(&e.dir).unwrap();
 }
 
 #[test]
 fn with_the_server_down_at_settlement_a_later_retry_delivers_exactly_one_record() {
-    let server = common::server();
+    let server = common::air::server();
     let mut e = env("retry");
-    let build = e.buy(&[4]);
-    e.settle("aa", 4_000, build.payload);
+    let build = e.buy(&[32, 16, 2]);
+    e.settle("aa", 50_000, build.payload);
 
     // the AIR server cannot be reached when the payment settles: issuance stands,
     // nothing is delivered
     let mut dead = Deliverer::new(down(&server), 2, e.mint_key.clone());
-    let report = dead.pass(&mut e.records, Instant::now());
+    let report = dead.pass_shared(&e.psp.records, Instant::now());
     assert_eq!((report.delivered, report.failed), (0, 1), "{report:?}");
     // the next scan is inside the wait: it is left alone
-    let report = dead.pass(&mut e.records, Instant::now());
+    let report = dead.pass_shared(&e.psp.records, Instant::now());
     assert_eq!((report.failed, report.waiting), (0, 1), "{report:?}");
-    assert_eq!(e.records.undelivered().len(), 1);
+    assert_eq!(e.psp.records.lock().unwrap().undelivered().len(), 1);
     assert_eq!(only(&e.pickup(&server)), &Pickup::NotThere);
     let sealed = e
+        .psp
         .records
+        .lock()
+        .unwrap()
         .get("aa")
         .unwrap()
         .delivery
@@ -444,23 +461,32 @@ fn with_the_server_down_at_settlement_a_later_retry_delivers_exactly_one_record(
 
     // the mint is restarted: the waits are gone, the records are read from disk,
     // and the AIR server is back
-    let path = e.dir.join("psp").join("settlements.json");
-    e.records = Records::open(&path).unwrap();
+    e.psp.reopen_records();
     let mut deliverer = e.deliverer(&server);
-    let report = deliverer.pass(&mut e.records, Instant::now());
+    let report = deliverer.pass_shared(&e.psp.records, Instant::now());
     assert_eq!((report.delivered, report.failed), (1, 0), "{report:?}");
     // the same bytes were written that were saved the first time
-    let delivery = e.records.get("aa").unwrap().delivery.clone().unwrap();
+    let delivery = e
+        .psp
+        .records
+        .lock()
+        .unwrap()
+        .get("aa")
+        .unwrap()
+        .delivery
+        .clone()
+        .unwrap();
     assert!(delivery.delivered);
     assert_eq!(delivery.sealed, Some(sealed));
     // nothing is left to do, now or after another restart
     assert_eq!(
-        deliverer.pass(&mut e.records, Instant::now()),
+        deliverer.pass_shared(&e.psp.records, Instant::now()),
         Report::default()
     );
-    e.records = Records::open(&path).unwrap();
+    e.psp.reopen_records();
     assert_eq!(
-        e.deliverer(&server).pass(&mut e.records, Instant::now()),
+        e.deliverer(&server)
+            .pass_shared(&e.psp.records, Instant::now()),
         Report::default()
     );
 
@@ -468,17 +494,17 @@ fn with_the_server_down_at_settlement_a_later_retry_delivers_exactly_one_record(
     let Pickup::Claimed(claimed) = only(&found) else {
         panic!("expected the notes to be claimed: {found:?}");
     };
-    assert_eq!(claimed.claim.claimed_units, 4);
-    assert_eq!(e.wallet.balance().psp, 4);
+    assert_eq!(claimed.claim.claimed_units, 50);
+    assert_eq!(e.wallet.balance().psp, 50);
     fs::remove_dir_all(&e.dir).unwrap();
 }
 
 #[test]
 fn a_record_that_is_not_the_psps_or_not_for_this_purchase_is_refused() {
-    let server = common::server();
+    let server = common::air::server();
     let mut e = env("refused");
-    e.buy(&[1]);
-    e.buy(&[2]);
+    e.buy(&[32, 16, 2]);
+    e.buy(&[64]);
     let purchases = e.wallet.pending_purchases().to_vec();
     assert_eq!(purchases.len(), 2);
     let psp = e.psp_did();
@@ -518,33 +544,9 @@ fn a_record_that_is_not_the_psps_or_not_for_this_purchase_is_refused() {
 }
 
 #[test]
-fn a_purchase_made_before_purchases_had_keys_reads_and_is_not_looked_for() {
-    // no AIR server is needed: with no key there is nothing to ask for
-    let mut e = env("old-wallet");
-    e.buy(&[2]);
-    let mut json: serde_json::Value =
-        serde_json::from_slice(&fs::read(&e.wallet_path).unwrap()).unwrap();
-    for p in json["pending_purchases"].as_array_mut().unwrap() {
-        let p = p.as_object_mut().unwrap();
-        p.remove("reply_secret");
-        p.remove("delivery_id");
-    }
-    // the old wallet's one shared reply DID, which is now ignored
-    json["reply_did"] = serde_json::Value::String(format!("02{}", "79be".repeat(16)));
-    fs::write(&e.wallet_path, serde_json::to_vec(&json).unwrap()).unwrap();
-
-    let mut old = Wallet::open(&e.wallet_path).unwrap();
-    assert_eq!(old.balance().pending_purchases, 1);
-    let found = psp_pickup(&mut old, &AirSettings::default(), 0).unwrap();
-    assert_eq!(only(&found), &Pickup::NoKey);
-    assert_eq!(old.balance().pending_purchases, 1);
-    fs::remove_dir_all(&e.dir).unwrap();
-}
-
-#[test]
 fn without_air_settings_the_pickup_says_what_is_missing_and_changes_nothing() {
     let mut e = env("no-air");
-    e.buy(&[1]);
+    e.buy(&[64]);
     let before = e.wallet.balance();
     let err = psp_pickup(&mut e.wallet, &AirSettings::default(), 0).unwrap_err();
     assert!(matches!(err, WalletError::Invalid(_)), "{err:?}");

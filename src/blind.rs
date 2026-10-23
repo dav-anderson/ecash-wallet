@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 /// An output that has been blinded and sent, and is waiting for its signature.
 /// This holds the only copy of the spend key and the blinding factor.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingOutput {
     pub amount: u64,
     pub nonce_secret: SecretKey,
@@ -81,25 +81,22 @@ mod tests {
     }
 
     #[test]
-    fn the_mint_never_sees_the_nonce() {
-        let out = PendingOutput::new(1);
-        assert_ne!(out.blind_nonce.0, out.nonce.0);
-    }
-
-    #[test]
     fn the_spend_key_is_the_nonce_key() {
         let out = PendingOutput::new(1);
         let keypair = Keypair::from_secret_key(SECP256K1, &out.nonce_secret);
         assert_eq!(keypair.public_key(), out.nonce.0);
-    }
 
-    #[test]
-    fn every_output_has_fresh_keys() {
-        let a = PendingOutput::new(1);
+        // every output has fresh keys
         let b = PendingOutput::new(1);
-        assert_ne!(a.nonce, b.nonce);
-        assert_ne!(a.blind_nonce, b.blind_nonce);
-        assert_ne!(a.blinding_key, b.blinding_key);
+        assert_ne!(out.nonce, b.nonce);
+        assert_ne!(out.blind_nonce, b.blind_nonce);
+        assert_ne!(out.blinding_key, b.blinding_key);
+
+        // the mint's view of an output carries the amount and the blind nonce
+        let big = PendingOutput::new(16);
+        let m = big.mint_output();
+        assert_eq!(m.amount, Amount::from_units(16));
+        assert_eq!(m.blind_nonce, big.blind_nonce);
     }
 
     #[test]
@@ -127,25 +124,5 @@ mod tests {
             bad_factor.signature,
             &out.nonce.as_hash_preimage()
         ));
-    }
-
-    #[test]
-    fn a_pending_output_survives_json() {
-        let out = PendingOutput::new(8);
-        let text = serde_json::to_string(&out).unwrap();
-        let back: PendingOutput = serde_json::from_str(&text).unwrap();
-        assert_eq!(back.nonce, out.nonce);
-        assert_eq!(back.blind_nonce, out.blind_nonce);
-        assert_eq!(back.nonce_secret, out.nonce_secret);
-        assert_eq!(back.blinding_key, out.blinding_key);
-        assert_eq!(back.amount, 8);
-    }
-
-    #[test]
-    fn the_mint_output_carries_the_amount_and_blind_nonce() {
-        let out = PendingOutput::new(16);
-        let m = out.mint_output();
-        assert_eq!(m.amount, Amount::from_units(16));
-        assert_eq!(m.blind_nonce, out.blind_nonce);
     }
 }

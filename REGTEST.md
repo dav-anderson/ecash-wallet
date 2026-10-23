@@ -26,9 +26,11 @@ Use four terminals and keep them open:
 
 `balance` prints the service as its full 66-character DID (the 33-byte compressed key: `02` or `03`, then 64 hex characters). The outputs below show it shortened as `0279be...1798`.
 
-**Wire version 3 (sp-wire 0.5.0).** A service is its DID, so `$SERVICE` below is `02` and the generator's x coordinate, and a command given the old 64-character form is refused with a message that says to use the DID. The outputs below were recorded at wire version 2 and have **not been run again**: every number that comes from a size moves with the new sizes. A redemption of one note with one decline output is 3 bytes larger (`120 + 187 + memo + 82`, was `119 + 186 + memo + 81`), so its size, its fee (the size times the rate) and the payout (the note less the fee) change by that many bytes and `rate × 3` ESP units, and the audit totals that follow from them move with them. The exchange and transfer sizes are one byte larger (`49` and `121` fixed). Re-run the walkthrough to capture the new figures.
+**Wire version 3 (sp-wire 0.5.0).** A service is its DID, so `$SERVICE` below is `02` and the generator's x coordinate, and a command given the old 64-character form is refused with a message that says to use the DID. The outputs below are wire version 2 captures. The 2026-10-22 run, at wire version 3, checked the flow but did not re-record them, so they have **not been run again**: every number that comes from a size moves with the new sizes. A redemption of one note with one decline output is 3 bytes larger (`120 + 187 + memo + 82`, was `119 + 186 + memo + 81`), so its size, its fee (the size times the rate) and the payout (the note less the fee) change by that many bytes and `rate × 3` ESP units, and the audit totals that follow from them move with them. The exchange and transfer sizes are one byte larger (`49` and `121` fixed). Re-run the walkthrough to capture the new figures.
 
 **Rewritten when the `hand-over` and `transfer` commands were removed, and not run.** The wallet no longer writes hand-over files or swaps notes for a service by itself. The service's ESP now comes from `fsp issue`, which hands ESP to the FSP mint over AIR; the FSP mint swaps it at the ESP mint; and `fsp-mint export-esp` writes it out for the service's wallet to `receive` (that is all `receive` is for now). So steps 14 to 20 are gone, step 26 is rebuilt around the FSP mint (which is now set up there, not in step 35), and every figure that followed from the old transfers moved: steps 27 to 28, 31, 33 and 35 to 48 are changed and marked as such where they are. The audit totals were recomputed by hand (issued and redeemed each 3×10^11 lower than the recorded run through step 36, then by the rounds added in steps 38 and 40), not captured. Steps 39 to 41 no longer split a note with `transfer --amounts`: step 40 splits a redemption over two notes instead. Re-run the walkthrough to capture the real output, and look at a difference rather than matching it.
+
+**Corrected after the first end-to-end run (2026-10-22, regtest round 1, ROADMAP item 18), and not rerun.** That run followed this file on release builds and its report lists where the file had drifted. The listen lines, the payload sizes, the note counts, the ceiling of step 27, the `pgrep` pattern of step 22, the `ESP_NETWORK` of `esp-mint pubkey`, the balance of step 25, the wording of steps 30, 38, 42, 45 and 46 and the size ceiling of step 40 are corrected below from that report. What the report did not print is not guessed: it is marked `not rerun` where it stands. Three behaviours changed in the same round, and the text of the steps they touch was rewritten for them without a run: every `esp-mint` command says its network on standard error (`esp-mint on regtest: data in …`); a stale ESP rollover now names every spent note, and an FSP refusal that names spent notes marks them spent in the wallet (steps 46 and 48); and `redeem --max-bytes` names the limit in force and prints its summary first (step 40). The observed audit totals of that run are in its report; the totals in this file from step 26 on are calculated and differ with the number and size of the notes each step makes.
 
 The commands that need `bitcoin-cli` use `CLI=~/bitcoin-core/bitcoin-31.1/bin/bitcoin-cli`, set in the terminal that runs them.
 
@@ -82,7 +84,7 @@ Every mint is reached over AIR only: the wallet's calls to the PSP, the ESP and 
 export AIR_SERVER=<the AIR server's key>
 ```
 
-Set the same shell variable in every terminal below (T1 to T5). The mints take it as `PSP_AIR_SERVER`, `ESP_AIR_SERVER` and `FSP_AIR_SERVER` with the host `127.0.0.1` (the FSP mint also as `FSP_AIR_ESP_SERVER` and `FSP_AIR_ESP_HOST`, for its calls to the ESP; here the same server carries both), and the wallet as `ECASH_AIR_SERVER` and `ECASH_AIR_HOST` (step 5), plus `ECASH_AIR_FSP` for the FSP mint (step 35). Without them `psp-mint serve`, `esp-mint serve` and `fsp-mint serve` refuse to start, and a wallet command that calls the PSP or the ESP stops with an error that names `air.server` and `air.host`, and an `fsp` command for a service with no `air.fsp` entry stops with an error that names `air.fsp`. The mint's local HTTP (`/audit`, `/health` for the PSP and the ESP, `/melt`, `/burns` and the operator's routes) is unchanged; fsp-mint's only HTTP route is `/audit`. Start the mints in the order of steps 3, 4 and 35: the FSP asks the ESP over AIR at startup and exits if it cannot be reached.
+Set the same shell variable in every terminal below (T1 to T5). The mints take it as `PSP_AIR_SERVER`, `ESP_AIR_SERVER` and `FSP_AIR_SERVER` with the host `127.0.0.1` (the FSP mint also as `FSP_AIR_ESP_SERVER` and `FSP_AIR_ESP_HOST`, for its calls to the ESP; here the same server carries both), and the wallet as `ECASH_AIR_SERVER` and `ECASH_AIR_HOST` (step 5), plus `ECASH_AIR_FSP` for the FSP mint (step 35). Without them `psp-mint serve`, `esp-mint serve` and `fsp-mint serve` refuse to start, and a wallet command that calls the PSP or the ESP stops with an error that names `air.server` and `air.host`, and an `fsp` command for a service with no `air.fsp` entry stops with an error that names `air.fsp`. The mint's local HTTP (`/audit`, `/health` for the PSP and the ESP, `/melt`, `/burns` and the operator's routes) is unchanged; fsp-mint's HTTP routes are `/audit` and `/health`. Start the mints in the order of steps 3, 4 and 35: the FSP asks the ESP over AIR at startup and exits if it cannot be reached.
 
 ### 3. The PSP mint (T2)
 
@@ -93,7 +95,7 @@ cd ~/psp-mint
 PSP_AIR_SERVER=$AIR_SERVER PSP_AIR_HOST=127.0.0.1 PSP_SCAN_INTERVAL_SECS=10 cargo run -- --regtest serve 2>&1 | tee ~/psp-serve.log
 ```
 
-Expected: `scanning wallet psp-regtest every 10 s` and `psp-mint api listening on http://127.0.0.1:3000`. In T1, `curl -s http://127.0.0.1:3000/health` returns `"status":"ok"` and `/audit` returns `{"issued":0,"redeemed":0,"outstanding":0}`.
+Expected: `scanning wallet psp-regtest every 10 s` and the api line, which the 2026-10-22 run printed as `local api (melt, burns, audit, health)` with the address (the whole line was not captured; **not rerun**). In T1, `curl -s http://127.0.0.1:3000/health` returns `"status":"ok"` and `"wire_version":3`, and `/audit` returns `issued`, `redeemed` and `outstanding` all 0, with further fields (the reconciliation counts) that are not listed here.
 
 ### 4. The ESP mint (T3)
 
@@ -104,14 +106,9 @@ ESP_AIR_SERVER=$AIR_SERVER ESP_AIR_HOST=127.0.0.1 ESP_NETWORK=regtest ESP_REDEEM
 
 Every fee in esp-mint defaults to 0. This walkthrough sets the redemption fee to 10^6 ESP units a byte (`ESP_REDEEM_FEE_PER_BYTE`) so that the redemption steps below show a fee being taken; the figures in them depend on it. Start the mint the same way each time it is restarted.
 
-Expected:
+Expected: first, on standard error, the network the mint runs on (every `esp-mint` command says it, as psp-mint does): `esp-mint on regtest: data in <home>/.esp-mint/regtest`. Then the api and admin lines. The 2026-10-22 run printed `api (/audit, /health)` for the api line, with its address; the whole lines were not captured, and the old `esp-mint api listening on http://127.0.0.1:3100, burning PSP at …` is gone (**not rerun**).
 
-```
-esp-mint api listening on http://127.0.0.1:3100, burning PSP at http://127.0.0.1:3000
-esp-mint admin listening on http://127.0.0.1:3101
-```
-
-In T1, `curl -s http://127.0.0.1:3100/health` returns `{"status":"ok"}` and `/audit` returns `issued`, `outstanding` and `redeemed` all 0.
+In T1, `curl -s http://127.0.0.1:3100/health` returns `"status":"ok"` and `"wire_version":3`, and `/audit` returns `issued`, `outstanding` and `redeemed` all 0, with further fields that are not listed here.
 
 ### 5. Build the purchase payload (T4)
 
@@ -121,14 +118,15 @@ Run this once. A second run makes a second pending purchase in the wallet file.
 cd ~/ecash-wallet
 export ECASH_WALLET_FILE=/tmp/wallet-regtest.json
 MINT_KEY=$(cd ~/psp-mint && cargo run -q -- --regtest pubkey)
-ESP_DID=$(cd ~/esp-mint && cargo run -q -- pubkey)
+ESP_DID=$(cd ~/esp-mint && ESP_NETWORK=regtest cargo run -q -- pubkey)
 export ECASH_AIR_SERVER=$AIR_SERVER ECASH_AIR_HOST=127.0.0.1 ECASH_AIR_PSP_DID=$MINT_KEY ECASH_AIR_ESP_DID=$ESP_DID
 echo ${#MINT_KEY}
-HEX=$(cargo run -q -- --regtest buy-psp --mint-key $MINT_KEY 4 1)
+# this walkthrough buys 5 PSP on purpose, below the 50 PSP default of psp.min_purchase
+HEX=$(ECASH_PSP_MIN_PURCHASE=5 cargo run -q -- --regtest buy-psp --mint-key $MINT_KEY 4 1)
 echo ${#HEX}
 ```
 
-The wallet takes both mints' DIDs from the settings (the built-in ones are placeholders until the first SPI deploy). Expected: `66` (the mint's public key in hex), then `purchase <id>` and `199 bytes. Put the hex below in an OP_RETURN and pay the PSP.` and a sentence saying the notes arrive over AIR (both on standard error, so they show on the screen but are not in `HEX`), then `398`. The payload is 117 bytes plus 82 for the encryption: 199 bytes, 398 hex characters.
+The wallet takes both mints' DIDs from the settings (the built-in ones are placeholders until the first SPI deploy). `esp-mint pubkey` takes its network from `ESP_NETWORK`: without it, it makes and prints a mainnet DID (and a mainnet key file under `~/.esp-mint/main`), which is the wrong DID here. It says its network on standard error and prints only the DID on standard output, so `$(…)` takes just the DID. Expected: `66` (the mint's public key in hex), then `purchase <id>` and `197 bytes. Put the hex below in an OP_RETURN and pay the PSP.` and a sentence saying the notes arrive over AIR (both on standard error, so they show on the screen but are not in `HEX`), then `394`. A payload of a 4 and a 1 is 197 bytes (the encryption adds 82), 394 hex characters (the 2026-10-22 run; the earlier 199 and 398 were for the old wire).
 
 ### 6. Pay the PSP (T4)
 
@@ -144,7 +142,7 @@ PSP_ADDR=$($CLI -rpcwallet=psp-regtest getnewaddress)
 $CLI -rpcwallet=payer -named send outputs="[{\"$PSP_ADDR\":$AMOUNT},{\"data\":\"$HEX\"}]" fee_rate=10
 ```
 
-Expected: the price (for example `82357.555`), the BTC amount (for example `0.00000613`, which is 613 sats), and JSON with a `txid` and `"complete": true`. Note the `txid`. Nothing is printed in T2 or T3 yet.
+Expected: the price (for example `82357.555`), the BTC amount (for example `0.00000613`, which is 613 sats), and JSON with a `txid` and `"complete": true`. Note the `txid`. Nothing is printed in T3. Within one scan (10 s) T2 logs the payment at `confirmations=0`, before any block is mined (the exact line was not captured; **not rerun**).
 
 ### 7. Lock the price at 1 confirmation (T4)
 
@@ -161,7 +159,7 @@ Expected in T4: `"confirmations": 1,`. Within one scan (10 s), T2 prints:
   price locked at 82313.33 USD/BTC, waiting: 1 of 6 confirmations
 ```
 
-The locked price is the median of Coinbase, Bitstamp and Gemini, so it differs a little from the Coinbase price used to size the payment.
+The locked price is the median of Coinbase, Bitstamp and Gemini, so it differs a little from the Coinbase price used to size the payment. T2 also prints a line saying the payment is within the price tolerance (1%); its wording was not captured (**not rerun**).
 
 ### 8. Settle at 6 confirmations (T4)
 
@@ -175,12 +173,10 @@ Expected in T4: `"confirmations": 6,`. Within one scan, T2 prints the settlement
 ```
 <txid> confirmations=6 value_sats=613
   over/under: 91 bps
-  signature <blind nonce hex> <signature hex>
-  signature <blind nonce hex> <signature hex>
 delivery <txid>: record written
 ```
 
-The over/under is the payment against the request at the locked price: 613 sats at 82313.33 USD/BTC is about $0.5046, so about +91 basis points. That is within the 0.10 reconciliation target (`settle.payment_reconciliation_target`), so the mint keeps the extra and records no credit. Two signature lines are printed (a log; the payer gets the same signatures over AIR), one for the 4 and one for the 1, then `delivery <txid>: record written`. There is no credit, rejection or error message.
+The over/under is the payment against the request at the locked price: 613 sats at 82313.33 USD/BTC is about $0.5046, so about +91 basis points. That is within the price tolerance (`settle.price_tolerance`, 1% by default, 100 basis points), so the mint settles it as if it were exact: it signs every requested note, keeps the extra and records no credit. (The reconciliation target, `settle.payment_reconciliation_target`, 10%, is for payments outside the tolerance, as in the reconciliation cases of the run's report.) The mint no longer logs one `signature` line for each note; the payer gets the signatures over AIR. There is no credit, rejection or error message. The lines of this step are the 2026-10-15 ones with the signature lines removed and the tolerance sentence changed, **not rerun**.
 
 ### 9. Claim the notes and check the balance (T4)
 
@@ -189,7 +185,7 @@ cargo run -q -- --regtest claim-psp
 cargo run -q -- --regtest balance
 ```
 
-Nothing is pasted: the wallet computes the record's address from its purchase and reads it. `claim-psp` waits up to 60 seconds for a record that is not there yet (`--wait SECONDS`). Expected:
+Nothing is pasted: the wallet computes the record's address from its purchase and reads it. `claim-psp` waits up to 60 seconds for a record that is not there yet (`--wait SECONDS`). The 2026-10-22 run printed the claim line in other words than below (not captured, **not rerun**). Expected:
 
 ```
 purchase <id>: claimed 5 PSP in 2 note(s)
@@ -213,14 +209,14 @@ Expected:
 
 ```
 exchange <id> (spends 4 PSP)
-received 400000000000 ESP in 2 note(s), redeemable after day 21106
+received 400000000000 ESP in 30 note(s), redeemable after day 21106
 100000000000 of that is change: the PSP notes spent were worth more than the amount asked for, and the rest came back as ESP under the same terms
 
 psp  1
 esp  400000000000
        400000000000 for 0279be...1798, redeemable after day 21106
 fsp  0
-notes 3 (0 held for a pending request)
+notes 31 (0 held for a pending request)
 ```
 
 The redeemable-after day is today's day number plus 365 (the placeholder redeem window in the esp-mint README). `balance` lists ESP by service and day.
@@ -245,29 +241,29 @@ Expected:
 
 ```
 exchange <id> (spends 1 PSP)
-received 100000000000 ESP in 1 note(s), redeemable after day 21106
+received 100000000000 ESP in 15 note(s), redeemable after day 21106
 
 psp  0
 esp  500000000000
        500000000000 for 0279be...1798, redeemable after day 21106
 fsp  0
-notes 3 (0 held for a pending request)
+notes 45 (0 held for a pending request)
 ```
 
-There is no change line, because the 1 PSP note is exactly the amount asked for. The three ESP notes (a 3 PSP note and a 1 PSP note from the first exchange, and a 1 PSP note from this one) are all bound to the same service and day.
+There is no change line, because the 1 PSP note is exactly the amount asked for. The mint issues ESP in many small notes, not one: the 2026-10-22 run got 30 and 15, and the `notes` counts above (31 and 45) are worked out from those (**not rerun**). The 45 ESP notes are all bound to the same service and day.
 
 ### Notes
 
 - If `exchange` times out, run it again with `--resume <id>` (the id was printed). It sends the same request and gets the same answer, and nothing is burned twice.
 - The PSP writes each payer's signatures to a record only that payer can find, so `claim-psp` reads its own purchases' records and no one else's. Any wallet command also picks up a delivery when it starts, so the line above may be printed by the command that ran first, and `claim-psp` then says there is nothing pending.
-- A payment the PSP holds (paid, but short beyond its reconciliation target) or rejects is delivered too, so the wallet shows `the PSP is holding the payment` or `the PSP rejected it`, with what was paid and the time it stays open until, and keeps the purchase and its key. When that time passes the PSP forfeits the payment and the next wallet command prints `its reconciliation window has closed` and deletes the purchase and the key. The PSP's window is `PSP_RECONCILIATION_WINDOW_DAYS` (14); set `1` on the PSP to see it close sooner.
+- A payment the PSP holds (paid, but short beyond its reconciliation target) or rejects is delivered too, so the wallet shows `the PSP is holding the payment` or `the PSP rejected it`, with what was paid and the time it stays open until, and keeps the purchase and its key. The wallet settles it by itself at every start, right after the pickup, with a reconciliation request (AIR kind 15) built from the rules in the PSP's record, and prints what came of it (this was built after the runs in this file and has not been run on regtest). When the time passes with the payment still open, the PSP forfeits it and the next wallet command says `The PSP forfeited the payment: the funds are lost`, with the amount, and deletes the purchase and the key. `buy-psp` also prints `ONE-TIME USE`: pay a payload once. The PSP's window is `PSP_RECONCILIATION_WINDOW_DAYS` (14); set `1` on the PSP to see it close sooner.
 - Stop the servers with Ctrl-C in T2 and T3, and the node with `$CLI stop`.
 
 ## Regtest, restart on the new build
 
-This continues the run above, with the app wallet still holding 5 PSP of ESP (notes of 3, 1 and 1 PSP) for the service below. It needs T1 to T4 as before. T2 (the PSP mint) is restarted in step 13 and otherwise only answers the ESP mint. The Bitcoin node (T1) must be running, because the PSP scans it. The service's secret key in this run is the test key `000...01`, whose public key is the generator point used as the service in step 10. Step 13 was run on 2026-10-15 (macOS, Apple Silicon) and its output is what that run printed.
+This continues the run above, with the app wallet still holding 5 PSP of ESP (500000000000 ESP units, in 45 notes) for the service below. It needs T1 to T4 as before. T2 (the PSP mint) is restarted in step 13 and otherwise only answers the ESP mint. The Bitcoin node (T1) must be running, because the PSP scans it. The service's secret key in this run is the test key `000...01`, whose public key is the generator point used as the service in step 10. Step 13 was run on 2026-10-15 (macOS, Apple Silicon) and its output is what that run printed.
 
-The app wallet is `$ECASH_WALLET_FILE` (the one used so far in T4). The service has its own wallet file, set per command with `ECASH_WALLET_FILE=...` in front.
+The app wallet is `$ECASH_WALLET_FILE` (`/tmp/wallet-regtest.json`, exported in step 5 and used so far in T4). The service has its own wallet file, set per command with `ECASH_WALLET_FILE=...` in front.
 
 ### 13. Restart both mints on the new build (T2, T3)
 
@@ -312,7 +308,7 @@ These were the wallet's stand-alone `hand-over --out FILE`, `receive` and `trans
 
 This continues the two runs above (purchase to ESP, then the restart), with the same four terminals, the Bitcoin node, the PSP mint (T2) and the ESP mint (T3) running, and one more terminal, T5, for the FSP mint. It was run end to end on 2026-10-16 (macOS, Apple Silicon) from a clean start (step 1 moved the old data aside) **before the hand-over and transfer commands were removed; steps 26 to 28, 31, 33 and 35 to 37 were rewritten for that and are not run** (see the note at the top). Elsewhere every output below is what that run printed, apart from values that differ each run (ids, transaction ids, keys, the price, the day numbers). Today's day number in that run was 20742, so notes issued after step 22 are "redeemable after day 20742" and the year-out notes are day 21107. Use your own: the day is the number of days since 1970-01-01, and the first run's notes carry today plus 365.
 
-The app wallet is the default one, `~/.ecash-wallet/regtest/wallet.json`. The service has its own wallet file, set per command with `ECASH_WALLET_FILE=/tmp/wallet-service.json`. `$SERVICE` is the generator point `0279be…1798` and `$KEY` its secret key `000…01` (see "Regtest, restart on the new build"). `$CLI`, `$PAYER`, `$HEX` and `$TXID` are shell variables in T4.
+The app wallet is `/tmp/wallet-regtest.json`, the `ECASH_WALLET_FILE` exported in step 5 and still set in T4 (the default wallet, `~/.ecash-wallet/regtest/wallet.json`, is used only when that variable is not set). The service has its own wallet file, set per command with `ECASH_WALLET_FILE=/tmp/wallet-service.json`, which overrides the exported one for that command. `$SERVICE` is the generator point `0279be…1798` and `$KEY` its secret key `000…01` (see "Regtest, restart on the new build"). `$CLI`, `$PAYER`, `$HEX` and `$TXID` are shell variables in T4.
 
 ### 21. The ESP mint's rates (no command)
 
@@ -327,11 +323,11 @@ cat > ~/.esp-mint/esp-mint.toml <<'EOT'
 [terms]
 maturity_days = 0
 EOT
-kill -HUP $(pgrep -f 'target/debug/esp-mint serve')
+kill -HUP $(pgrep -f 'esp-mint serve')
 sleep 1
 ```
 
-Expected: T3 prints `esp-mint: SIGHUP, settings read again:` and `  terms.maturity_days changed from 365 to 0 days`. Notes already issued keep their day, and an exchange from now on gives notes that mature the day they are issued.
+The pattern `esp-mint serve` matches a debug and a release build alike (`target/debug/esp-mint serve` matched only the debug one). Expected: T3 prints `esp-mint: SIGHUP, settings read again:` and `  terms.maturity_days changed from 365 to 0 days`. Notes already issued keep their day, and an exchange from now on gives notes that mature the day they are issued.
 
 ### 23. Buy 3 more PSP, a 2 and a 1 (T4)
 
@@ -339,11 +335,12 @@ Expected: T3 prints `esp-mint: SIGHUP, settings read again:` and `  terms.maturi
 cd ~/ecash-wallet
 MINT_KEY=$(cd ~/psp-mint && cargo run -q -- --regtest pubkey 2>/dev/null)
 echo ${#MINT_KEY}
-HEX=$(cargo run -q -- --regtest buy-psp --mint-key $MINT_KEY 2 1)
+# 3 PSP is below the 50 PSP default of psp.min_purchase; lowered for this command only
+HEX=$(ECASH_PSP_MIN_PURCHASE=3 cargo run -q -- --regtest buy-psp --mint-key $MINT_KEY 2 1)
 echo ${#HEX}
 ```
 
-Expected: `66`, `purchase <id>`, `199 bytes. Put the hex below in an OP_RETURN and pay the PSP.` and a sentence saying the notes arrive over AIR, and `398` (two outputs, the same size as in step 5). The purchase is 3 PSP and not 2 because of the dust limit: Bitcoin Core will not send an output below 294 sats (for this address type), which is about $0.24 at this price, so 2 PSP ($0.20) could only be paid by overpaying. 3 PSP ($0.30) is paid with 368 sats. `2>/dev/null` hides the banner `pubkey` prints on standard error.
+Expected: `66`, `purchase <id>`, `205 bytes. Put the hex below in an OP_RETURN and pay the PSP.` and a sentence saying the notes arrive over AIR, and `410` (a payload of a 2 and a 1 is 205 bytes, not the 197 of step 5). The purchase is 3 PSP and not 2 because of the dust limit: Bitcoin Core will not send an output below 294 sats (for this address type), which is about $0.24 at this price, so 2 PSP ($0.20) could only be paid by overpaying. 3 PSP ($0.30) is paid with 368 sats. `2>/dev/null` hides the banner `pubkey` prints on standard error.
 
 ### 24. Pay and settle (T4)
 
@@ -363,7 +360,7 @@ $CLI -rpcwallet=payer generatetoaddress 6 $PAYER > /dev/null
 $CLI -rpcwallet=psp-regtest gettransaction $TXID | grep confirmations
 ```
 
-Expected in T4: `"confirmations": 6,`. Within a scan T2 prints the settlement (the price is locked and settled in one pass when all six blocks arrive at once): `<txid> confirmations=6 value_sats=368`, `over/under: 83 bps` (within the 0.10 reconciliation target, so no credit), `keyset <id>`, two `signature` lines and `delivery <txid>: record written`.
+Expected in T4: `"confirmations": 6,`. Within a scan T2 prints the settlement (the price is locked and settled in one pass when all six blocks arrive at once): `<txid> confirmations=6 value_sats=368`, `over/under: 83 bps` (within the 1% price tolerance, so settled as exact and no credit), `keyset <id>` and `delivery <txid>: record written` (no `signature` lines; not rerun).
 
 ### 25. Claim and exchange (T4)
 
@@ -373,7 +370,7 @@ cargo run -q -- --regtest exchange --service $SERVICE --psp 2
 cargo run -q -- --regtest balance
 ```
 
-Expected: `purchase <id>: claimed 3 PSP in 2 note(s)` (the earlier purchase was claimed in step 9 and is not asked for again); then `received 200000000000 ESP in 1 note(s), redeemable after day 20742`. The balance shows ESP 4×10^11: 2×10^11 at day 20742 and 2×10^11 at day 21107, and `psp  1` (the 1 PSP note of the purchase is not exchanged).
+Expected: `purchase <id>: claimed 3 PSP in 2 note(s)` (the earlier purchase was claimed in step 9 and is not asked for again); then `received 200000000000 ESP in 1 note(s), redeemable after day 20742`. The balance shows ESP 7×10^11: the 5×10^11 of steps 10 and 12 at day 21107 (the year-out notes) and the 2×10^11 of this exchange at day 20742, and `psp  1` (the 1 PSP note of the purchase is not exchanged).
 
 ### 26. Give the service its mature ESP through the FSP mint (T1, T5, T4)
 
@@ -393,11 +390,11 @@ Expected: the settings, then `service.did = 0279be667ef9dcbbac55a06295ce870b0702
 
 ```
 cd ~/fsp-mint
-ESP_DID=$(cd ~/esp-mint && cargo run -q -- pubkey)
+ESP_DID=$(cd ~/esp-mint && ESP_NETWORK=regtest cargo run -q -- pubkey)
 FSP_AIR_ESP_DID=$ESP_DID FSP_AIR_ESP_SERVER=$AIR_SERVER FSP_AIR_ESP_HOST=127.0.0.1 FSP_AIR_SERVER=$AIR_SERVER FSP_AIR_HOST=127.0.0.1 FSP_NETWORK=regtest FSP_SERVICE_DID=0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798 cargo run -- serve
 ```
 
-Expected: the settings (with `service.did` from the environment), `fsp-mint api listening on http://127.0.0.1:3200` (the operator's `/audit` only) and `fsp-mint AIR listener: wallets reach this service with the air.fsp entry 0279be…1798@<AIR server key>@127.0.0.1 (ECASH_AIR_FSP, air.fsp; …)`. The entry is what the wallet needs: it is the service's DID, the AIR server the FSP mint listens on, and the host. In T1, `curl -s http://127.0.0.1:3200/audit` returns the FSP mint's counts. The FSP mint's other calls (`/health`, `/keys`, `/fees`, `/rotation`, `/issue`, `/spend`) are AIR calls, so there is no `curl` for them. In T4, give the wallet the entry (the same variable for every `fsp` command below):
+Expected: the settings (with `service.did` from the environment), `fsp-mint api listening on http://127.0.0.1:3200` (the operator's `/audit` and `/health`; the line's exact wording in the 2026-10-22 run was not captured, **not rerun**) and `fsp-mint AIR listener: wallets reach this service with the air.fsp entry 0279be…1798@<AIR server key>@127.0.0.1 (ECASH_AIR_FSP, air.fsp; …)`. The entry is what the wallet needs: it is the service's DID, the AIR server the FSP mint listens on, and the host. In T1, `curl -s http://127.0.0.1:3200/audit` returns the FSP mint's counts. The FSP mint's other calls (`/keys`, `/fees`, `/rotation`, `/issue`, `/spend`) are AIR calls, so there is no `curl` for them. In T4, give the wallet the entry (the same variable for every `fsp` command below):
 
 ```
 export ECASH_AIR_FSP=0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798@$AIR_SERVER@127.0.0.1
@@ -405,7 +402,7 @@ export ECASH_AIR_FSP=0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b1
 
 Without it `fsp issue --service $SERVICE ...` stops with an error that names `air.fsp` and the service, and sends nothing.
 
-**The round.** The app holds ESP of 2×10^11 at day 20742 and two notes of 10^11 at day 21107. `fsp issue --esp N` takes the largest notes first, so asking for 2×10^11 takes the day-20742 note. In T4:
+**The round.** The app holds ESP of 2×10^11 at day 20742 and 5×10^11 at day 21107, in many small notes. `fsp issue --esp N` takes the largest notes first, across days, so asking for 2×10^11 takes notes of both days (the 2026-10-22 run mixed day 20748 and day 21113 notes). The issue has one group for each redeemable-after day it takes. In T4:
 
 ```
 cd ~/ecash-wallet
@@ -413,7 +410,7 @@ cargo run -q -- --regtest fsp issue --service $SERVICE --esp 200000000000
 curl -s http://127.0.0.1:3100/audit; echo
 ```
 
-Expected: `issue <id>: 1 group(s)` and `issued 200000000000 FSP (fee 0)`, and the audit `{"issued":900000000000,"outstanding":700000000000,"redeemed":200000000000}`: the FSP mint swapped the note at the ESP mint, so issued and redeemed each rose by 2×10^11 and outstanding did not change. The app's `balance` now shows `fsp  200000000000` and ESP of 2×10^11 at day 21107 only.
+Expected: `issue <id>: 2 group(s)` (one for each day: N group(s) in general) and `issued 200000000000 FSP (fee 0)`, and the audit `{"issued":900000000000,"outstanding":700000000000,"redeemed":200000000000}`: the FSP mint swapped the note at the ESP mint, so issued and redeemed each rose by 2×10^11 and outstanding did not change. The app's `balance` now shows `fsp  200000000000`, a line `handed over N time(s); the hand-overs are kept in the wallet file`, and less ESP at both days (how much of each depends on the notes taken; **not rerun**).
 
 `export-esp` needs the FSP mint stopped (its README says so). Ctrl-C in T5, then in T1:
 
@@ -423,14 +420,14 @@ cd ~/fsp-mint
 FSP_NETWORK=regtest FSP_SERVICE_DID=$SERVICE cargo run -q -- export-esp --out /tmp/fsp-esp-1
 ```
 
-Expected: `wrote /tmp/fsp-esp-1/esp-20742-<time>.json (1 notes)`. `export-esp` writes only ESP it has not written before, so a later export holds only what came after. In T4, the service takes it in with `receive`, which takes this file and nothing else:
+Expected: one `wrote …` line for each redeemable-after day the FSP mint holds, for example `wrote /tmp/fsp-esp-1/esp-20742-<time>.json (N notes)` and `wrote /tmp/fsp-esp-1/esp-21107-<time>.json (N notes)`: `export-esp` writes one file for each day (two files in the 2026-10-22 run), and only ESP it has not written before, so a later export holds only what came after. In T4, the service takes each file in with `receive`, which takes one file at a time and nothing else:
 
 ```
-ECASH_WALLET_FILE=/tmp/wallet-service.json cargo run -q -- --regtest receive /tmp/fsp-esp-1/esp-20742-<time>.json
+ECASH_WALLET_FILE=/tmp/wallet-service.json cargo run -q -- --regtest receive /tmp/fsp-esp-1/esp-20742-<time>.json   # and the same for the day-21107 file
 ECASH_WALLET_FILE=/tmp/wallet-service.json cargo run -q -- --regtest balance
 ```
 
-Expected: `received 200000000000 ESP in 1 note(s) for <service>, redeemable after day 20742`, and a service balance of `esp  200000000000`, `notes 1`, mature today.
+Expected: for each file, `received N ESP in N note(s) for <service>, redeemable after day D`, and a service balance of the sum of the files, the day-20742 part mature today and the other year-out (**not rerun**: the figures here were for one note).
 
 Steps 38, 40 and 43 repeat this round (steps 23 to 25 to get a fresh note, then the issue, the export and the `receive`, with the next export folder, `/tmp/fsp-esp-2` and so on). The FSP mint is stopped now; step 35 starts it again.
 
@@ -446,14 +443,14 @@ ECASH_WALLET_FILE=/tmp/wallet-service.json cargo run -q -- --regtest balance
 Expected:
 
 ```
-fee rate 1000000 ESP units a byte; at most 67108864 bytes a request; 1 request(s)
+fee rate 1000000 ESP units a byte; at most 15728640 bytes a request; 1 request(s)
 redemption <id>: 1 note(s) worth 200000000000 ESP ($0.200000000000), 407 bytes, fee 407000000 ESP ($0.000407000000), expected payout 199593000000 ESP ($0.199593000000)
 redemption <id>: 1 of 1 note(s) accepted, 200000000000 ESP ($0.200000000000). Fee 407000000 ESP ($0.000407000000): 407 bytes at 1000000 a byte
   payout queued: owed 199593000000 ESP ($0.199593000000)
   payout is open. Check later with: redeem --collect
 ```
 
-The size is `119 + 186 + 21 (memo) + 81 (one decline output) = 407`, so the fee is `407 × 10^6`. The balance no longer has the day-20742 note and lists `pending redemption <id> (payout of 199593000000 ESP queued at the mint)`. The redemption id is the request hash.
+The size is `120 + 187 for each note + 21 (the memo) + 82 for each decline output`, and the fee is the size times 10^6. The block above is for one note and one decline output (`120 + 187 + 21 + 82 = 410` bytes at this build, not the 407 shown, which is the old wire's); it was calculated, not run. The 2026-10-22 run redeemed many notes at once and the request was 3054 bytes (fee 3054000000), and 4177 bytes after the decline of step 30, because the decline reissues many small notes (**not rerun** for this build). The summary line comes first, before any `not sent` line. The balance no longer has the day-20742 note and lists `pending redemption <id> (payout of 199593000000 ESP queued at the mint)`. The redemption id is the request hash.
 
 ### 28. The operator's report and the audit (T1)
 
@@ -482,7 +479,7 @@ ESP_NETWORK=regtest cargo run -q -- decline <redemption id> --reason "terms not 
 ESP_NETWORK=regtest cargo run -q -- payouts
 ```
 
-Expected: `declined entry <id>: 1 output(s) reissued, 199593000000 ESP units` and then `nothing is owed: no open redemption entries`.
+Expected: `declined entry <id>: 15 output(s) reissued, <owed> ESP units` (15 outputs in the 2026-10-22 run; the owed amount depends on the redemption of step 27) and then `nothing is owed: no open redemption entries`.
 
 ### 31. The service collects the decline (T4)
 
@@ -492,7 +489,7 @@ ECASH_WALLET_FILE=/tmp/wallet-service.json cargo run -q -- --regtest balance
 curl -s http://127.0.0.1:3100/audit; echo
 ```
 
-Expected: `payout declined: terms not met: service was offline. 1 note(s) worth 199593000000 ESP reissued to this wallet`. The balance has 199,593,000,000 at day 20742 (the original day), and the audit is `{"issued":1099593000000,"outstanding":699593000000,"redeemed":400000000000}` (**rewritten, not run**). Only the fee, 407,000,000, is lost.
+Expected: `payout declined: terms not met: service was offline. 15 note(s) worth <owed> ESP reissued to this wallet` (15 notes, following the 15 outputs of step 30; the owed amount and the figures after it are for one note and were calculated, **not rerun**). The balance has 199,593,000,000 at day 20742 (the original day), and the audit is `{"issued":1099593000000,"outstanding":699593000000,"redeemed":400000000000}` (**rewritten, not run**). Only the fee, 407,000,000, is lost.
 
 ### 32. Redeem again and pay (T4, then T1)
 
@@ -531,7 +528,7 @@ The FSP mint was set up in step 26 (its service key and `ECASH_AIR_FSP`) and sto
 
 ```
 cd ~/fsp-mint
-ESP_DID=$(cd ~/esp-mint && cargo run -q -- pubkey)
+ESP_DID=$(cd ~/esp-mint && ESP_NETWORK=regtest cargo run -q -- pubkey)
 FSP_AIR_ESP_DID=$ESP_DID FSP_AIR_ESP_SERVER=$AIR_SERVER FSP_AIR_ESP_HOST=127.0.0.1 FSP_AIR_SERVER=$AIR_SERVER FSP_AIR_HOST=127.0.0.1 FSP_NETWORK=regtest FSP_SERVICE_DID=0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798 cargo run -- serve
 ```
 
@@ -581,7 +578,7 @@ cp /tmp/wallet-service.stale.json /tmp/wallet-service.json
 ECASH_WALLET_FILE=/tmp/wallet-service.json cargo run -q -- --regtest redeem --service-key $KEY --memo 'btc:bcrt1qreplay'
 ```
 
-Expected: the first redemption is accepted (`403 bytes`, fee 403000000, payout queued 199597000000). The second, built from the stale copy, is refused: `the mint refused the redemption (below_fee): the genuine, unspent notes are worth 0 ESP units, less than the fee of 402000000. Nothing was burned and no fee was taken`. The refusal is printed twice (once per request, once at exit). The audit does not move. The wallet still lists the note as free: `below_fee` says only that no genuine unspent note is left, not which note is the problem, so the wallet cannot tell that this note was burned. Put the real wallet back with `cp /tmp/wallet-service.after.json /tmp/wallet-service.json`.
+Expected: the first redemption is accepted (`403 bytes`, fee 403000000, payout queued 199597000000). The second, built from the stale copy, is refused: `the mint refused the redemption (below_fee): the genuine, unspent notes are worth 0 ESP units, less than the fee of 402000000. Nothing was burned and no fee was taken`. The refusal is printed once (the 2026-10-22 run). The audit does not move. The refusal lists a reason for every note, and the wallet moves the notes the mint marks `already_spent` to its spent record: they leave the balance, `balance` prints `spent elsewhere N note(s)`, and the other notes are freed (the doc used to say the wallet could not tell; the wording of the refusal in this build was not captured, **not rerun**). Put the real wallet back with `cp /tmp/wallet-service.after.json /tmp/wallet-service.json`.
 
 ### 39. The operator declines (T1, then T4)
 
@@ -602,13 +599,13 @@ Expected: `payout declined: dev test: splitting next. 1 note(s) worth 1995970000
 
 ### 40. Redeem over a small ceiling (T4)
 
-`--max-bytes` lowers the ceiling on one request, so the wallet has to split. A request of two notes is larger than a request of one, so the service needs two mature notes: the reissued 199597000000 of step 39 and a second one from another round (steps 23 to 25, then the round of step 26 with `/tmp/fsp-esp-3`, then the FSP mint started again as in step 35).
+`--max-bytes` lowers the ceiling on one request, so the wallet has to split. The split sizes each request for the worst case, the most decline and refund outputs a service and day can need (64 of each), so even one note counts as 10,803 bytes plus its memo, and a ceiling below that is refused. The service needs more mature notes than fit in one request: the reissued notes of step 39 and those of another round (steps 23 to 25, then the round of step 26 with `/tmp/fsp-esp-3`, then the FSP mint started again as in step 35).
 
 ```
-ECASH_WALLET_FILE=/tmp/wallet-service.json cargo run -q -- --regtest redeem --service-key $KEY --max-bytes 500 --memo 'btc:bcrt1qsplit'
+ECASH_WALLET_FILE=/tmp/wallet-service.json cargo run -q -- --regtest redeem --service-key $KEY --max-bytes 12000 --memo 'btc:bcrt1qsplit'
 ```
 
-Expected (**rewritten, not run**): `at most 500 bytes a request; 2 request(s)`, then two redemptions of one note each, every one `401 bytes` (119 + 186 + 15 for the memo + 81 for one decline output), fee 401000000, with payouts 199599000000 (the new 2×10^11 note) and 199196000000 (the reissued note) queued, in either order. A request of both notes would be 587 bytes, over the ceiling, which is why the wallet splits. Each request is its own entry at the mint.
+Expected (**rewritten, not run**): first the summary, `fee rate 1000000 ESP units a byte; at most 12000 bytes a request (--max-bytes); N request(s)`, then a `not sent: …` line for each part that would owe nothing, then each request that is sent, with the actual size of its request (a few thousand bytes, not the worst case). A request holds up to 7 notes at this ceiling (`120 + 187 × 7 + 15 (the memo) + 128 × 82 = 11940` fits 12000, 8 notes (12127) do not); the notes go in order, oldest day first and the largest first. In the 2026-10-22 run the first request took 7 large notes (2592 bytes) and the later parts held small notes worth less than the fee (`not sent: … less than the fee of 1444000000`, and one of 448 ESP units, less than the fee of 696000000), so only one request was sent; the small notes stay in the wallet. With `--max-bytes 500`, as this step used to say, the command now stops: `error: --max-bytes 500 is too small for even one note: a request for one note can need <n> bytes` (it used to name the mint's ceiling); a ceiling that is the mint's own is named as `the mint's ceiling of N bytes`. Each request that is sent is its own entry at the mint.
 
 ### 41. The operator pays two entries in one call (T1, then T4)
 
@@ -618,7 +615,7 @@ ESP_NETWORK=regtest cargo run -q -- payouts
 ESP_NETWORK=regtest cargo run -q -- pay $SERVICE regtest-split-payment <id1> <id2>
 ```
 
-Expected (**rewritten, not run**): `payouts` shows one service, owed 0.398795 USD in 2 entries with one memo, and `pay` prints `marked 2 entries completed for 0279be…1798: 0.398795000000 USD (398795000000 ESP), payment reference regtest-split-payment`. Entries with different memos need `--mixed-memos`. In T4, `redeem --collect` prints `payout completed, payment reference regtest-split-payment` twice. The audit was `{"issued":2299190000000,"outstanding":500000000000,"redeemed":1799190000000}`: the decline issued 199597000000 again, and the two redemptions burned that note and the second round's.
+This step needs two entries. In the 2026-10-22 run the split sent only one request, so the two-entry call was **not run**; with notes that make two requests that each owe something it reads as follows. Expected (**rewritten, not run**): `payouts` shows one service, owed 0.398795 USD in 2 entries with one memo, and `pay` prints `marked 2 entries completed for 0279be…1798: 0.398795000000 USD (398795000000 ESP), payment reference regtest-split-payment`. Entries with different memos need `--mixed-memos`. In T4, `redeem --collect` prints `payout completed, payment reference regtest-split-payment` twice. The audit was `{"issued":2299190000000,"outstanding":500000000000,"redeemed":1799190000000}`: the decline issued 199597000000 again, and the two redemptions burned that note and the second round's.
 
 ### 42. ESP the FSP mint has kept, not yet mature (T1, then T4)
 
@@ -630,7 +627,7 @@ cd ~/fsp-mint
 FSP_NETWORK=regtest FSP_SERVICE_DID=$SERVICE cargo run -q -- export-esp --out /tmp/fsp-export
 ```
 
-Expected: `wrote /tmp/fsp-export/esp-21107-<time>.json (2 notes)`: the FSP issue in step 36 used the two year-out notes, since FSP ignores maturity (the day-20742 ESP of the earlier rounds was exported in step 26 and the rounds after it, and is not written again). In T4:
+Expected: `wrote /tmp/fsp-export/esp-21107-<time>.json (2 notes)` (when the FSP mint has kept no ESP it has not written before, `export-esp` writes nothing and says `no ESP to export`): the FSP issue in step 36 used the two year-out notes, since FSP ignores maturity (the day-20742 ESP of the earlier rounds was exported in step 26 and the rounds after it, and is not written again). In T4:
 
 ```
 ECASH_WALLET_FILE=/tmp/wallet-service.json cargo run -q -- --regtest receive /tmp/fsp-export/esp-21107-<time>.json
@@ -698,7 +695,7 @@ At startup the wallet reads the ESP mint's rotation over AIR and swaps notes fro
 ECASH_WALLET_FILE=/tmp/wallet-rot.json cargo run -q -- --regtest balance
 ```
 
-Expected: after a pause (the wallet's own random delay, at most 0.5% of the period, 18 seconds here) `http://127.0.0.1:3100: rolled over 2 note(s) to the current key set`, and the balance is still 2×10^11. A second run prints no message. The audit counts the rollover as a burn and a re-issue: issued and redeemed each rise by the notes' value and outstanding is unchanged (here `{"issued":2899190000000,"outstanding":500000000000,"redeemed":2399190000000}`, **recomputed, not run**).
+Expected: `esp: rolled over N note(s) to the current key set` (not `http://127.0.0.1:3100: …`; 17 notes in the 2026-10-22 run, and no noticeable delay), and the balance is still 2×10^11. A second run prints no message. The audit counts the rollover as a burn and a re-issue: issued and redeemed each rise by the notes' value and outstanding is unchanged (here `{"issued":2899190000000,"outstanding":500000000000,"redeemed":2399190000000}`, **recomputed, not run**).
 
 ### 46. Notes from before the rotation (T4)
 
@@ -708,7 +705,7 @@ The stale copy's notes were burned by the rollover. The wallet's own sync tries 
 ECASH_WALLET_FILE=/tmp/wallet-rot.pre.json cargo run -q -- --regtest balance
 ```
 
-Expected (**rewritten, not run**): `rollover refused, notes freed: : input 0: the note is already spent`. The step used to run `transfer` here, which printed a second line, `error: the mint refused the request: {"error":"note 0 is already spent"}`; `balance` is not expected to. Nothing is burned or charged. The wallet cannot tell the notes are spent and tries the same rollover on every run.
+Expected (**rewritten, not run**): `esp: rollover refused (inputs 0, 1, …: the notes are already spent): N note(s) marked spent, 0 freed`, and a `spent elsewhere N note(s)` line from `balance`. The mint names every spent input of the rollover (this round), and the wallet marks all of them spent, so one run settles the stale copy and the next prints no refusal. In the 2026-10-22 run, before that change, the mint named only `input 0`, so the line read `esp: rollover refused (input 0: the note is already spent): 1 note(s) marked spent, 16 freed` and it took 17 runs for the balance to come down. The step used to run `transfer` here; `balance` prints no second line. Nothing is burned or charged.
 
 ### 47. The old key set retires, live (T1, then T4)
 
@@ -720,7 +717,7 @@ ECASH_WALLET_FILE=/tmp/wallet-rot.json cargo run -q -- --regtest balance
 curl -s http://127.0.0.1:3100/audit; echo
 ```
 
-Expected: the mint now has epoch 2 as current, `5e81c980bed405b1` (epoch 1) as previous and `507d…` gone (the wallet's `balance` reads the window over AIR; there is no `GET /rotation` to `curl` any more). The stale wallet says `2 note(s) expired: their key set was retired at a rotation before they were rolled over, and they are lost (not counted in the balance)` and shows `esp  0`. The other wallet rolls its notes over again (`rolled over 2 note(s) to the current key set`) and keeps 2×10^11. The audit rose by 2×10^11 on each side for the second rollover (`{"issued":3099190000000,"outstanding":500000000000,"redeemed":2599190000000}`, **recomputed, not run**).
+Expected: the mint now has epoch 2 as current, `5e81c980bed405b1` (epoch 1) as previous and `507d…` gone (the wallet's `balance` reads the window over AIR; there is no `GET /rotation` to `curl` any more). The stale wallet says `2 note(s) expired: their key set was retired at a rotation before they were rolled over, and they are lost (not counted in the balance)` and shows `esp  0`. The other wallet rolls its notes over again (`esp: rolled over N note(s) to the current key set`) and keeps 2×10^11. The audit rose by 2×10^11 on each side for the second rollover (`{"issued":3099190000000,"outstanding":500000000000,"redeemed":2599190000000}`, **recomputed, not run**).
 
 ### 48. FSP key rotation (T1, T5, T4)
 
@@ -733,7 +730,9 @@ cd ~/fsp-mint
 FSP_AIR_ESP_DID=$ESP_DID FSP_AIR_ESP_SERVER=$AIR_SERVER FSP_AIR_ESP_HOST=127.0.0.1 FSP_AIR_SERVER=$AIR_SERVER FSP_AIR_HOST=127.0.0.1 FSP_NETWORK=regtest FSP_SERVICE_DID=$SERVICE FSP_ROTATION_ACTIVATION_HOURS=1 FSP_ROTATION_PERIOD_HOURS=1 cargo run -- serve
 ```
 
-In T4: `cargo run -q -- --regtest fsp-window --service $SERVICE` and `cargo run -q -- --regtest balance`. Expected: `fsp-window` lists the new current set (epoch 1) and the previous one `8fa2a88519b4bef5`; the first command that connects prints `fsp 0279be…1798: rollover <id>: rolled over to the current keyset` after the wallet's delay, and `balance` shows the same FSP on the new key set (550000000000 FSP: **recomputed, not run**, it was 350000000000 before step 26 added 2×10^11) in fewer notes (the count depends on the amounts and was not recomputed). The second run prints nothing.
+In T4: `cargo run -q -- --regtest fsp-window --service $SERVICE` and `cargo run -q -- --regtest balance`. Expected: `fsp-window` lists the new current set (epoch 1) and the previous one `8fa2a88519b4bef5`; the first command that connects prints `fsp 0279be…1798: rollover <id>: rolled over to the current keyset` after the wallet's delay, and `balance` shows the same FSP on the new key set (550000000000 FSP: **recomputed, not run**, it was 350000000000 before step 26 added 2×10^11; the 2026-10-22 run, with extra rounds, had 750000000000: 4 × 2×10^11 issued less 5×10^10 paid) in fewer notes (the count depends on the amounts and was not recomputed). The second run prints nothing.
+
+A stale copy of the FSP wallet (one made before the rollover, as step 44 does for the ESP) is refused at the FSP mint. In the 2026-10-22 run the mint answered `already_spent` for note 0 only, the wallet read it as a plain refusal and tried again on every connection, and `balance` kept the old FSP. The FSP mint now answers `note_spent_elsewhere` and names every spent input, and the wallet marks them spent and frees the rest: the connection logs a line `rollover refused (…): N note(s) marked spent, M freed` and the next one does not repeat it (**rewritten, not run**).
 
 ### 49. Put it away (T1)
 
@@ -741,10 +740,11 @@ Both mints' data now belongs to the rotated key sets, and the app wallet's FSP n
 
 ```
 for d in .psp-mint .esp-mint .fsp-mint; do mv ~/$d ~/$d.run-20261016; done
-mv ~/.ecash-wallet ~/.ecash-wallet.run-20261016
+mv ~/.ecash-wallet ~/.ecash-wallet.run-20261016   # only if a default wallet was made
+mv /tmp/wallet-regtest.json /tmp/wallet-regtest.run-20261016.json
 rm -f /tmp/wallet-service*.json /tmp/wallet-rot*.json
 rm -rf /tmp/fsp-export /tmp/fsp-export2 /tmp/fsp-esp-*
-unset ECASH_AIR_SERVER ECASH_AIR_HOST ECASH_AIR_PSP_DID ECASH_AIR_ESP_DID ECASH_AIR_FSP AIR_SERVER ESP_DID
+unset ECASH_WALLET_FILE ECASH_AIR_SERVER ECASH_AIR_HOST ECASH_AIR_PSP_DID ECASH_AIR_ESP_DID ECASH_AIR_FSP AIR_SERVER ESP_DID
 ```
 
 The node's regtest folder moves aside in step 1 of the next run. The copies `~/.esp-mint.pre-rotation` and `~/.fsp-mint.pre-rotation` made in steps 44 and 48 are the state from just before the rotations, and can be removed when this run's data is no longer needed. Delete `~/.esp-mint/esp-mint.toml` if you restore any of it, so the 365-day maturity applies again.

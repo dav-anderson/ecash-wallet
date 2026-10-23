@@ -6,153 +6,27 @@
 
 mod common;
 
-use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
+use std::path::Path;
+use std::sync::Arc;
 
-use ecash_wallet::config::AirSettings;
-use ecash_wallet::mint_info::{
-    psp_post, psp_window, rotation_sync, send_transfer, sync_esp_keysets,
-};
+use ecash_wallet::mint_info::{psp_post, psp_window, rotation_sync};
 use ecash_wallet::psp::Delivered;
-use ecash_wallet::store::{HandedNote, Handover, StoredNote, WalletData};
-use ecash_wallet::{Kind, Wallet};
-use esp_mint::exchange::{Burn, Psp};
-use esp_mint::server::EspState;
-use esp_mint::terms::Terms;
-use mint_server::state::AppState;
-use mint_types::{Amount, BlindNonce, MintInput, MintOutput, Nonce, Note};
-use rand::rngs::OsRng;
+use ecash_wallet::store::{HandedNote, Handover, WalletData};
+use ecash_wallet::{Kind, Wallet, WalletError};
+use esp_mint::config::Config;
+use psp_mint::settle::Settlement;
 use secp256k1::{Keypair, SECP256K1};
 use sp_wire::ServiceDid;
+use sp_wire::air_request::delivery::Outcome;
+use sp_wire::seal::SecretKey as DidKey;
 
-use common::{EspAt, PspAt};
+use common::air::{EspAt, PspUp};
+use common::{EspMint, NoPsp, PspMint, T0 as T, esp_record, open_wallet, psp_record, scratch};
 
-/// What the wallet's records call the PSP and the ESP (keys for their live
-/// keysets and swap times). Nothing dials them: both are reached by DID.
-const PSP_RECORD: &str = "http://127.0.0.1:3000";
-const ESP_RECORD: &str = "http://127.0.0.1:3100";
-
-const T: u64 = 1_800_000_000;
 const H: u64 = 3600;
 /// Past the stagger window of a 1-hour period (0.5% = 18 s, and a swap time is
 /// 1 to 18 s after the set starts).
 const LATER: u64 = 100;
-
-fn scratch(name: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("wallet-rot-{}-{name}", {
-        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        format!(
-            "{}-{}",
-            std::process::id(),
-            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        )
-    }));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
-}
-
-struct PspMint {
-    state: Arc<AppState>,
-    rot: psp_mint::server::SharedRotating,
-    /// Its AIR listener, and the turn on the shared server. Last.
-    at: PspAt,
-}
-
-fn start_psp(dir: &Path) -> PspMint {
-    let d = dir.join("psp");
-    let (rotor, logic) =
-        psp_mint::rotation::Rotor::open_at(&d, Amount::from_units(1024), 1, 1, T).unwrap();
-    let rot =
-        psp_mint::server::Rotating::new(rotor, psp_mint::rotation::Rollovers::open(&d).unwrap());
-    let state = psp_mint::server::app_state(logic);
-    // The listener keeps its state in a folder of its own, outside `dir`, which a
-    // test may remove while the listener is still running.
-    let at = PspAt::new(
-        Arc::clone(&state),
-        Arc::clone(&rot),
-        &scratch("airstate-psp"),
-    );
-    PspMint { state, rot, at }
-}
-
-impl PspMint {
-    /// The wallet's `[air]` settings for this PSP.
-    fn air(&self) -> AirSettings {
-        self.at.air(10, 3)
-    }
-
-    fn set_clock(&self, t: u64) {
-        self.rot
-            .rotor
-            .lock()
-            .unwrap()
-            .clock
-            .store(t, Ordering::SeqCst);
-    }
-    fn note(&self, units: u64) -> StoredNote {
-        let kp = Keypair::new(SECP256K1, &mut OsRng);
-        let nonce = Nonce(kp.public_key());
-        let (b, r) = bdhke::blind_message(&nonce.as_hash_preimage(), None);
-        let amount = Amount::from_units(units);
-        let logic = self.state.logic.lock().unwrap();
-        let out = logic
-            .issue(&MintOutput {
-                amount,
-                blind_nonce: BlindNonce(b),
-            })
-            .unwrap();
-        let n = StoredNote {
-            kind: Kind::Psp,
-            amount: units,
-            note: Note {
-                nonce,
-                signature: bdhke::unblind_message(&out.0, &r, &logic.public_keys()[&amount]),
-            },
-            spend_secret: kp.secret_key(),
-            terms: None,
-            reserved_by: None,
-        };
-        // The keyset that signed it, as the wallet records on every note.
-        let ks = psp_mint::rotation::keyset_id(logic.public_keys());
-        SIGNED_BY.with(|m| m.borrow_mut().insert(n.id(), ks));
-        n
-    }
-    fn spent(&self, n: &StoredNote) -> bool {
-        let logic = self.state.logic.lock().unwrap();
-        let rotor = self.rot.rotor.lock().unwrap();
-        logic.is_spent(n.note.nonce).unwrap()
-            || rotor
-                .previous
-                .as_ref()
-                .is_some_and(|(_, l)| l.is_spent(n.note.nonce).unwrap())
-    }
-}
-
-thread_local! {
-    /// Each test note's signing keyset, by note id.
-    static SIGNED_BY: std::cell::RefCell<std::collections::BTreeMap<String, String>> =
-        Default::default();
-}
-
-fn wallet_with(dir: &Path, name: &str, notes: Vec<StoredNote>) -> Wallet {
-    let path = dir.join(format!("{name}.json"));
-    let keysets = SIGNED_BY.with(|m| {
-        let m = m.borrow();
-        notes
-            .iter()
-            .filter_map(|n| m.get(&n.id()).map(|k| (n.id(), k.clone())))
-            .collect()
-    });
-    let data = WalletData {
-        keysets,
-        notes,
-        ..Default::default()
-    };
-    std::fs::write(&path, serde_json::to_vec(&data).unwrap()).unwrap();
-    Wallet::open(&path).unwrap()
-}
 
 fn file_text(w: &Wallet) -> String {
     std::fs::read_to_string(w.path()).unwrap()
@@ -161,13 +35,14 @@ fn file_text(w: &Wallet) -> String {
 #[test]
 fn psp_rolls_over_after_its_staggered_time_and_the_time_is_then_forgotten() {
     let dir = scratch("psp");
-    let m = start_psp(&dir);
+    let m = PspUp::start(&dir.join("psp"), T);
     let air = m.air();
+    let record = psp_record(&air);
     let a = m.note(4);
     let b = m.note(1);
-    let mut w = wallet_with(&dir, "w", vec![a.clone(), b.clone()]);
+    let mut w = m.wallet(&dir, "w", vec![a.clone(), b.clone()]);
     // Before any rotation: one set, nothing to do, nothing scheduled.
-    let log = rotation_sync(&mut w, &air, Kind::Psp, PSP_RECORD).unwrap();
+    let log = rotation_sync(&mut w, &air, Kind::Psp, &psp_record(&air)).unwrap();
     assert!(log.is_empty(), "{log:?}");
     assert_eq!(w.swap_schedule_len(), 0);
     assert_eq!(w.epoch_of(&w.notes()[0]), Some(0));
@@ -177,17 +52,17 @@ fn psp_rolls_over_after_its_staggered_time_and_the_time_is_then_forgotten() {
     let win = psp_window(&mut w, &air).unwrap();
     assert_eq!((win.current_epoch, win.previous_epoch), (1, Some(0)));
     let start = win.current_starts.unwrap();
-    let at = w.swap_time(Kind::Psp, PSP_RECORD, &win).unwrap();
+    let at = w.swap_time(Kind::Psp, &record, &win).unwrap();
     // Strictly after the start: a delay of 0 would make a wallet that syncs the
     // second the set starts swap at once, and this test would then see no
     // "will be rolled over" step to wait through.
     assert!(at > start && at <= start + 18, "0.5% of a 1-hour period");
     assert_eq!(
-        w.swap_time(Kind::Psp, PSP_RECORD, &win).unwrap(),
+        w.swap_time(Kind::Psp, &record, &win).unwrap(),
         at,
         "drawn once"
     );
-    let log = rotation_sync(&mut w, &air, Kind::Psp, PSP_RECORD).unwrap();
+    let log = rotation_sync(&mut w, &air, Kind::Psp, &psp_record(&air)).unwrap();
     for l in &log {
         assert!(
             !l.contains(&at.to_string()),
@@ -198,7 +73,7 @@ fn psp_rolls_over_after_its_staggered_time_and_the_time_is_then_forgotten() {
     // Past the swap time: rolled over without a prompt, and the swap time is
     // gone in the same write that recorded the new notes.
     m.set_clock(T + H + LATER);
-    let log = rotation_sync(&mut w, &air, Kind::Psp, PSP_RECORD).unwrap();
+    let log = rotation_sync(&mut w, &air, Kind::Psp, &psp_record(&air)).unwrap();
     assert!(
         log.iter().any(|l| l.contains("rolled over 2 note(s)")),
         "{log:?}"
@@ -211,12 +86,12 @@ fn psp_rolls_over_after_its_staggered_time_and_the_time_is_then_forgotten() {
         !file_text(&w).contains(&at.to_string()),
         "no history of the swap time in the file"
     );
-    let again = Wallet::open(w.path()).unwrap();
+    let again = open_wallet(w.path()).unwrap();
     assert_eq!(again.swap_schedule_len(), 0);
 
     // The next rotation retires generation 0; this wallet's notes are on 1.
     m.set_clock(T + 2 * H + LATER);
-    let log = rotation_sync(&mut w, &air, Kind::Psp, PSP_RECORD).unwrap();
+    let log = rotation_sync(&mut w, &air, Kind::Psp, &psp_record(&air)).unwrap();
     assert!(
         log.iter().any(|l| l.contains("rolled over 2 note(s)")),
         "{log:?}"
@@ -227,18 +102,19 @@ fn psp_rolls_over_after_its_staggered_time_and_the_time_is_then_forgotten() {
 #[test]
 fn psp_left_offline_through_a_full_cycle_is_lost_and_its_schedule_dropped() {
     let dir = scratch("psp-lost");
-    let m = start_psp(&dir);
+    let m = PspUp::start(&dir.join("psp"), T);
     let air = m.air();
+    let record = psp_record(&air);
     let n = m.note(2);
-    let mut w = wallet_with(&dir, "w", vec![n]);
-    rotation_sync(&mut w, &air, Kind::Psp, PSP_RECORD).unwrap(); // stamped epoch 0
+    let mut w = m.wallet(&dir, "w", vec![n]);
+    rotation_sync(&mut w, &air, Kind::Psp, &psp_record(&air)).unwrap(); // stamped epoch 0
     m.set_clock(T + H);
     let win = psp_window(&mut w, &air).unwrap();
-    w.swap_time(Kind::Psp, PSP_RECORD, &win).unwrap();
+    w.swap_time(Kind::Psp, &record, &win).unwrap();
     assert_eq!(w.swap_schedule_len(), 1);
     // Offline past the next rotation: generation 0 is deleted.
     m.set_clock(T + 2 * H);
-    let log = rotation_sync(&mut w, &air, Kind::Psp, PSP_RECORD).unwrap();
+    let log = rotation_sync(&mut w, &air, Kind::Psp, &psp_record(&air)).unwrap();
     assert!(log.iter().any(|l| l.contains("lost")), "{log:?}");
     assert_eq!(w.lost().len(), 1);
     assert!(w.notes().is_empty());
@@ -252,16 +128,17 @@ fn psp_left_offline_through_a_full_cycle_is_lost_and_its_schedule_dropped() {
 #[test]
 fn a_crash_before_the_send_or_after_the_mint_answered_is_finished_on_the_next_connection() {
     let dir = scratch("psp-crash");
-    let m = start_psp(&dir);
+    let m = PspUp::start(&dir.join("psp"), T);
     let air = m.air();
+    let record = psp_record(&air);
     let (a, b) = (m.note(1), m.note(2));
-    let mut w = wallet_with(&dir, "w", vec![a.clone(), b.clone()]);
-    rotation_sync(&mut w, &air, Kind::Psp, PSP_RECORD).unwrap();
+    let mut w = m.wallet(&dir, "w", vec![a.clone(), b.clone()]);
+    rotation_sync(&mut w, &air, Kind::Psp, &psp_record(&air)).unwrap();
     m.set_clock(T + H + LATER);
     let win = psp_window(&mut w, &air).unwrap();
-    let old = w.prepare_rollover(Kind::Psp, PSP_RECORD, &win).unwrap();
-    w.swap_time(Kind::Psp, PSP_RECORD, &win).unwrap();
-    let ids = w.build_rollovers(Kind::Psp, PSP_RECORD, &win, old).unwrap();
+    let old = w.prepare_rollover(Kind::Psp, &record, &win).unwrap();
+    w.swap_time(Kind::Psp, &record, &win).unwrap();
+    let ids = w.build_rollovers(Kind::Psp, &record, &win, old).unwrap();
     // The mint answers, but the wallet dies before it finishes the rollover (the
     // reply is as good as lost): the same body, sent by hand, is applied by the
     // mint and its answer stored.
@@ -270,9 +147,9 @@ fn a_crash_before_the_send_or_after_the_mint_answered_is_finished_on_the_next_co
     drop(w);
     // Restart: the stored request is sent again and finished from the mint's
     // stored answer.
-    let mut w = Wallet::open(&dir.join("w.json")).unwrap();
+    let mut w = open_wallet(&dir.join("w.json")).unwrap();
     assert_eq!(w.pending_rollovers()[0].id, ids[0]);
-    let log = rotation_sync(&mut w, &air, Kind::Psp, PSP_RECORD).unwrap();
+    let log = rotation_sync(&mut w, &air, Kind::Psp, &psp_record(&air)).unwrap();
     assert!(
         log.iter().any(|l| l.contains("rolled over 2 note(s)")),
         "{log:?}"
@@ -285,26 +162,30 @@ fn a_crash_before_the_send_or_after_the_mint_answered_is_finished_on_the_next_co
 #[test]
 fn a_failed_rollover_is_logged_and_retried_on_the_next_connection() {
     let dir = scratch("psp-fail");
-    let m = start_psp(&dir);
+    let m = PspUp::start(&dir.join("psp"), T);
     let air = m.air();
-    let mut w = wallet_with(&dir, "w", vec![m.note(8)]);
-    rotation_sync(&mut w, &air, Kind::Psp, PSP_RECORD).unwrap();
+    let record = psp_record(&air);
+    let mut w = m.wallet(&dir, "w", vec![m.note(8)]);
+    rotation_sync(&mut w, &air, Kind::Psp, &psp_record(&air)).unwrap();
     m.set_clock(T + H + LATER);
     let win = psp_window(&mut w, &air).unwrap();
-    let old = w.prepare_rollover(Kind::Psp, PSP_RECORD, &win).unwrap();
-    w.swap_time(Kind::Psp, PSP_RECORD, &win).unwrap();
-    w.build_rollovers(Kind::Psp, PSP_RECORD, &win, old).unwrap();
+    let old = w.prepare_rollover(Kind::Psp, &record, &win).unwrap();
+    w.swap_time(Kind::Psp, &record, &win).unwrap();
+    w.build_rollovers(Kind::Psp, &record, &win, old).unwrap();
     // The mint is not answering: one short try, then "unreachable". The request
     // is kept in the wallet file.
     m.at.silence();
     let quick = m.at.air(1, 1);
-    let _ = rotation_sync(&mut w, &quick, Kind::Psp, PSP_RECORD);
+    match rotation_sync(&mut w, &quick, Kind::Psp, &psp_record(&quick)) {
+        Err(WalletError::Mint(why)) => assert!(why.contains("did not answer"), "{why}"),
+        other => panic!("expected the silent PSP to be unreachable, got {other:?}"),
+    }
     assert_eq!(w.pending_rollovers().len(), 1, "kept for the retry");
     assert_eq!(w.swap_schedule_len(), 1, "kept until the swap is done");
     // Back online: the next connection carries on with the kept request.
     m.at.listen();
-    let mut w = Wallet::open(w.path()).unwrap();
-    let log = rotation_sync(&mut w, &air, Kind::Psp, PSP_RECORD).unwrap();
+    let mut w = open_wallet(w.path()).unwrap();
+    let log = rotation_sync(&mut w, &air, Kind::Psp, &psp_record(&air)).unwrap();
     assert!(
         log.iter().any(|l| l.contains("rolled over 1 note(s)")),
         "{log:?}"
@@ -314,91 +195,34 @@ fn a_failed_rollover_is_logged_and_retried_on_the_next_connection() {
 
 // ---- ESP ---------------------------------------------------------------------
 
-struct NoPsp;
-impl Psp for NoPsp {
-    fn melt(&self, _: &[MintInput], _: &str) -> Result<Amount, String> {
-        Err("no psp".into())
-    }
-    fn burns(&self, _: &[Nonce]) -> Result<Vec<Burn>, String> {
-        Err("no psp".into())
-    }
-}
-
-fn service_kp() -> Keypair {
-    Keypair::from_seckey_slice(SECP256K1, &[7u8; 32]).unwrap()
-}
 fn service() -> ServiceDid {
-    ServiceDid::from(service_kp().public_key())
+    ServiceDid::from(
+        Keypair::from_seckey_slice(SECP256K1, &[7u8; 32])
+            .unwrap()
+            .public_key(),
+    )
 }
 
-/// A rotating ESP mint (1-hour periods from `T`) and three notes of its
-/// first set for `service()`: 4 and 4 on day 100, 2 on day 200 (ESP notes are
-/// powers of two).
-fn start_esp(dir: &Path) -> (EspAt, Vec<(u64, HandedNote)>) {
-    let d = dir.join("esp");
-    let (rotor, logic) = esp_mint::rotation::Rotor::open_at(&d, 1, 1, T).unwrap();
-    let master = rotor.current.master.clone();
-    let state = Arc::new(EspState {
-        logic: Mutex::new(logic),
-        master: master.clone(),
-        psp: Box::new(NoPsp),
-        responses: Mutex::new(
-            esp_mint::responses::Responses::open(&d.join("responses.json")).unwrap(),
-        ),
-        queue_path: d.join("queue.json"),
-        queue_lock: Mutex::new(()),
-        in_flight: Default::default(),
-        config: esp_mint::config::Handle::new(esp_mint::config::Config::default()),
-        rollovers: Some(Mutex::new(esp_mint::rotation::Rollovers::open(&d).unwrap())),
-        rotor: Some(Mutex::new(rotor)),
-    });
-    let mut notes = Vec::new();
-    for (units, day) in [(4u64, 100u64), (4, 100), (2, 200)] {
-        let terms = Terms {
-            service: service(),
-            redeemable_after_day: day,
-        };
-        let kp = Keypair::new(SECP256K1, &mut OsRng);
-        let nonce = Nonce(kp.public_key());
-        let (b, r) = bdhke::blind_message(&nonce.as_hash_preimage(), None);
-        let amount = Amount::from_units(units);
-        let sk = master.key_for(amount, &terms);
-        let out = state
-            .logic
-            .lock()
-            .unwrap()
-            .issue_with_key(
-                &sk,
-                &MintOutput {
-                    amount,
-                    blind_nonce: BlindNonce(b),
-                },
-            )
-            .unwrap();
-        notes.push((
-            day,
-            HandedNote {
-                amount: units,
-                note: Note {
-                    nonce,
-                    signature: bdhke::unblind_message(&out.0, &r, &sk.public_key(SECP256K1)),
-                },
-                spend_secret: kp.secret_key(),
-                keyset: esp_mint::rotation::keyset_id(&master),
-            },
-        ));
-    }
+/// A rotating ESP mint (1-hour periods from `T`) with its listener, and three
+/// notes of its first set for `service()`: 4 and 4 on day 100, 2 on day 200 (ESP
+/// notes are powers of two).
+fn start_esp(dir: &Path) -> (EspAt, EspMint, Vec<(u64, HandedNote)>) {
+    let mint = EspMint::open(&dir.join("esp"), Box::new(NoPsp), Config::default(), T);
+    let notes = [(4u64, 100u64), (4, 100), (2, 200)]
+        .into_iter()
+        .map(|(units, day)| (day, mint.handed(&service(), units, day)))
+        .collect();
     // The listener keeps its state in a folder of its own, outside `dir`.
-    (EspAt::new(state, &scratch("airstate-esp")), notes)
+    let at = EspAt::new(Arc::clone(&mint.state), &scratch("airstate-esp"));
+    (at, mint, notes)
 }
 
 #[test]
 fn esp_rolls_over_keeping_its_service_and_day() {
     let dir = scratch("esp");
-    let (esp, notes) = start_esp(&dir);
+    let (esp, mint, notes) = start_esp(&dir);
     let air = esp.air(10, 3);
-    let state = Arc::clone(&esp.state);
-    let mut w = Wallet::open(&dir.join("w.json")).unwrap();
+    let mut w = open_wallet(&dir.join("w.json")).unwrap();
     for day in [100, 200] {
         w.receive_handover(&Handover {
             service: service(),
@@ -411,10 +235,9 @@ fn esp_rolls_over_keeping_its_service_and_day() {
         })
         .unwrap();
     }
-    rotation_sync(&mut w, &air, Kind::Esp, ESP_RECORD).unwrap();
-    let clock = Arc::clone(&state.rotor.as_ref().unwrap().lock().unwrap().clock);
-    clock.store(T + H + LATER, Ordering::SeqCst);
-    let log = rotation_sync(&mut w, &air, Kind::Esp, ESP_RECORD).unwrap();
+    rotation_sync(&mut w, &air, Kind::Esp, &esp_record(&air)).unwrap();
+    mint.set_clock(T + H + LATER);
+    let log = rotation_sync(&mut w, &air, Kind::Esp, &esp_record(&air)).unwrap();
     assert!(
         log.iter().filter(|l| l.contains("rolled over")).count() == 2,
         "one per day: {log:?}"
@@ -440,65 +263,40 @@ fn esp_rolls_over_keeping_its_service_and_day() {
 
 /// Settle one purchase at the PSP's current set, as psp-mint's service does,
 /// and return what it stores for the payer: the outcome that goes to the payer's
-/// AIR record.
-fn settle_now(
-    m: &PspMint,
-    dir: &Path,
-    key: &sp_wire::seal::SecretKey,
-    txid: &str,
-    payload: Vec<u8>,
-) -> sp_wire::air_request::delivery::Outcome {
-    let (opened, ignored) = psp_mint::seal::open_payloads(
-        key,
-        vec![psp_mint::scan::Received {
-            txid: txid.to_string(),
-            confirmations: 6,
-            value_sats: 5_000,
-            payload: Some(payload),
-        }],
-    );
-    assert_eq!(ignored, 0);
-    let mut records =
-        psp_mint::records::Records::open(&dir.join("psp").join("settlements.json")).unwrap();
-    let logic = m.state.logic.lock().unwrap();
-    // $10,000 per BTC, in cents: a PSP is $0.10, so 5,000 sats is exactly 5 PSP
-    let s =
-        psp_mint::settle::settle(&logic, &mut records, &opened[0], &mut || Ok(1_000_000)).unwrap();
-    assert!(
-        matches!(s, psp_mint::settle::Settlement::Issued(_)),
-        "{s:?}"
-    );
-    records
-        .get(txid)
-        .and_then(|r| r.delivery.as_ref())
-        .expect("psp-mint stored a delivery for the payer")
-        .outcome
-        .clone()
+/// AIR record. 5,000 sats at $10,000 a BTC is exactly 5 PSP.
+fn settle_now(m: &PspMint, key: &DidKey, txid: &str, sats: u64, payload: Vec<u8>) -> Outcome {
+    let settled = m.pay(key, txid, sats, payload);
+    assert!(matches!(settled, Settlement::Issued(_)), "{settled:?}");
+    m.delivery_of(txid)
 }
 
 #[test]
 fn purchases_around_a_psp_rotation_are_claimed_with_the_keys_of_the_set_that_signed() {
     let dir = scratch("psp-claim");
-    let m = start_psp(&dir);
-    let _ = m.note(1);
-    let mint_key = sp_wire::seal::SecretKey::new();
-    let mut w = Wallet::open(&dir.join("w.json")).unwrap();
+    let m = PspUp::start(&dir.join("psp"), T);
+    // The first issuance starts the mint's rotation clock (at `T`): its first
+    // set rotates an hour after it.
+    m.note(1);
+    let mint_key = DidKey::new();
+    let mut w = open_wallet(&dir.join("w.json")).unwrap();
     // Both purchases are prepared before the rotation; `a` is settled before
     // it, `b` after it.
-    let a = w.build_psp_payload(&[4], &mint_key.public_key()).unwrap();
-    let b = w.build_psp_payload(&[1], &mint_key.public_key()).unwrap();
+    let a = w.build_psp_payload(&[64], &mint_key.public_key()).unwrap();
+    let b = w
+        .build_psp_payload(&[32, 16, 2], &mint_key.public_key())
+        .unwrap();
     let air = m.air();
     let old = psp_window(&mut w, &air).unwrap().current_id;
-    let out_a = settle_now(&m, &dir, &mint_key, "aa", a.payload);
+    let out_a = settle_now(&m, &mint_key, "aa", 64_000, a.payload);
 
     m.set_clock(T + H);
     let win = psp_window(&mut w, &air).unwrap();
     assert_ne!(win.current_id, old);
-    let out_b = settle_now(&m, &dir, &mint_key, "bb", b.payload);
+    let out_b = settle_now(&m, &mint_key, "bb", 50_000, b.payload);
 
     // Each record names the set that signed it ...
-    let named = |out: &sp_wire::air_request::delivery::Outcome| match out {
-        sp_wire::air_request::delivery::Outcome::Signed(s) => s.clone(),
+    let named = |out: &Outcome| match out {
+        Outcome::Signed(s) => s.clone(),
         other => panic!("expected signatures, got {other:?}"),
     };
     assert_eq!(named(&out_a).keyset, old);
@@ -512,7 +310,7 @@ fn purchases_around_a_psp_rotation_are_claimed_with_the_keys_of_the_set_that_sig
             Delivered::Claimed(_)
         ));
     }
-    assert_eq!(w.balance().psp, 5);
+    assert_eq!(w.balance().psp, 114);
     let by_amount = |units: u64| {
         w.notes()
             .iter()
@@ -520,70 +318,33 @@ fn purchases_around_a_psp_rotation_are_claimed_with_the_keys_of_the_set_that_sig
             .unwrap()
             .clone()
     };
-    assert_eq!(w.psp_keyset_of(&by_amount(4)).unwrap(), old);
-    assert_eq!(w.psp_keyset_of(&by_amount(1)).unwrap(), win.current_id);
+    assert_eq!(w.psp_keyset_of(&by_amount(64)).unwrap(), old);
+    assert_eq!(w.psp_keyset_of(&by_amount(32)).unwrap(), win.current_id);
     // The notes are good: the previous-set note rolls over to the current set.
-    rotation_sync(&mut w, &air, Kind::Psp, PSP_RECORD).unwrap();
+    rotation_sync(&mut w, &air, Kind::Psp, &psp_record(&air)).unwrap();
     m.set_clock(T + H + LATER);
-    let log = rotation_sync(&mut w, &air, Kind::Psp, PSP_RECORD).unwrap();
+    let log = rotation_sync(&mut w, &air, Kind::Psp, &psp_record(&air)).unwrap();
     assert!(
         log.iter().any(|l| l.contains("rolled over 1 note")),
         "{log:?}"
     );
-    assert_eq!(w.balance().psp, 5);
-}
-
-#[test]
-fn a_transfer_built_before_the_esp_mint_rotated_is_signed_by_the_set_it_names() {
-    let dir = scratch("esp-stale");
-    let (esp, notes) = start_esp(&dir);
-    let air = esp.air(10, 3);
-    let state = Arc::clone(&esp.state);
-    let mut w = Wallet::open(&dir.join("w.json")).unwrap();
-    w.receive_handover(&Handover {
-        service: service(),
-        redeemable_after_day: 100,
-        notes: notes
-            .iter()
-            .filter(|(d, _)| *d == 100)
-            .map(|(_, n)| n.clone())
-            .collect(),
-    })
-    .unwrap();
-    sync_esp_keysets(&mut w, &air, ESP_RECORD).unwrap();
-    let old = w.esp_output_keyset();
-    // The mint rotates; the wallet's cached keyset is now the previous one,
-    // which the mint still signs with.
-    let clock = Arc::clone(&state.rotor.as_ref().unwrap().lock().unwrap().clock);
-    clock.store(T + H + LATER, Ordering::SeqCst);
-    let built = w
-        .build_transfer(&service_kp().secret_key(), Some(100), None)
-        .unwrap();
-    assert_eq!(built.request.keyset, old, "built from the stale cache");
-    // The wallet kept the keyset with the pending transfer, and sends it as it is.
-    let reply = send_transfer(&mut w, &air, &built.request).unwrap();
-    assert_eq!(reply.keyset, old, "signed by the set the request named");
-    let done = w.finish_transfer(&built.id, &reply).unwrap();
-    assert_eq!(done.esp_units, 8);
-    for id in &done.notes {
-        let n = w.notes().iter().find(|n| &n.id() == id).unwrap();
-        assert_eq!(w.esp_keyset_of(n).unwrap(), old);
-    }
+    assert_eq!(w.balance().psp, 114);
 }
 
 #[test]
 fn a_note_without_a_recorded_keyset_is_refused_not_guessed() {
     let dir = scratch("psp-noks");
-    let m = start_psp(&dir);
+    let m = PspUp::start(&dir.join("psp"), T);
     let n = m.note(4);
     // Written straight to the file with no keyset, as an old wallet would have.
     let path = dir.join("old.json");
     let data = WalletData {
+        network: common::NETWORK.into(),
         notes: vec![n.clone()],
         ..Default::default()
     };
     std::fs::write(&path, serde_json::to_vec(&data).unwrap()).unwrap();
-    let w = Wallet::open(&path).unwrap();
+    let w = open_wallet(&path).unwrap();
     let e = w.psp_keyset_of(&n).unwrap_err().to_string();
     assert!(e.contains("no recorded keyset"), "{e}");
     let e = w.esp_keyset_of(&n).unwrap_err().to_string();

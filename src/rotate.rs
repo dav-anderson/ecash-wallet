@@ -59,8 +59,8 @@ pub fn random_delay(period_secs: u64) -> u64 {
 }
 
 /// The schedule key of a rotation.
-pub fn schedule_key(kind: Kind, url: &str, keyset: &str) -> String {
-    format!("{}|{url}|{keyset}", kind_name(kind))
+pub fn schedule_key(kind: Kind, record: &str, keyset: &str) -> String {
+    format!("{}|{record}|{keyset}", kind_name(kind))
 }
 
 fn kind_name(kind: Kind) -> &'static str {
@@ -72,8 +72,8 @@ fn kind_name(kind: Kind) -> &'static str {
 }
 
 /// The schedule prefix of one mint.
-pub fn schedule_prefix(kind: Kind, url: &str) -> String {
-    format!("{}|{url}|", kind_name(kind))
+pub fn schedule_prefix(kind: Kind, record: &str) -> String {
+    format!("{}|{record}|", kind_name(kind))
 }
 
 /// A rollover stored before it is sent.
@@ -82,7 +82,7 @@ pub struct PendingRollover {
     /// The request hash, as the mint keys its answer.
     pub id: String,
     pub kind: Kind,
-    pub url: String,
+    pub record: String,
     /// The JSON body sent to `POST /rollover`.
     pub body: serde_json::Value,
     pub inputs: Vec<String>,
@@ -188,23 +188,25 @@ impl Wallet {
     /// Remember the ESP mint's live keysets.
     pub fn note_esp_keysets(
         &mut self,
-        url: &str,
+        record: &str,
         current: &str,
         previous: Option<&str>,
     ) -> Result<(), WalletError> {
         let live = (current.to_string(), previous.map(str::to_string));
-        if self.data().esp_live_keysets.get(url) == Some(&live) {
+        if self.data().esp_live_keysets.get(record) == Some(&live) {
             return Ok(());
         }
         self.update(|d| {
             d.esp_live_keysets.clear();
-            d.esp_live_keysets.insert(url.to_string(), live);
+            d.esp_live_keysets.insert(record.to_string(), live);
             Ok(())
         })
     }
 
-    /// Record the keyset a mint's reply names for these notes. An empty name
-    /// (an old mint) records nothing.
+    /// Record the keyset a mint's reply names for these notes. A reply that
+    /// names none is refused with a `Mint` error and nothing is stored: a note
+    /// is spent under its recorded keyset, so one with none could not be spent.
+    /// (esp-mint always names it, `exchange.rs:829`.)
     pub fn record_keysets(&mut self, ids: &[String], keyset: &str) -> Result<(), WalletError> {
         if keyset.is_empty() {
             return Err(WalletError::Mint(
@@ -220,13 +222,13 @@ impl Wallet {
     }
 
     /// Remember a mint's live keysets, as just read from `/rotation`.
-    pub fn note_live_keysets(&mut self, url: &str, w: &Window) -> Result<(), WalletError> {
+    pub fn note_live_keysets(&mut self, record: &str, w: &Window) -> Result<(), WalletError> {
         let live = (w.current_id.clone(), w.previous_id.clone());
-        if self.data().live_keysets.get(url) == Some(&live) {
+        if self.data().live_keysets.get(record) == Some(&live) {
             return Ok(());
         }
         self.update(|d| {
-            d.live_keysets.insert(url.to_string(), live);
+            d.live_keysets.insert(record.to_string(), live);
             Ok(())
         })
     }
@@ -242,11 +244,11 @@ impl Wallet {
     pub fn prepare_rollover(
         &mut self,
         kind: Kind,
-        url: &str,
+        record: &str,
         w: &Window,
     ) -> Result<Vec<StoredNote>, WalletError> {
-        let prefix = schedule_prefix(kind, url);
-        let current_key = schedule_key(kind, url, &w.current_id);
+        let prefix = schedule_prefix(kind, record);
+        let current_key = schedule_key(kind, record, &w.current_id);
         let oldest_live = w.previous_epoch.unwrap_or(w.current_epoch);
         self.update(|d| {
             let (keep, lost): (Vec<StoredNote>, Vec<StoredNote>) =
@@ -333,12 +335,12 @@ impl Wallet {
     /// nothing is left to roll over.
     pub fn drop_fsp_schedule(
         &mut self,
-        url: &str,
+        record: &str,
         current: &str,
         has_old: bool,
     ) -> Result<(), WalletError> {
-        let prefix = schedule_prefix(Kind::Fsp, url);
-        let key = schedule_key(Kind::Fsp, url, current);
+        let prefix = schedule_prefix(Kind::Fsp, record);
+        let key = schedule_key(Kind::Fsp, record, current);
         if !self
             .data()
             .swap_schedule
@@ -355,8 +357,8 @@ impl Wallet {
     }
 
     /// This rotation's swap time: drawn once and kept until the swap is done.
-    pub fn swap_time(&mut self, kind: Kind, url: &str, w: &Window) -> Result<u64, WalletError> {
-        let key = schedule_key(kind, url, &w.current_id);
+    pub fn swap_time(&mut self, kind: Kind, record: &str, w: &Window) -> Result<u64, WalletError> {
+        let key = schedule_key(kind, record, &w.current_id);
         if let Some(t) = self.data().swap_schedule.get(&key) {
             return Ok(*t);
         }
@@ -376,11 +378,11 @@ impl Wallet {
     pub fn build_rollovers(
         &mut self,
         kind: Kind,
-        url: &str,
+        record: &str,
         w: &Window,
         old: Vec<StoredNote>,
     ) -> Result<Vec<String>, WalletError> {
-        let schedule = schedule_key(kind, url, &w.current_id);
+        let schedule = schedule_key(kind, record, &w.current_id);
         let mut groups: std::collections::BTreeMap<Option<(String, u64)>, Vec<StoredNote>> =
             Default::default();
         for n in old {
@@ -470,7 +472,7 @@ impl Wallet {
                 let p = PendingRollover {
                     id: id.clone(),
                     kind,
-                    url: url.to_string(),
+                    record: record.to_string(),
                     body,
                     inputs: ids.clone(),
                     outputs,
@@ -506,7 +508,7 @@ impl Wallet {
             .iter()
             .find(|p| p.id == id)
             .cloned()
-            .ok_or_else(|| WalletError::Invalid(format!("no rollover {id}")))?;
+            .ok_or_else(|| WalletError::Unknown(format!("no pending rollover {id}")))?;
         if signatures.len() != p.outputs.len() || keys.len() != p.outputs.len() {
             return Err(WalletError::Mint(
                 "the rollover reply does not fit the request".into(),
@@ -571,18 +573,18 @@ impl Wallet {
         })
     }
 
-    /// The mint refused the rollover: free its notes.
+    /// The mint refused the rollover: free its notes. An id that is not a
+    /// pending rollover is refused (`Unknown`) and nothing is written.
     pub fn cancel_rollover(&mut self, id: &str) -> Result<(), WalletError> {
         self.update(|d| {
             let schedule = d
                 .pending_rollovers
                 .iter()
                 .find(|q| q.id == id)
-                .map(|q| q.schedule.clone());
-            if let Some(schedule) = schedule {
-                // A reclaim the mint refused leaves the handoff pending again.
-                crate::handoff::settle_reclaim(d, &schedule, false);
-            }
+                .map(|q| q.schedule.clone())
+                .ok_or_else(|| WalletError::Unknown(format!("no pending rollover {id}")))?;
+            // A reclaim the mint refused leaves the handoff pending again.
+            crate::handoff::settle_reclaim(d, &schedule, false);
             for n in d
                 .notes
                 .iter_mut()
@@ -599,6 +601,21 @@ impl Wallet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::expect;
+
+    /// Open a wallet file of the test network.
+    fn open_wallet(path: &std::path::Path) -> Result<crate::Wallet, crate::WalletError> {
+        crate::Wallet::open(path, "regtest")
+    }
+
+    /// The PSP's name in the wallet's records, as `main` makes it: its DID in
+    /// lowercase hex.
+    fn psp_record() -> String {
+        let sk = secp256k1::SecretKey::from_slice(&[9; 32]).unwrap();
+        crate::fsp::record_of(sp_wire::ServiceDid::from(
+            sk.public_key(secp256k1::SECP256K1),
+        ))
+    }
 
     #[test]
     fn the_stagger_is_half_a_percent_capped_at_72_hours() {
@@ -645,7 +662,7 @@ mod tests {
         let pending = PendingRollover {
             id: "roll1".into(),
             kind: Kind::Psp,
-            url: "http://127.0.0.1:1".into(),
+            record: psp_record(),
             body: serde_json::json!({}),
             inputs: ids.clone(),
             outputs: Vec::new(),
@@ -653,6 +670,7 @@ mod tests {
             schedule: "s".into(),
         };
         let data = WalletData {
+            network: "regtest".into(),
             notes,
             pending_rollovers: vec![pending],
             ..Default::default()
@@ -666,9 +684,13 @@ mod tests {
             )
         }));
         std::fs::write(&path, serde_json::to_vec(&data).unwrap()).unwrap();
-        let mut w = Wallet::open(&path).unwrap();
+        let mut w = open_wallet(&path).unwrap();
         // an index past the rollover changes nothing
-        assert!(w.mark_spent_in_rollover("roll1", &[3]).is_err());
+        let e = expect::invalid(w.mark_spent_in_rollover("roll1", &[3]));
+        assert!(
+            e.contains("the mint named notes [3], but the rollover has 3 notes"),
+            "{e}"
+        );
         assert_eq!(w.pending_rollovers().len(), 1);
         let report = w.mark_spent_in_rollover("roll1", &[1]).unwrap();
         assert_eq!((report.marked_spent, report.freed), (1, 2));
@@ -711,6 +733,7 @@ mod tests {
             )
         }));
         let data = WalletData {
+            network: "regtest".into(),
             keysets: [(old.0.id(), old.1.clone()), (live.0.id(), live.1.clone())]
                 .into_iter()
                 .collect(),
@@ -718,7 +741,7 @@ mod tests {
             ..Default::default()
         };
         std::fs::write(&path, serde_json::to_vec(&data).unwrap()).unwrap();
-        let mut w = Wallet::open(&path).unwrap();
+        let mut w = open_wallet(&path).unwrap();
         let win = Window {
             current_epoch: 5,
             current_id: "cccccccccccccccc".into(),
@@ -738,6 +761,84 @@ mod tests {
         assert_eq!(w.lost()[0].id(), old.0.id());
         assert!(!w.data().keysets.contains_key(&old.0.id()));
         assert_eq!(w.notes().len(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn unknown_request_ids_are_refused_and_change_nothing() {
+        use crate::store::WalletData;
+        use secp256k1::Keypair;
+        use sp_wire::esp::redeem::Totals;
+        let kp = Keypair::new(SECP256K1, &mut rand::rngs::OsRng);
+        let held = StoredNote {
+            kind: Kind::Psp,
+            amount: 1,
+            note: mint_types::Note {
+                nonce: mint_types::Nonce(kp.public_key()),
+                signature: kp.public_key(),
+            },
+            spend_secret: kp.secret_key(),
+            terms: None,
+            reserved_by: Some("roll1".into()),
+        };
+        let data = WalletData {
+            network: "regtest".into(),
+            pending_rollovers: vec![PendingRollover {
+                id: "roll1".into(),
+                kind: Kind::Psp,
+                record: psp_record(),
+                body: serde_json::json!({}),
+                inputs: vec![held.id()],
+                outputs: Vec::new(),
+                terms: None,
+                schedule: "s".into(),
+            }],
+            notes: vec![held],
+            ..Default::default()
+        };
+        let path = std::env::temp_dir().join(format!(
+            "wallet-unknown-ids-{}-{:?}.json",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&path, serde_json::to_vec(&data).unwrap()).unwrap();
+        let mut w = open_wallet(&path).unwrap();
+        let state = |w: &Wallet| {
+            (
+                serde_json::to_value(w.snapshot()).unwrap(),
+                std::fs::read(&path).unwrap(),
+            )
+        };
+        let before = state(&w);
+
+        let e = expect::unknown(w.finish_rollover("nope", 1, "k", &[], &[]));
+        assert!(e.contains("no pending rollover nope"), "{e}");
+        let e = expect::unknown(w.cancel_rollover("nope"));
+        assert!(e.contains("no pending rollover nope"), "{e}");
+        let e = expect::unknown(w.mark_spent_in_rollover("nope", &[0]));
+        assert!(e.contains("no pending rollover nope"), "{e}");
+        let totals = Totals {
+            notes: vec![],
+            accepted_esp: 0,
+            rejected_esp: 0,
+            fee_esp: 0,
+            size_bytes: 0,
+            fee_per_byte: 0,
+            accepted_by_terms: vec![],
+            rejected_by_terms: vec![],
+        };
+        let e = expect::unknown(w.rebuild_redemption("nope", &kp.secret_key(), &totals));
+        assert!(e.contains("no pending redemption nope"), "{e}");
+        let e = expect::unknown(w.refuse_redemption("nope", &[]));
+        assert!(e.contains("no pending redemption nope"), "{e}");
+        assert_eq!(state(&w), before, "no refused call changed the wallet");
+
+        // a reply of the wrong size for the rollover that is there
+        match w.finish_rollover("roll1", 1, "k", &[kp.public_key()], &[]) {
+            Err(WalletError::Mint(m)) => assert!(m.contains("does not fit the request"), "{m}"),
+            other => panic!("expected WalletError::Mint, got {other:?}"),
+        }
+        assert_eq!(state(&w), before, "the rollover is untouched");
         let _ = std::fs::remove_file(&path);
     }
 }

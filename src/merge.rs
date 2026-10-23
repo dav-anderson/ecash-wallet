@@ -3,7 +3,7 @@
 //! Every wallet is meant to be kept in two places: locally, to pay for reads and
 //! writes, and in the AIR, for redundancy and recovery. After a handoff to a new
 //! device the two differ: the local copy holds the starter notes, and the stored
-//! one holds everything else. [`merge`] makes one wallet of two copies, and
+//! one holds everything else. `merge` makes one wallet of two copies, and
 //! [`Wallet::merge_from`] applies it. The merged copy is meant to be saved to
 //! both places; its [`WalletData::version`] is above both inputs'.
 //!
@@ -27,23 +27,50 @@
 //!   are united by purchase id, and `finished` does not drop them: the purchase
 //!   they belong to is finished (its notes were claimed), and the key is what
 //!   stays until its window closes (`Wallet::close_expired`).
+//! - **A PSP reconciliation is carried with its payment.** The request a copy
+//!   built for a held or rejected purchase, or for a credit, is part of that
+//!   payment (`ReconcileState`): when one copy has the payment and a request for
+//!   it and the other has the payment without one, the result has the request,
+//!   so the two copies do not each build one. Where both copies have a request,
+//!   the local copy's is kept (it is the one this copy resends). A payment the
+//!   other copy holds open, that this one has not heard of, comes with its
+//!   request. The copies' answers to "was the user told it is lost" are
+//!   or-ed, so it is said once. The rules must be the same record's; copies
+//!   with other rules for one payment keep the local copy's.
+//! - **A payment reconciled in either copy is never brought back.** The ids of
+//!   the purchases and credits whose reconciliation was answered are a ledger of
+//!   their own (`reconciled`), united by the merge: a purchase or a credit in it
+//!   is not in the result, in whichever copy it is still held. That is what keeps
+//!   a settled credit from coming back (and its "pending" line with it) after a
+//!   merge with a copy that had not heard the answer. The notes the answer
+//!   brought are united like all notes, so applying the same answer in both
+//!   copies adds none twice. The AIR request of a payment that is gone is
+//!   dropped with it.
 //! - **Everything keyed by a note or a mint** (key sets, epochs, the mints and
 //!   key sets last seen, the swap schedule) is united; where both have an entry
 //!   the local copy's is kept, because it is the one in use.
+//!
+//! - **Both copies are of one network.** `merge` itself does not look (the
+//!   result carries the local copy's `network`); [`Wallet::merge_from`] and
+//!   [`Wallet::merge_file`] refuse a copy whose `network` differs from the
+//!   wallet's, and `merge_file` refuses a file that records none, so a
+//!   wallet is never mixed with another network's notes.
 //!
 //! The merge is a pure function of the two copies, does not change either, and
 //! gives the same result when run again on its own output.
 //!
 //! What it cannot do: tell that a note in the stored copy was spent by a copy
 //! that no longer exists (a device lost before it was stored). Such a note is
-//! found spent when it is next used, as always. A wallet file from before this
-//! version has no ledgers; it is merged as if nothing had ever left it.
+//! found spent when it is next used, as always. A copy with empty ledgers is
+//! merged as if nothing had ever left it.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::error::WalletError;
 use crate::handoff::{HandoffState, OutgoingHandoff};
-use crate::store::{StoredNote, Wallet, WalletData, has_departed};
+use crate::store::{
+    OpenPurchase, ReconcileState, StoredNote, Wallet, WalletData, has_departed, parse_wallet,
+};
 
 /// What a merge did.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -112,7 +139,6 @@ fn pending_request_ids(d: &WalletData, handoffs: &[OutgoingHandoff]) -> BTreeSet
     let mut ids = BTreeSet::new();
     ids.extend(d.pending_purchases.iter().map(|p| p.id.clone()));
     ids.extend(d.pending_exchanges.iter().map(|p| p.id.clone()));
-    ids.extend(d.pending_transfers.iter().map(|p| p.id.clone()));
     ids.extend(d.pending_redemptions.iter().map(|p| p.id.clone()));
     ids.extend(d.pending_fsp.iter().map(|p| p.id.clone()));
     ids.extend(d.pending_rollovers.iter().map(|p| p.id.clone()));
@@ -123,6 +149,48 @@ fn pending_request_ids(d: &WalletData, handoffs: &[OutgoingHandoff]) -> BTreeSet
             .map(|h| h.id.clone()),
     );
     ids
+}
+
+/// The reconciliation state of one payment that both copies hold, for the same
+/// record of the PSP: the request one has built is kept, the local copy's where
+/// both have one (see the module documentation).
+fn merged_state(
+    local: &ReconcileState,
+    stored: &ReconcileState,
+    same_rules: bool,
+) -> ReconcileState {
+    if !same_rules {
+        return local.clone();
+    }
+    let told_lost = local.told_lost || stored.told_lost;
+    match (&local.request, &stored.request) {
+        (None, Some(_)) => ReconcileState {
+            told_lost,
+            ..stored.clone()
+        },
+        _ => ReconcileState {
+            told_lost,
+            ..local.clone()
+        },
+    }
+}
+
+/// The open record of a purchase both copies hold: the local copy's, with the
+/// stored copy's request when it has one and the local copy has none, or the
+/// stored copy's record when the local copy has not heard it.
+fn merged_open(local: Option<OpenPurchase>, stored: Option<&OpenPurchase>) -> Option<OpenPurchase> {
+    match (local, stored) {
+        (None, Some(stored)) => Some(stored.clone()),
+        (Some(mut local), Some(stored)) => {
+            local.reconcile = merged_state(
+                &local.reconcile,
+                &stored.reconcile,
+                local.rules == stored.rules,
+            );
+            Some(local)
+        }
+        (local, None) => local,
+    }
 }
 
 /// Note ids a copy records as no longer in its active notes, other than through
@@ -142,20 +210,21 @@ fn listed_gone(d: &WalletData) -> BTreeSet<String> {
     ids
 }
 
-/// Make one wallet of `local` and `stored`. Neither is changed.
-pub fn merge(local: &WalletData, stored: &WalletData) -> (WalletData, MergeReport) {
-    // Records of the removed `send-psp` (`sent`) are PSP handoff records first,
-    // in both copies, so that the rules below see them.
-    let (mut migrated_local, mut migrated_stored) = (local.clone(), stored.clone());
-    migrated_local.migrate_legacy();
-    migrated_stored.migrate_legacy();
-    let (local, stored) = (&migrated_local, &migrated_stored);
+/// Make one wallet of `local` and `stored`. Neither is changed. Crate-private
+/// on purpose: it does not look at the network, so an app goes through
+/// [`Wallet::merge_from`] or [`Wallet::merge_file`], which refuse another one.
+pub(crate) fn merge(local: &WalletData, stored: &WalletData) -> (WalletData, MergeReport) {
     let mut m = local.clone();
 
     // The ledgers first: everything else is decided by them.
     m.departed = max_counts(&local.departed, &stored.departed);
     m.returned = max_counts(&local.returned, &stored.returned);
     m.finished = local.finished.union(&stored.finished).cloned().collect();
+    m.reconciled = local
+        .reconciled
+        .union(&stored.reconciled)
+        .cloned()
+        .collect();
 
     // Handoffs this wallet made: a done one wins, a cancelled one (in
     // `finished`) is not brought back.
@@ -220,23 +289,23 @@ pub fn merge(local: &WalletData, stored: &WalletData) -> (WalletData, MergeRepor
     }
     m.notes = notes;
 
-    // Requests, once each, and none that has ended.
-    let skip = &m.finished;
+    // Requests, once each, and none that has ended or was reconciled.
+    let skip: BTreeSet<String> = m.finished.union(&m.reconciled).cloned().collect();
+    let skip = &skip;
     m.pending_purchases = union_list(
         &local.pending_purchases,
         &stored.pending_purchases,
         |p| p.id.clone(),
         skip,
     );
+    for p in &mut m.pending_purchases {
+        if let Some(other) = stored.pending_purchases.iter().find(|s| s.id == p.id) {
+            p.open = merged_open(p.open.take(), other.open.as_ref());
+        }
+    }
     m.pending_exchanges = union_list(
         &local.pending_exchanges,
         &stored.pending_exchanges,
-        |p| p.id.clone(),
-        skip,
-    );
-    m.pending_transfers = union_list(
-        &local.pending_transfers,
-        &stored.pending_transfers,
         |p| p.id.clone(),
         skip,
     );
@@ -329,12 +398,35 @@ pub fn merge(local: &WalletData, stored: &WalletData) -> (WalletData, MergeRepor
     // The one-off keys of purchases that may still be open: every one either copy
     // holds (a key is not an ongoing request, so `finished` does not drop it: a
     // claimed purchase is `finished` and its key is exactly what stays).
+    // Not a credit that either copy has claimed.
     m.open_replies = union_list(
         &local.open_replies,
         &stored.open_replies,
         |r| r.id.clone(),
-        &BTreeSet::new(),
+        &m.reconciled,
     );
+    for r in &mut m.open_replies {
+        if let Some(other) = stored.open_replies.iter().find(|s| s.id == r.id) {
+            r.reconcile = merged_state(&r.reconcile, &other.reconcile, r.rules == other.rules);
+        }
+    }
+    // The AIR request of a payment that is gone is gone with it. (The requests are
+    // this copy's own; the keys are the reply keys.)
+    let held: BTreeSet<&str> = m
+        .pending_purchases
+        .iter()
+        .map(|p| p.reply_secret.as_str())
+        .chain(m.open_replies.iter().map(|r| r.reply_secret.as_str()))
+        .collect();
+    let gone: BTreeSet<String> = local
+        .pending_purchases
+        .iter()
+        .map(|p| p.reply_secret.clone())
+        .chain(local.open_replies.iter().map(|r| r.reply_secret.clone()))
+        .filter(|key| !held.contains(key.as_str()))
+        .collect();
+    m.air_requests
+        .retain(|a| !(a.kind == sp_wire::air_request::KIND_PSP_RECONCILE && gone.contains(&a.r)));
     m.version = local.version.max(stored.version);
 
     let before = pending_request_ids(local, &local.handoffs_out);
@@ -357,8 +449,16 @@ impl Wallet {
     /// Merge a copy of this wallet retrieved from storage into this one and save
     /// the result (see the module documentation). The caller then stores
     /// [`Wallet::snapshot`] back. If the merge changes nothing, nothing is
-    /// written and the counter stays.
+    /// written and the counter stays. A copy of another network is refused
+    /// (`Invalid`, naming both networks) and this wallet is left as it is.
     pub fn merge_from(&mut self, stored: &WalletData) -> Result<MergeReport, WalletError> {
+        if stored.network != self.data().network {
+            return Err(WalletError::Invalid(format!(
+                "the copy to merge is a wallet of the {} network, but this wallet is on the {} network. Nothing was merged and this wallet is unchanged",
+                stored.network,
+                self.data().network
+            )));
+        }
         let (merged, report) = merge(self.data(), stored);
         let mut probe = merged.clone();
         probe.version = self.data().version;
@@ -377,10 +477,10 @@ impl Wallet {
     }
 
     /// As [`Wallet::merge_from`], with the stored copy read from a wallet file.
+    /// A file that records no network is refused (`Corrupt`), as on open.
     pub fn merge_file(&mut self, path: &std::path::Path) -> Result<MergeReport, WalletError> {
         let bytes = std::fs::read(path)?;
-        let stored: WalletData = serde_json::from_slice(&bytes)
-            .map_err(|e| WalletError::Corrupt(format!("{}: {e}", path.display())))?;
+        let stored = parse_wallet(&bytes, &path.display().to_string())?;
         self.merge_from(&stored)
     }
 }
@@ -389,10 +489,32 @@ impl Wallet {
 mod tests {
     use super::*;
     use crate::blind::PendingOutput;
-    use crate::store::{Kind, PendingPurchase};
+    use crate::error::expect;
+    use crate::store::{
+        Kind, OpenKind, OpenReply, PendingAirRequest, PendingPurchase, SavedRequest,
+    };
     use secp256k1::{SECP256K1, SecretKey};
+    use sp_wire::air_request::KIND_PSP_RECONCILE;
+    use sp_wire::air_request::delivery::{
+        FORFEIT_NOTICE, ReconcileRules, SEND_CORRECTED_REQUEST, SEND_CREDIT_CLAIM,
+    };
     use std::fs;
     use std::path::{Path, PathBuf};
+
+    /// A service's DID (the PSP, in these tests), as the wallet's records name it
+    /// in hex.
+    fn did_n(n: u8) -> sp_wire::ServiceDid {
+        sp_wire::ServiceDid::from(
+            SecretKey::from_slice(&[n; 32])
+                .unwrap()
+                .public_key(SECP256K1),
+        )
+    }
+
+    /// Open a wallet file of the test network.
+    fn open_wallet(path: &std::path::Path) -> Result<crate::Wallet, crate::WalletError> {
+        crate::Wallet::open(path, "regtest")
+    }
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("ecash-wallet-merge-{}-{name}", {
@@ -428,9 +550,85 @@ mod tests {
             reply_did: "02".repeat(33),
             mint_did_pubkey: "03".repeat(33),
             outputs: vec![PendingOutput::new(1)],
-            reply_secret: None,
-            delivery_id: None,
+            reply_secret: "ee".repeat(32),
+            delivery_id: "dd".repeat(32),
             open: None,
+        }
+    }
+
+    fn reconcile_rules(send: &str, due_units: u64) -> ReconcileRules {
+        ReconcileRules {
+            send: send.to_string(),
+            kind: KIND_PSP_RECONCILE,
+            due_units,
+            reconciliation_fee_units: 0,
+            read_prepaid_units: 0,
+            write_prepaid_units: 0,
+            open_until: 4_000_000_000,
+            max_attempts: 3,
+            on_failure: FORFEIT_NOTICE.to_string(),
+        }
+    }
+
+    fn saved(hash: &str) -> SavedRequest {
+        SavedRequest {
+            body: hex::encode(hash),
+            hash: hash.to_string(),
+            keyset: "0123456789abcdef".to_string(),
+            outputs: vec![PendingOutput::new(4)],
+        }
+    }
+
+    /// A purchase the PSP holds, with the request built for it (if any).
+    fn held_purchase(id: &str, request: Option<&str>, due_units: u64) -> PendingPurchase {
+        let mut p = purchase(id);
+        p.open = Some(OpenPurchase {
+            kind: OpenKind::Held,
+            reason: "the payment is short".into(),
+            paid_sats: 1_000,
+            paid_cents: 10,
+            requested_units: 5,
+            over_under_bps: -8_000,
+            open_until: 4_000_000_000,
+            rules: reconcile_rules(SEND_CORRECTED_REQUEST, due_units),
+            reconcile: ReconcileState {
+                request: request.map(saved),
+                attempts: u32::from(request.is_some()),
+                unanswered: false,
+                told_lost: false,
+            },
+        });
+        p
+    }
+
+    fn credit(id: &str, secret: &str, request: Option<&str>) -> OpenReply {
+        OpenReply {
+            id: id.into(),
+            delivery_id: "dd".repeat(32),
+            mint_did_pubkey: "03".repeat(33),
+            reply_secret: secret.repeat(32),
+            credit_cents: 94,
+            unaccounted_units: 0,
+            open_until: 4_000_000_000,
+            rules: Some(reconcile_rules(SEND_CREDIT_CLAIM, 9)),
+            reconcile: ReconcileState {
+                request: request.map(saved),
+                attempts: u32::from(request.is_some()),
+                unanswered: false,
+                told_lost: false,
+            },
+        }
+    }
+
+    fn air_request(secret: &str) -> PendingAirRequest {
+        PendingAirRequest {
+            kind: KIND_PSP_RECONCILE,
+            request_id: "11".repeat(32),
+            mint: "03".repeat(33),
+            r: secret.repeat(32),
+            slots: vec![],
+            created_at: 1,
+            body_hash: "aa".repeat(32),
         }
     }
 
@@ -461,7 +659,7 @@ mod tests {
     /// Two copies of one wallet that began alike: `local` and `stored`. Both
     /// held `a`, `b`, `c`.
     fn diverged(dir: &Path) -> (Wallet, Wallet, [StoredNote; 3]) {
-        let mut base = Wallet::open(&dir.join("base.json")).unwrap();
+        let mut base = open_wallet(&dir.join("base.json")).unwrap();
         let notes = [note(4), note(2), note(1)];
         for n in &notes {
             add(&mut base, n);
@@ -469,24 +667,71 @@ mod tests {
         fs::copy(base.path(), dir.join("local.json")).unwrap();
         fs::copy(base.path(), dir.join("stored.json")).unwrap();
         (
-            Wallet::open(&dir.join("local.json")).unwrap(),
-            Wallet::open(&dir.join("stored.json")).unwrap(),
+            open_wallet(&dir.join("local.json")).unwrap(),
+            open_wallet(&dir.join("stored.json")).unwrap(),
             notes,
         )
     }
 
     #[test]
+    fn a_copy_of_another_network_is_refused_and_the_wallet_is_unchanged() {
+        let dir = scratch("network");
+        let mut w = open_wallet(&dir.join("w.json")).unwrap();
+        add(&mut w, &note(4));
+        let mut other = crate::Wallet::open(&dir.join("signet.json"), "signet").unwrap();
+        add(&mut other, &note(2));
+        let (file, kept) = (fs::read(w.path()).unwrap(), w.snapshot());
+
+        // The copy itself, and the file it was saved to, are refused naming both.
+        let want = "the copy to merge is a wallet of the signet network, but this wallet is on the regtest network. Nothing was merged and this wallet is unchanged";
+        assert_eq!(expect::invalid(w.merge_from(&other.snapshot())), want);
+        assert_eq!(expect::invalid(w.merge_file(other.path())), want);
+        assert_eq!(fs::read(w.path()).unwrap(), file, "nothing was written");
+        assert_eq!(
+            serde_json::to_value(w.snapshot()).unwrap(),
+            serde_json::to_value(&kept).unwrap()
+        );
+        assert_eq!(w.version(), kept.version);
+
+        // A file with no network (what a pre-release version wrote) is refused
+        // with what to do, and nothing is written.
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(w.path()).unwrap()).unwrap();
+        value.as_object_mut().unwrap().remove("network");
+        let old = dir.join("old.json");
+        fs::write(&old, serde_json::to_vec(&value).unwrap()).unwrap();
+        match w.merge_file(&old) {
+            Err(WalletError::Corrupt(why)) => {
+                assert!(why.contains(&old.display().to_string()), "{why}");
+                assert!(why.contains("it records no network"), "{why}");
+                assert!(why.contains("Start a new wallet file"), "{why}");
+            }
+            other => panic!("expected the file to be refused, got {other:?}"),
+        }
+        assert_eq!(fs::read(w.path()).unwrap(), file, "nothing was written");
+
+        // A copy of its own network still merges.
+        let mut same = open_wallet(&dir.join("same.json")).unwrap();
+        add(&mut same, &note(2));
+        assert_eq!(w.merge_from(&same.snapshot()).unwrap().notes_added, 1);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn the_version_goes_up_with_every_write() {
         let dir = scratch("version");
-        let mut w = Wallet::open(&dir.join("w.json")).unwrap();
+        let mut w = open_wallet(&dir.join("w.json")).unwrap();
         assert_eq!(w.version(), 0);
         add(&mut w, &note(1));
         assert_eq!(w.version(), 1);
         add(&mut w, &note(2));
         assert_eq!(w.version(), 2);
-        assert_eq!(Wallet::open(w.path()).unwrap().version(), 2);
+        assert_eq!(open_wallet(w.path()).unwrap().version(), 2);
         // a failed change does not count
-        let _ = w.update(|_| -> Result<(), WalletError> { Err(WalletError::Invalid("no".into())) });
+        let e = expect::invalid(
+            w.update(|_| -> Result<(), WalletError> { Err(WalletError::Invalid("no".into())) }),
+        );
+        assert_eq!(e, "no");
         assert_eq!(w.version(), 2);
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -516,13 +761,13 @@ mod tests {
         assert!(!local.data().keysets.contains_key(&b.id()));
         assert!(!local.data().keysets.contains_key(&c.id()));
         // saved: a reopen gives the same wallet
-        assert_eq!(ids(&Wallet::open(local.path()).unwrap()), want);
+        assert_eq!(ids(&open_wallet(local.path()).unwrap()), want);
 
         // the other direction gives the same notes
-        let mut other = Wallet::open(&dir.join("stored.json")).unwrap();
+        let mut other = open_wallet(&dir.join("stored.json")).unwrap();
         let before_local = {
             // rebuild the local copy as it was: a, c, d (b spent)
-            let mut w = Wallet::open(&dir.join("local2.json")).unwrap();
+            let mut w = open_wallet(&dir.join("local2.json")).unwrap();
             for n in [&a, &c, &d] {
                 add(&mut w, n);
             }
@@ -557,12 +802,12 @@ mod tests {
     fn the_starter_notes_of_a_new_device_are_united_with_the_stored_wallet() {
         let dir = scratch("newdevice");
         // the stored wallet holds the real value; the new device only the starters
-        let mut stored = Wallet::open(&dir.join("stored.json")).unwrap();
+        let mut stored = open_wallet(&dir.join("stored.json")).unwrap();
         let stored_notes = [note(64), note(32), note(8)];
         for n in &stored_notes {
             add(&mut stored, n);
         }
-        let mut local = Wallet::open(&dir.join("local.json")).unwrap();
+        let mut local = open_wallet(&dir.join("local.json")).unwrap();
         let starters = [note(2), note(1)];
         for n in &starters {
             add(&mut local, n);
@@ -680,7 +925,7 @@ mod tests {
             .unwrap()
             .public_key();
         let out = local
-            .export_psp_handoff(std::slice::from_ref(&aid), "http://m", &to)
+            .export_psp_handoff(std::slice::from_ref(&aid), did_n(9), &to)
             .unwrap();
         local.merge_from(&stored.snapshot()).unwrap();
         assert!(
@@ -704,7 +949,7 @@ mod tests {
             .unwrap()
             .public_key();
         let out = local
-            .export_psp_handoff(std::slice::from_ref(&aid), "http://m", &to)
+            .export_psp_handoff(std::slice::from_ref(&aid), did_n(9), &to)
             .unwrap();
         local.finish_handoff(&out.id).unwrap();
         local.merge_from(&stored.snapshot()).unwrap();
@@ -720,7 +965,7 @@ mod tests {
             .unwrap()
             .public_key();
         let first = local.notes()[0].id();
-        let out = local.export_psp_handoff(&[first], "http://m", &to).unwrap();
+        let out = local.export_psp_handoff(&[first], did_n(9), &to).unwrap();
         // the stored copy learns of it as pending, then local finishes it
         stored.merge_from(&local.snapshot()).unwrap();
         assert_eq!(stored.handoffs_out()[0].state, HandoffState::Pending);
@@ -764,26 +1009,28 @@ mod tests {
     fn keys_and_mints_are_united_and_the_local_entry_wins() {
         let dir = scratch("maps");
         let (mut local, mut stored, _) = diverged(&dir);
+        let m = crate::fsp::record_of(did_n(9));
+        let n = crate::fsp::record_of(did_n(8));
         local
             .update(|d| {
                 d.live_keysets
-                    .insert("http://m".into(), ("aaaaaaaaaaaaaaaa".into(), None));
+                    .insert(m.clone(), ("aaaaaaaaaaaaaaaa".into(), None));
                 Ok(())
             })
             .unwrap();
         stored
             .update(|d| {
                 d.live_keysets
-                    .insert("http://m".into(), ("bbbbbbbbbbbbbbbb".into(), None));
+                    .insert(m.clone(), ("bbbbbbbbbbbbbbbb".into(), None));
                 d.live_keysets
-                    .insert("http://n".into(), ("cccccccccccccccc".into(), None));
+                    .insert(n.clone(), ("cccccccccccccccc".into(), None));
                 Ok(())
             })
             .unwrap();
         local.merge_from(&stored.snapshot()).unwrap();
         let live = &local.data().live_keysets;
-        assert_eq!(live["http://m"].0, "aaaaaaaaaaaaaaaa");
-        assert_eq!(live["http://n"].0, "cccccccccccccccc");
+        assert_eq!(live[&m].0, "aaaaaaaaaaaaaaaa");
+        assert_eq!(live[&n].0, "cccccccccccccccc");
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -800,6 +1047,8 @@ mod tests {
             credit_cents: 10,
             unaccounted_units: 0,
             open_until: 4_000_000_000,
+            rules: Some(reconcile_rules(SEND_CREDIT_CLAIM, 1)),
+            reconcile: ReconcileState::default(),
         };
         local
             .update(|d| {
@@ -825,7 +1074,7 @@ mod tests {
     #[test]
     fn the_tracking_counts_each_departure_and_each_return() {
         let dir = scratch("track");
-        let mut w = Wallet::open(&dir.join("w.json")).unwrap();
+        let mut w = open_wallet(&dir.join("w.json")).unwrap();
         let n = note(4);
         let id = n.id();
         add(&mut w, &n);
@@ -859,5 +1108,214 @@ mod tests {
         .unwrap();
         assert!(!w.data().finished.contains("x"));
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn request_of(w: &Wallet, id: &str) -> Option<String> {
+        let from_purchase = w
+            .pending_purchases()
+            .iter()
+            .find(|p| p.id == id)
+            .and_then(|p| p.open.as_ref())
+            .and_then(|o| o.reconcile.request.as_ref());
+        let from_credit = w
+            .open_replies()
+            .iter()
+            .find(|r| r.id == id)
+            .and_then(|r| r.reconcile.request.as_ref());
+        from_purchase.or(from_credit).map(|r| r.hash.clone())
+    }
+
+    #[test]
+    fn a_saved_request_travels_with_its_payment_and_the_local_one_is_kept_when_both_have_one() {
+        let dir = scratch("saved-request");
+        let (mut local, mut stored, _) = diverged(&dir);
+        local
+            .update(|d| {
+                d.pending_purchases
+                    .push(held_purchase("only-stored-has-it", None, 5));
+                d.pending_purchases
+                    .push(held_purchase("both", Some("local-hash"), 5));
+                d.pending_purchases
+                    .push(held_purchase("other-rules", Some("local-hash"), 5));
+                let mut told = held_purchase("told", None, 5);
+                told.open.as_mut().unwrap().reconcile.told_lost = true;
+                d.pending_purchases.push(told);
+                // this copy has not heard the PSP's record of this one
+                d.pending_purchases.push(purchase("unheard"));
+                d.open_replies.push(credit("credit", "cc", None));
+                Ok(())
+            })
+            .unwrap();
+        stored
+            .update(|d| {
+                d.pending_purchases.push(held_purchase(
+                    "only-stored-has-it",
+                    Some("stored-hash"),
+                    5,
+                ));
+                d.pending_purchases
+                    .push(held_purchase("both", Some("stored-hash"), 5));
+                d.pending_purchases
+                    .push(held_purchase("other-rules", Some("stored-hash"), 6));
+                d.pending_purchases.push(held_purchase("told", None, 5));
+                d.pending_purchases
+                    .push(held_purchase("unheard", Some("stored-hash"), 5));
+                d.pending_purchases
+                    .push(held_purchase("new-here", Some("stored-hash"), 5));
+                d.open_replies
+                    .push(credit("credit", "cc", Some("stored-hash")));
+                Ok(())
+            })
+            .unwrap();
+        local.merge_from(&stored.snapshot()).unwrap();
+
+        // the stored copy's request comes to the copy that had none
+        assert_eq!(
+            request_of(&local, "only-stored-has-it").as_deref(),
+            Some("stored-hash")
+        );
+        let adopted = local
+            .pending_purchases()
+            .iter()
+            .find(|p| p.id == "only-stored-has-it")
+            .unwrap()
+            .open
+            .as_ref()
+            .unwrap()
+            .reconcile
+            .clone();
+        assert_eq!(adopted.attempts, 1, "with its count");
+        // where both have one, this copy's is kept
+        assert_eq!(request_of(&local, "both").as_deref(), Some("local-hash"));
+        // another record of the PSP (other rules): this copy's, whole
+        assert_eq!(
+            request_of(&local, "other-rules").as_deref(),
+            Some("local-hash")
+        );
+        let kept = local
+            .pending_purchases()
+            .iter()
+            .find(|p| p.id == "other-rules")
+            .unwrap();
+        assert_eq!(kept.open.as_ref().unwrap().rules.due_units, 5);
+        // a payment this copy had not heard of, and the request built for it
+        assert_eq!(
+            request_of(&local, "unheard").as_deref(),
+            Some("stored-hash")
+        );
+        assert_eq!(
+            request_of(&local, "new-here").as_deref(),
+            Some("stored-hash")
+        );
+        // a credit's request travels too
+        assert_eq!(request_of(&local, "credit").as_deref(), Some("stored-hash"));
+        // "the user was told" is or-ed
+        let told = local
+            .pending_purchases()
+            .iter()
+            .find(|p| p.id == "told")
+            .unwrap();
+        assert!(told.open.as_ref().unwrap().reconcile.told_lost);
+
+        // merging the result again changes nothing
+        let version = local.version();
+        local.merge_from(&stored.snapshot()).unwrap();
+        assert_eq!(local.version(), version);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_payment_reconciled_in_either_copy_is_never_brought_back() {
+        let dir = scratch("reconciled");
+        let (mut local, mut stored, _) = diverged(&dir);
+        for w in [&mut local, &mut stored] {
+            w.update(|d| {
+                d.pending_purchases
+                    .push(held_purchase("held", Some("h"), 5));
+                d.pending_purchases
+                    .push(held_purchase("kept", Some("h"), 5));
+                d.open_replies.push(credit("credit", "cc", Some("h")));
+                d.open_replies.push(credit("still", "dd", None));
+                Ok(())
+            })
+            .unwrap();
+        }
+        // this copy reconciled the purchase and the credit
+        local
+            .update(|d| {
+                d.pending_purchases.retain(|p| p.id != "held");
+                d.open_replies.retain(|r| r.id != "credit");
+                d.reconciled.insert("held".into());
+                d.reconciled.insert("credit".into());
+                Ok(())
+            })
+            .unwrap();
+        // the stored copy has not heard: its payments are still open
+        let report = local.merge_from(&stored.snapshot()).unwrap();
+        let ids: Vec<&str> = local
+            .pending_purchases()
+            .iter()
+            .map(|p| p.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["kept"], "the purchase is not brought back");
+        let replies: Vec<&str> = local.open_replies().iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(replies, vec!["still"], "nor is the credit");
+        assert!(
+            local.pending_psp_credit(0).balance_line().is_some(),
+            "the one still owed"
+        );
+        assert_eq!(report.requests_added, 0);
+        assert!(
+            local.data().reconciled.contains("held") && local.data().reconciled.contains("credit")
+        );
+
+        // the other way: the stored copy reconciled, this one is behind
+        let dir2 = scratch("reconciled-2");
+        let (mut behind, mut ahead, _) = diverged(&dir2);
+        for w in [&mut behind, &mut ahead] {
+            w.update(|d| {
+                d.pending_purchases
+                    .push(held_purchase("held", Some("h"), 5));
+                d.open_replies.push(credit("credit", "cc", Some("h")));
+                Ok(())
+            })
+            .unwrap();
+        }
+        behind
+            .update(|d| {
+                d.air_requests.push(air_request("ee"));
+                d.air_requests.push(air_request("cc"));
+                d.air_requests.push(air_request("ff"));
+                Ok(())
+            })
+            .unwrap();
+        ahead
+            .update(|d| {
+                d.pending_purchases.clear();
+                d.open_replies.clear();
+                d.reconciled.insert("held".into());
+                d.reconciled.insert("credit".into());
+                Ok(())
+            })
+            .unwrap();
+        let report = behind.merge_from(&ahead.snapshot()).unwrap();
+        assert!(behind.pending_purchases().is_empty());
+        assert!(behind.open_replies().is_empty());
+        assert_eq!(
+            behind.pending_psp_credit(0).balance_line(),
+            None,
+            "the pending line is gone"
+        );
+        assert_eq!(report.requests_dropped, 1);
+        // the AIR requests of the two payments went with them; another stays
+        let keys: Vec<&str> = behind.air_requests().iter().map(|a| a.r.as_str()).collect();
+        let other = "ff".repeat(32);
+        assert_eq!(keys, vec![other.as_str()]);
+        // and it stays gone on a second merge, which changes nothing
+        let version = behind.version();
+        behind.merge_from(&ahead.snapshot()).unwrap();
+        assert_eq!(behind.version(), version);
+        fs::remove_dir_all(&dir).unwrap();
+        fs::remove_dir_all(&dir2).unwrap();
     }
 }

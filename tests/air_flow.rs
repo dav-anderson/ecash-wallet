@@ -17,9 +17,11 @@
 //! built only with the `air-listener-tests` feature (the local-mints script
 //! turns on every feature).
 
+mod common;
+
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -31,61 +33,22 @@ use ecash_wallet::mint_info::{
 };
 use ecash_wallet::store::{PendingAirRequest, StoredNote, WalletData};
 use ecash_wallet::{Kind, Wallet, WalletError};
-use mint_server::state::AppState;
-use mint_types::{Amount, BlindNonce, MintInput, MintOutput, Nonce, Note, transaction_sighash};
+use mint_types::{Amount, BlindNonce, MintInput, MintOutput, Nonce, transaction_sighash};
 use psp_mint::air_listener::{self, Serve, Settings};
-use psp_mint::rotation::{Rollovers, Rotor};
-use psp_mint::server::{Health, Limits, Rotating, SharedRotating};
+use psp_mint::server::Limits;
 use rand::rngs::OsRng;
 use secp256k1::{Keypair, SECP256K1};
 use sp_wire::air_request::addr::{self, reply_secret, seal_to, shared_wallet};
 use sp_wire::air_request::client::{self, ServerRef, block_on_new_runtime};
 use sp_wire::air_request::envelope::{STATUS_ANSWERED, WireRequest, build_reply};
-use sp_wire::air_request::{KIND_KEYS, KIND_MINT_INFO, MintInfo, local_server};
+use sp_wire::air_request::{KIND_KEYS, KIND_MINT_INFO, MintInfo};
 use sp_wire::seal::SecretKey;
 use sp_wire::{ServiceDid, WIRE_VERSION};
 
+use common::air::{server, slot_is_empty, wait_for_slot};
+use common::{PspMint, T0 as T, psp_record, scratch};
+
 const NETWORK: &str = "regtest";
-
-fn scratch(name: &str) -> PathBuf {
-    static N: AtomicU64 = AtomicU64::new(0);
-    let dir = std::env::temp_dir().join(format!(
-        "ecash-wallet-airflow-{}-{name}-{}",
-        std::process::id(),
-        N.fetch_add(1, Ordering::Relaxed)
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
-/// One test at a time on the shared AIR server. It has a single storage worker,
-/// so tests running in parallel starve each other past their timeouts.
-static AIR_TURN: Mutex<()> = Mutex::new(());
-
-/// The shared server plus this test's turn on it; the turn ends when this drops,
-/// whether the test passed, failed or panicked.
-struct Server {
-    server: ServerRef,
-    _turn: std::sync::MutexGuard<'static, ()>,
-}
-
-impl std::ops::Deref for Server {
-    type Target = ServerRef;
-
-    fn deref(&self) -> &ServerRef {
-        &self.server
-    }
-}
-
-fn server() -> Server {
-    let turn = AIR_TURN.lock().unwrap_or_else(|e| e.into_inner());
-    let server = local_server::start().expect("a local AIR server (is port 5702 free?)");
-    Server {
-        server,
-        _turn: turn,
-    }
-}
 
 fn mint_key() -> (SecretKey, ServiceDid) {
     let key = SecretKey::new();
@@ -106,25 +69,15 @@ fn air_settings(server: &ServerRef, did: &ServiceDid, wait: u64, attempts: u32) 
 
 type Info = Arc<dyn Fn() -> MintInfo + Send + Sync>;
 
-/// A PSP's state as `serve` builds it: the mint, the health report, and the
-/// closure the listener answers from.
-struct Psp {
-    health: Arc<Health>,
-    info: Info,
+/// A PSP mint (the shared fixture), in `dir`.
+fn psp(dir: &PathBuf) -> PspMint {
+    PspMint::open(dir)
 }
 
-fn psp(dir: &PathBuf) -> Psp {
-    let logic = psp_mint::mint::open(dir, Amount::from_units(1024)).unwrap();
-    let state = psp_mint::server::app_state(logic);
-    let health = Health::for_network(100, NETWORK);
-    health.record_scan_at(psp_mint::server::now_secs());
-    let for_info = Arc::clone(&health);
-    Psp {
-        health,
-        info: Arc::new(move || {
-            for_info.mint_info(state.logic.is_poisoned(), psp_mint::server::now_secs())
-        }),
-    }
+/// What the mint info reads of `psp`: its health report, as `serve` answers it.
+fn info_of(psp: &PspMint) -> Info {
+    let (state, health) = (Arc::clone(&psp.state), Arc::clone(&psp.health));
+    Arc::new(move || health.mint_info(state.logic.is_poisoned(), psp_mint::server::now_secs()))
 }
 
 /// The listener on a thread of its own, as `serve` runs it. Dropping it stops it.
@@ -229,7 +182,7 @@ fn put(server: &ServerRef, key: &SecretKey, bytes: Vec<u8>) {
 }
 
 fn open_wallet(dir: &PathBuf) -> Wallet {
-    Wallet::open(&dir.join("wallet.json")).unwrap()
+    common::open_wallet(&dir.join("wallet.json")).unwrap()
 }
 
 /// A wallet file that already holds a request in flight for `did`, as if an
@@ -260,6 +213,7 @@ fn wallet_with_kind(
         body_hash: String::new(),
     };
     let data = WalletData {
+        network: common::NETWORK.into(),
         air_requests: vec![pending.clone()],
         ..Default::default()
     };
@@ -307,7 +261,7 @@ fn verify_mint_goes_over_air_to_psp_mints_listener_and_leaves_nothing_pending() 
     let dir = scratch("happy");
     let psp = psp(&dir.join("psp"));
     let state_dir = scratch("happy-state");
-    let listener = start_listener(&server, &key, &state_dir, Arc::clone(&psp.info));
+    let listener = start_listener(&server, &key, &state_dir, info_of(&psp));
 
     let mut wallet = open_wallet(&dir);
     let air = air_settings(&server, &did, 10, 3);
@@ -328,7 +282,7 @@ fn a_psp_on_another_network_is_refused_over_air() {
     let dir = scratch("network");
     let psp = psp(&dir.join("psp"));
     let state_dir = scratch("network-state");
-    let listener = start_listener(&server, &key, &state_dir, psp.info);
+    let listener = start_listener(&server, &key, &state_dir, info_of(&psp));
 
     let mut wallet = open_wallet(&dir);
     let air = air_settings(&server, &did, 10, 3);
@@ -369,15 +323,13 @@ fn an_unanswered_request_is_kept_and_a_late_reply_is_picked_up_by_the_next_call(
 
     // The PSP starts, reads its slot 0 and answers. The wallet's next call
     // carries on with the same request: it finds the reply, and writes nothing.
-    let listener = start_listener(&server, &key, &state_dir, psp.info);
+    let listener = start_listener(&server, &key, &state_dir, info_of(&psp));
     wait_for_next(&state_dir, 1);
     verify_psp(&mut wallet, &air, NETWORK).unwrap();
     assert!(wallet.air_requests().is_empty());
     assert!(open_wallet(&dir).air_requests().is_empty());
-    thread::sleep(Duration::from_millis(500));
-    assert_eq!(
-        air_listener::read_next(&state_dir).unwrap(),
-        1,
+    assert!(
+        slot_is_empty(&server, &did, 1),
         "no second request was written"
     );
     listener.stop().unwrap();
@@ -402,7 +354,7 @@ fn a_reply_found_long_after_it_was_issued_is_dropped_and_a_new_request_is_made()
     );
     plant_reply(&server, &did, &pending, &old);
 
-    let listener = start_listener(&server, &key, &state_dir, psp.info);
+    let listener = start_listener(&server, &key, &state_dir, info_of(&psp));
     let air = air_settings(&server, &did, 10, 3);
     verify_psp(&mut wallet, &air, NETWORK).unwrap();
     assert!(wallet.air_requests().is_empty());
@@ -454,7 +406,7 @@ fn the_psp_dying_before_it_replies_costs_a_retry_and_ends_with_one_reply() {
     let state_dir = scratch("dies-state");
 
     let armed = Arc::new(AtomicBool::new(true));
-    let live = Arc::clone(&psp.info);
+    let live = info_of(&psp);
     let dying: Info = {
         let armed = Arc::clone(&armed);
         Arc::new(move || {
@@ -480,8 +432,11 @@ fn the_psp_dying_before_it_replies_costs_a_retry_and_ends_with_one_reply() {
         "the first listener should have died"
     );
 
-    thread::sleep(Duration::from_secs(4));
-    let second = start_listener(&server, &key, &state_dir, psp.info);
+    // The wallet's first try goes into slot 0, which the dying listener did not
+    // answer; after three seconds its retry goes into slot 1. Start the second
+    // listener once the retry is there.
+    wait_for_slot(&server, &did, 1);
+    let second = start_listener(&server, &key, &state_dir, info_of(&psp));
     let (result, pending) = wallet_thread.join().unwrap();
     result.unwrap();
     assert!(pending.is_empty());
@@ -521,7 +476,7 @@ fn without_air_server_and_host_no_call_to_the_psp_is_made_and_the_error_names_th
         Err(WalletError::Invalid(why)) => named_both(&why),
         other => panic!("expected the missing settings to be named, got {other:?}"),
     }
-    match rotation_sync(&mut wallet, &none, Kind::Psp, RECORD) {
+    match rotation_sync(&mut wallet, &none, Kind::Psp, &psp_record(&none)) {
         Err(WalletError::Invalid(why)) => named_both(&why),
         other => panic!("expected the missing settings to be named, got {other:?}"),
     }
@@ -547,116 +502,14 @@ fn without_air_server_and_host_no_call_to_the_psp_is_made_and_the_error_names_th
 // ---------------------------------------------------------------- keys, keysets, rotation
 
 /// A real rotating PSP (a manual clock, so the rotation window does not move
-/// between two calls), answering through `air_served`, the `serve` psp-mint runs.
-struct RealPsp {
-    state: Arc<AppState>,
-    rot: SharedRotating,
-    health: Arc<Health>,
-    limits: Limits,
+/// between two calls), answering through `air_served_with`, the `serve` psp-mint
+/// runs.
+fn real_psp(dir: &PathBuf) -> PspMint {
+    PspMint::open_at(&dir.join("psp"), T)
 }
 
-fn real_psp(dir: &PathBuf) -> RealPsp {
-    real_psp_with(dir, Limits::default())
-}
-
-fn real_psp_with(dir: &PathBuf, limits: Limits) -> RealPsp {
-    let (rotor, logic) = Rotor::open_at(
-        &dir.join("psp"),
-        Amount::from_units(1024),
-        1,
-        1,
-        1_800_000_000,
-    )
-    .unwrap();
-    let rot = Rotating::new(rotor, Rollovers::open(&dir.join("psp")).unwrap());
-    let state = psp_mint::server::app_state(logic);
-    let health = Health::for_network(100, NETWORK);
-    health.record_scan_at(psp_mint::server::now_secs());
-    RealPsp {
-        state,
-        rot,
-        health,
-        limits,
-    }
-}
-
-impl RealPsp {
-    /// The ID of the keyset the PSP signs with now (the mint's own, not asked
-    /// over AIR).
-    fn current_keyset(&self) -> String {
-        psp_mint::rotation::keyset_id(self.state.logic.lock().unwrap().public_keys())
-    }
-
-    /// What the PSP's listener answers: the same `serve` psp-mint runs.
-    fn serve(&self) -> Arc<Serve> {
-        let (state, rot, health, limits) = (
-            Arc::clone(&self.state),
-            Arc::clone(&self.rot),
-            Arc::clone(&self.health),
-            self.limits,
-        );
-        Arc::new(move |kind, body: &[u8]| {
-            psp_mint::server::air_served(&state, &rot, &health, &limits, kind, body)
-        })
-    }
-
-    fn set_clock(&self, t: u64) {
-        self.rot
-            .rotor
-            .lock()
-            .unwrap()
-            .clock
-            .store(t, Ordering::SeqCst);
-    }
-
-    /// A note of `units` the PSP issued, as the wallet stores it.
-    fn note(&self, units: u64) -> StoredNote {
-        let kp = Keypair::new(SECP256K1, &mut OsRng);
-        let nonce = Nonce(kp.public_key());
-        let (b, r) = bdhke::blind_message(&nonce.as_hash_preimage(), None);
-        let amount = Amount::from_units(units);
-        let logic = self.state.logic.lock().unwrap();
-        let out = logic
-            .issue(&MintOutput {
-                amount,
-                blind_nonce: BlindNonce(b),
-            })
-            .unwrap();
-        StoredNote {
-            kind: Kind::Psp,
-            amount: units,
-            note: Note {
-                nonce,
-                signature: bdhke::unblind_message(&out.0, &r, &logic.public_keys()[&amount]),
-            },
-            spend_secret: kp.secret_key(),
-            terms: None,
-            reserved_by: None,
-        }
-    }
-
-    fn spent(&self, n: &StoredNote) -> bool {
-        let logic = self.state.logic.lock().unwrap();
-        let rotor = self.rot.rotor.lock().unwrap();
-        logic.is_spent(n.note.nonce).unwrap()
-            || rotor
-                .previous
-                .as_ref()
-                .is_some_and(|(_, l)| l.is_spent(n.note.nonce).unwrap())
-    }
-}
-
-/// A wallet file that holds `notes`, signed by the PSP's keyset now.
-fn wallet_with_notes(psp: &RealPsp, dir: &PathBuf, name: &str, notes: Vec<StoredNote>) -> Wallet {
-    let path = dir.join(format!("{name}.json"));
-    let ks = psp_mint::rotation::keyset_id(psp.state.logic.lock().unwrap().public_keys());
-    let data = WalletData {
-        keysets: notes.iter().map(|n| (n.id(), ks.clone())).collect(),
-        notes,
-        ..Default::default()
-    };
-    std::fs::write(&path, serde_json::to_vec(&data).unwrap()).unwrap();
-    Wallet::open(&path).unwrap()
+fn real_psp_with(dir: &PathBuf, limits: Limits) -> PspMint {
+    PspMint::open_with(&dir.join("psp"), T, limits)
 }
 
 fn psp_total(w: &Wallet) -> u64 {
@@ -719,14 +572,9 @@ fn check_body(notes: &[StoredNote]) -> Vec<u8> {
     .unwrap()
 }
 
-const T: u64 = 1_800_000_000;
 const H: u64 = 3600;
 /// Past the stagger window of a 1-hour period.
 const LATER: u64 = 100;
-
-/// What the wallet's records call the PSP (a key for its live keysets and swap
-/// times, and the mint a handoff names). Nothing dials it.
-const RECORD: &str = "http://127.0.0.1:3000";
 
 #[test]
 fn keys_keysets_rotation_limits_and_claim_keys_over_air_are_the_mints_own() {
@@ -752,7 +600,7 @@ fn keys_keysets_rotation_limits_and_claim_keys_over_air_are_the_mints_own() {
     }
 
     let keysets = psp_keysets(&mut wallet, &air).unwrap();
-    assert_eq!(keysets.current, psp.current_keyset());
+    assert_eq!(keysets.current, psp.keyset());
     assert!(keysets.keysets.contains_key(&keysets.current));
 
     let window = psp_window(&mut wallet, &air).unwrap();
@@ -768,7 +616,7 @@ fn keys_keysets_rotation_limits_and_claim_keys_over_air_are_the_mints_own() {
 
     // The rotation sync reads the window over AIR; a wallet with no PSP notes has
     // nothing to roll over.
-    let log = rotation_sync(&mut wallet, &air, Kind::Psp, RECORD).unwrap();
+    let log = rotation_sync(&mut wallet, &air, Kind::Psp, &psp_record(&air)).unwrap();
     assert!(log.is_empty(), "{log:?}");
 
     assert!(
@@ -813,8 +661,10 @@ fn a_kept_request_is_resumed_by_a_call_of_its_own_kind_only() {
     assert!(!psp_keys(&mut wallet, &air).unwrap().is_empty());
     let left = wallet.air_requests().to_vec();
     assert_eq!(left, vec![info_request], "only the keys request ended");
-    thread::sleep(Duration::from_millis(500));
-    assert_eq!(air_listener::read_next(&state_dir).unwrap(), 1);
+    assert!(
+        slot_is_empty(&server, &did, 1),
+        "the resumed call wrote nothing"
+    );
     listener.stop().unwrap();
 }
 
@@ -824,7 +674,11 @@ fn a_tampered_keys_reply_is_refused_and_a_signed_body_that_is_not_keys_is_too() 
     let (key, did) = mint_key();
     let dir = scratch("keys-tamper");
     let air = air_settings(&server, &did, 5, 1);
-    let honest = b"{\"keys\":{}}";
+    let honest = serde_json::to_vec(&sp_wire::keys::KeysResponse {
+        keys: Default::default(),
+    })
+    .unwrap();
+    let honest = honest.as_slice();
 
     // The control: the honest reply, planted for a kept keys request, is accepted.
     let (mut wallet, pending) = wallet_with_kind(&dir, &did, vec![0], KIND_KEYS);
@@ -906,22 +760,39 @@ fn a_psp_that_cannot_answer_says_so_at_once() {
     let psp = real_psp(&dir);
     let state_dir = scratch("unavailable-state");
     let listener = start_serving(&server, &key, &state_dir, psp.serve());
+    let a = psp.note(1);
+    let mut wallet = psp.wallet(&dir, "w", vec![a.clone()]);
+    let body = rollover_body(&[a], &psp.keyset());
 
     // The mint lock is poisoned: the mint cannot answer (a 5xx, "unavailable").
     let state = Arc::clone(&psp.state);
-    let _ = thread::spawn(move || {
+    let poisoner = thread::spawn(move || {
         let _held = state.logic.lock().unwrap();
         panic!("poisoning the mint lock on purpose");
-    })
-    .join();
+    });
+    assert!(
+        poisoner.join().is_err(),
+        "the thread panicked holding the mint lock"
+    );
 
-    let mut wallet = open_wallet(&dir);
-    // Three tries of ten seconds: it must not take them.
+    // Three tries of ten seconds: neither a read nor a rollover may take them.
     let air = air_settings(&server, &did, 10, 3);
     let started = Instant::now();
     match psp_keys(&mut wallet, &air) {
         Err(WalletError::Mint(why)) => {
             assert!(why.contains("could not answer keys now"), "{why}")
+        }
+        other => panic!("expected an unavailable PSP, got {other:?}"),
+    }
+    assert!(started.elapsed() < Duration::from_secs(9));
+    assert!(wallet.air_requests().is_empty());
+
+    // The same for a rollover. Not a refusal: the rollover is not cancelled, and
+    // the next call may retry.
+    let started = Instant::now();
+    match psp_post(&mut wallet, &air, "rollover", &body) {
+        Err(WalletError::Mint(why)) => {
+            assert!(why.contains("could not answer rollover now"), "{why}")
         }
         other => panic!("expected an unavailable PSP, got {other:?}"),
     }
@@ -943,16 +814,16 @@ fn a_rotation_rollover_goes_over_air_and_ends_with_the_notes_on_the_new_keyset()
     let air = air_settings(&server, &did, 10, 3);
 
     let (a, b) = (psp.note(4), psp.note(1));
-    let mut w = wallet_with_notes(&psp, &dir, "air", vec![a.clone(), b.clone()]);
+    let mut w = psp.wallet(&dir, "air", vec![a.clone(), b.clone()]);
     assert!(
-        rotation_sync(&mut w, &air, Kind::Psp, RECORD)
+        rotation_sync(&mut w, &air, Kind::Psp, &psp_record(&air))
             .unwrap()
             .is_empty()
     );
     psp.set_clock(T + H);
-    rotation_sync(&mut w, &air, Kind::Psp, RECORD).unwrap(); // draws the swap time
+    rotation_sync(&mut w, &air, Kind::Psp, &psp_record(&air)).unwrap(); // draws the swap time
     psp.set_clock(T + H + LATER);
-    let air_log = rotation_sync(&mut w, &air, Kind::Psp, RECORD).unwrap();
+    let air_log = rotation_sync(&mut w, &air, Kind::Psp, &psp_record(&air)).unwrap();
     assert!(
         air_log.iter().any(|l| l.contains("rolled over 2 note(s)")),
         "{air_log:?}"
@@ -975,8 +846,8 @@ fn a_rollover_resent_over_air_is_the_same_answer_and_a_kept_request_is_found_by_
     let state_dir = scratch("resend-state");
     let a = psp.note(4);
     let b = psp.note(2);
-    let mut w = wallet_with_notes(&psp, &dir, "w", vec![a.clone(), b.clone()]);
-    let current = psp.current_keyset();
+    let mut w = psp.wallet(&dir, "w", vec![a.clone(), b.clone()]);
+    let current = psp.keyset();
     let roll = rollover_body(&[a.clone()], &current);
     let check = check_body(&[b.clone()]);
 
@@ -1010,10 +881,8 @@ fn a_rollover_resent_over_air_is_the_same_answer_and_a_kept_request_is_found_by_
         &kept[1..],
         "only the rollover's request ended"
     );
-    thread::sleep(Duration::from_millis(500));
-    assert_eq!(
-        air_listener::read_next(&state_dir).unwrap(),
-        2,
+    assert!(
+        slot_is_empty(&server, &did, 2),
         "the resumed call wrote nothing"
     );
 
@@ -1034,7 +903,7 @@ fn a_rollover_resent_over_air_is_the_same_answer_and_a_kept_request_is_found_by_
 }
 
 fn open_wallet_at(dir: &PathBuf, name: &str) -> Wallet {
-    Wallet::open(&dir.join(format!("{name}.json"))).unwrap()
+    common::open_wallet(&dir.join(format!("{name}.json"))).unwrap()
 }
 
 #[test]
@@ -1053,7 +922,7 @@ fn refusals_over_air_are_the_wallets_errors() {
     let listener = start_serving(&server, &key, &state_dir, psp.serve());
     let air = air_settings(&server, &did, 10, 3);
     let (a, b) = (psp.note(1), psp.note(1));
-    let mut w = wallet_with_notes(&psp, &dir, "w", vec![a.clone(), b.clone()]);
+    let mut w = psp.wallet(&dir, "w", vec![a.clone(), b.clone()]);
     let current = psp_keysets(&mut w, &air).unwrap().current;
 
     // More notes than the cap: refused, with the mint's text.
@@ -1103,14 +972,14 @@ fn a_handoff_is_checked_swapped_and_reclaimed_over_air() {
     let air = air_settings(&server, &did, 10, 3);
 
     let (a, b, c) = (psp.note(4), psp.note(1), psp.note(2));
-    let mut dev = wallet_with_notes(&psp, &dir, "dev", vec![a.clone(), b.clone(), c.clone()]);
-    let mut user = wallet_with_notes(&psp, &dir, "user", vec![]);
+    let mut dev = psp.wallet(&dir, "dev", vec![a.clone(), b.clone(), c.clone()]);
+    let mut user = psp.wallet(&dir, "user", vec![]);
     let user_key = sp_wire::seal::SecretKey::from_array([7; 32]).unwrap();
 
     // 5 PSP to the user. Nothing is spent yet: it is still the sender's.
     let ids = dev.select_psp_handoff(5).unwrap();
     let out = dev
-        .export_psp_handoff(&ids, RECORD, &user_key.public_key())
+        .export_psp_handoff(&ids, air.psp_did(), &user_key.public_key())
         .unwrap();
     assert_eq!(
         check_handoff(&mut dev, &air, &out.id).unwrap(),
@@ -1119,7 +988,7 @@ fn a_handoff_is_checked_swapped_and_reclaimed_over_air() {
 
     // The user swaps over AIR, and the sender learns it was claimed.
     let imported = user
-        .import_psp_handoff(&out.text, &user_key, "dev")
+        .import_psp_handoff(&out.text, &user_key, air.psp_did(), "dev")
         .unwrap();
     let log = complete_import(&mut user, &air, &imported);
     assert!(log.iter().any(|l| l.contains("final")), "{log:?}");
@@ -1133,7 +1002,7 @@ fn a_handoff_is_checked_swapped_and_reclaimed_over_air() {
     // Another handoff, which the sender takes back before anyone swaps it.
     let ids = dev.select_psp_handoff(2).unwrap();
     let out = dev
-        .export_psp_handoff(&ids, RECORD, &user_key.public_key())
+        .export_psp_handoff(&ids, air.psp_did(), &user_key.public_key())
         .unwrap();
     let done = reclaim_handoff(&mut dev, &air, &out.id).unwrap();
     assert_eq!(done.standing, Standing::Reclaimed);
@@ -1145,40 +1014,6 @@ fn a_handoff_is_checked_swapped_and_reclaimed_over_air() {
     assert_eq!(psp_total(&dev), 2, "the notes are back, as fresh ones");
     assert!(psp.spent(&c));
     assert!(dev.air_requests().is_empty() && user.air_requests().is_empty());
-    listener.stop().unwrap();
-}
-
-#[test]
-fn a_mint_that_cannot_answer_a_rollover_says_so_at_once() {
-    let server = server();
-    let (key, did) = mint_key();
-    let dir = scratch("roll-unavailable");
-    let psp = real_psp(&dir);
-    let state_dir = scratch("roll-unavailable-state");
-    let listener = start_serving(&server, &key, &state_dir, psp.serve());
-    let a = psp.note(1);
-    let mut w = wallet_with_notes(&psp, &dir, "w", vec![a.clone()]);
-    let current = psp.current_keyset();
-    let body = rollover_body(&[a], &current);
-
-    let state = Arc::clone(&psp.state);
-    let _ = thread::spawn(move || {
-        let _held = state.logic.lock().unwrap();
-        panic!("poisoning the mint lock on purpose");
-    })
-    .join();
-
-    let air = air_settings(&server, &did, 10, 3);
-    let started = Instant::now();
-    match psp_post(&mut w, &air, "rollover", &body) {
-        Err(WalletError::Mint(why)) => {
-            assert!(why.contains("could not answer rollover now"), "{why}")
-        }
-        other => panic!("expected an unavailable PSP, got {other:?}"),
-    }
-    // Not a refusal: the rollover is not cancelled, and the next call may retry.
-    assert!(started.elapsed() < Duration::from_secs(9));
-    assert!(w.air_requests().is_empty());
     listener.stop().unwrap();
 }
 

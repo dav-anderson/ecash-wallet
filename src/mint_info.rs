@@ -11,12 +11,15 @@
 //! [`reclaim_handoff`], [`check_handoff`], [`complete_import`]). **The PSP's
 //! delivery** is not a call: the PSP writes each purchase's signatures to the
 //! SPI's AIR server, and [`psp_pickup`] reads those records (the AIR server is
-//! `air.server` and `air.host`, as for every PSP call).
+//! `air.server` and `air.host`, as for every PSP call). **The PSP's
+//! reconciliation** (AIR kind 15) settles a payment the PSP held or rejected, or
+//! a credit it owes: [`psp_reconcile`] builds the request from the record's
+//! rules, sends it and applies the answer.
 //!
 //! **The ESP's** are its mint info ([`verify_esp`]), keysets ([`sync_esp_keysets`]),
 //! fees ([`sync_esp_limits`], [`fetch_redeem_fees`]), rotation ([`esp_window`])
-//! and rollover ([`esp_post`], used by [`rotation_sync`]), and the three calls
-//! that spend: [`send_exchange`], [`send_transfer`] and [`send_redeem`]. The ESP
+//! and rollover ([`esp_post`], used by [`rotation_sync`]), and the two calls
+//! that spend: [`send_exchange`] and [`send_redeem`]. The ESP
 //! has no keys call (its keys arrive in the replies).
 //!
 //! **An FSP mint's** are its mint info ([`verify_fsp`]), keys ([`fsp_keys`]),
@@ -48,12 +51,12 @@ use sp_wire::air_request::client::{self, ServerRef, block_on_new_runtime};
 use sp_wire::air_request::delivery;
 use sp_wire::air_request::{
     KIND_CHECK_STATE, KIND_EXCHANGE, KIND_FEES, KIND_FSP_ISSUE, KIND_FSP_SPEND, KIND_KEYS,
-    KIND_KEYSETS, KIND_REDEEM, KIND_ROLLOVER, KIND_ROTATION, KIND_TRANSFER,
+    KIND_KEYSETS, KIND_PSP_RECONCILE, KIND_REDEEM, KIND_ROLLOVER, KIND_ROTATION,
 };
 use sp_wire::esp::exchange::{ExchangeRequest, ExchangeResponse};
 use sp_wire::esp::redeem::RedeemResponse;
-use sp_wire::esp::transfer::{TransferRequest, TransferResponse};
 use sp_wire::keys::{CheckStateRequest, CheckStateResponse};
+use sp_wire::psp::ReconcileResponse;
 
 use crate::Wallet;
 use crate::config::{AirSettings, Party};
@@ -134,14 +137,12 @@ pub enum Pickup {
     /// window closes ([`Wallet::close_expired`]).
     Open(crate::store::OpenPurchase),
     /// An open purchase from an earlier pickup, not read again: its record is
-    /// written once, and what settles it is not built yet.
+    /// written once, and a reconciliation request settles it
+    /// ([`psp_reconcile`]).
     StillOpen(crate::store::OpenPurchase),
     /// The PSP has not written the record yet (a payment settles at 6
     /// confirmations).
     NotThere,
-    /// The purchase was made before purchases had a key of their own, so its
-    /// record cannot be opened. Nothing can be picked up for it.
-    NoKey,
     /// The record was there and was not accepted (it did not open, was not the
     /// PSP's, or did not match the purchase). Nothing changed.
     Bad(String),
@@ -185,17 +186,10 @@ pub fn psp_pickup(
             });
             continue;
         }
-        let (Some(secret), Some(delivery_id)) = (&p.reply_secret, &p.delivery_id) else {
-            out.push(PickedUp {
-                id: p.id.clone(),
-                what: Pickup::NoKey,
-            });
-            continue;
-        };
         let made = (|| -> Result<Job, String> {
-            let reply_key = sp_wire::air_request::addr::secret_from_hex(secret)
+            let reply_key = sp_wire::air_request::addr::secret_from_hex(&p.reply_secret)
                 .map_err(|e| format!("the saved reply key: {e}"))?;
-            let purchase: [u8; 32] = hex::decode(delivery_id)
+            let purchase: [u8; 32] = hex::decode(&p.delivery_id)
                 .ok()
                 .and_then(|b| b.try_into().ok())
                 .ok_or("the saved delivery id is not 32 bytes of hex")?;
@@ -262,6 +256,385 @@ pub fn psp_pickup(
     Ok(out)
 }
 
+/// What the reconciliation of one open payment came to this time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconcileReport {
+    /// The purchase's id.
+    pub id: String,
+    pub what: Reconciled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reconciled {
+    /// The PSP answered: the notes were stored, and the purchase or credit, its
+    /// key and the saved request were removed.
+    Settled(crate::psp::Settled),
+    /// The rules' `due_units` is 0: the PSP's fees take the whole amount, so
+    /// nothing was built or sent, and the payment is lost at `open_until`. Said
+    /// once; the wallet remembers it told the user.
+    NothingDue(crate::psp::Loss),
+    /// The request was sent and the PSP did not answer. It answers an accepted
+    /// request only, so this is also what a refused one looks like. The identical
+    /// request is sent again at the next start, until `open_until` (`attempts`
+    /// requests have been built).
+    Waiting { attempts: u32, open_until: u64 },
+    /// The PSP did not answer, and every request the rules allow has been built:
+    /// the PSP did not accept the request, and the payment is lost at
+    /// `open_until`. Said once. The saved request is still sent again, in case it
+    /// was accepted and its answer lost.
+    NotAccepted {
+        loss: crate::psp::Loss,
+        attempts: u32,
+    },
+    /// Nothing was sent, and why (the purchase was sealed to another PSP than
+    /// `air.psp_did`, say).
+    NotSent(String),
+    /// The call failed or the answer was refused; the text says which. The
+    /// payment is as it was, with its key, and is tried again at the next start.
+    /// A bad answer stores nothing.
+    /// (At the close of the window, [`psp_close_expired`], a refused or bad
+    /// answer deletes the payment all the same, and a failed call keeps it for the
+    /// next start.)
+    Failed(String),
+}
+
+/// What sending a saved request came to.
+enum Step {
+    Settled(crate::psp::Settled),
+    /// The payment was settled already (by a copy of this wallet).
+    Already,
+    NoReply,
+    /// The call failed (`network`: the AIR server or the PSP could not be
+    /// reached, so the others will fail too) or the answer was refused.
+    Failed {
+        why: String,
+        network: bool,
+    },
+}
+
+/// Send the request saved for `id` as it is, and apply the answer.
+fn send_saved(wallet: &mut Wallet, air: &AirSettings, id: &str) -> Result<Step, WalletError> {
+    let to_send = wallet.reconcile_to_send(id)?;
+    let sent = match crate::air::call_with_key(
+        wallet,
+        air,
+        Party::Psp,
+        KIND_PSP_RECONCILE,
+        &to_send.body,
+        &to_send.key,
+    ) {
+        Ok(sent) => sent,
+        Err(e) => {
+            return Ok(Step::Failed {
+                why: e.to_string(),
+                network: true,
+            });
+        }
+    };
+    let verified = match sent {
+        crate::air::Sent::NoReply(_) => {
+            wallet.note_unanswered(id, true)?;
+            return Ok(Step::NoReply);
+        }
+        crate::air::Sent::Answered(verified) => verified,
+    };
+    wallet.note_unanswered(id, false)?;
+    if verified.refused() {
+        return Ok(Step::Failed {
+            why: format!(
+                "the PSP refused the reconciliation request in a signed reply: {}",
+                String::from_utf8_lossy(verified.body())
+            ),
+            network: false,
+        });
+    }
+    let response: ReconcileResponse = match serde_json::from_slice(verified.body()) {
+        Ok(response) => response,
+        Err(e) => {
+            return Ok(Step::Failed {
+                why: format!(
+                    "PSP reconciliation over AIR: the PSP signed a reply that is not what was asked for: {e}"
+                ),
+                network: false,
+            });
+        }
+    };
+    Ok(match wallet.apply_reconcile(id, &response) {
+        Ok(crate::psp::Applied::Settled(settled)) => Step::Settled(settled),
+        Ok(crate::psp::Applied::AlreadyDone) => Step::Already,
+        Err(e) => Step::Failed {
+            why: e.to_string(),
+            network: false,
+        },
+    })
+}
+
+/// Tell the user, once, about every open payment with nothing due (the PSP's fees
+/// take the whole amount): [`Reconciled::NothingDue`], and nothing else. It asks
+/// nothing of the network and needs no AIR settings. A payment it has told about
+/// before is not reported again ([`psp_reconcile`] calls this first, so the two
+/// never say it twice). The command line calls it by itself so that this is said
+/// even when the PSP cannot be reached for the others.
+pub fn psp_nothing_due(wallet: &mut Wallet) -> Result<Vec<ReconcileReport>, WalletError> {
+    use crate::psp::ReconcileStatus;
+    let now = sp_wire::air_request::addr::now_secs();
+    let mut out = Vec::new();
+    for open in wallet.open_reconciliations(now) {
+        if open.state == ReconcileStatus::NothingDue && !open.told_lost {
+            wallet.note_told_lost(&open.id)?;
+            if let Some(loss) = wallet.reconcile_loss(&open.id) {
+                out.push(ReconcileReport {
+                    id: open.id,
+                    what: Reconciled::NothingDue(loss),
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Settle every open payment the PSP holds, rejected or owes a credit for, with a
+/// reconciliation request (AIR kind 15), without being asked: this runs at every
+/// wallet start and in `claim-psp`.
+///
+/// For each payment still open ([`Wallet::open_reconciliations`]):
+///
+/// - **Nothing due** (the rules' `due_units` is 0): nothing is built and nothing
+///   is sent. The user is told once ([`Reconciled::NothingDue`]).
+/// - **No request saved yet:** read the PSP's keysets (fresh), build the request
+///   on its current keyset ([`Wallet::build_reconcile`]; it is saved before
+///   anything is sent) and send it.
+/// - **A request saved and unanswered:** send the identical request, once
+///   (`air.attempts` tries of `air.reply_wait_secs`). The PSP answers a repeat
+///   of an accepted request from its stored answer and counts nothing twice.
+/// - **The answer** is checked and applied in one write
+///   ([`Wallet::apply_reconcile`]): the notes are stored, and the purchase or
+///   credit, its key and the saved request are removed.
+/// - **No answer:** the PSP answers an accepted request only. The keysets are
+///   read again; when the saved request's keyset is neither the PSP's current nor
+///   its previous one, the one second request the rules allow is built on the
+///   current keyset and sent once, in the same run. Otherwise only the identical
+///   request is sent again, at the next start. When every request the rules
+///   allow has gone unanswered the user is told once that the PSP did not accept
+///   it ([`Reconciled::NotAccepted`]).
+///
+/// Nothing loops: each payment's request is sent once per call, and the second
+/// one only after a rotation. With no open payment nothing is asked of the
+/// network and the AIR settings are not needed; with nothing to send (every
+/// payment has nothing due) neither. A request is for the PSP the purchase was
+/// sealed to, and is not sent to another one ([`Reconciled::NotSent`]). A failed
+/// call is that payment's [`Reconciled::Failed`] and stops the others (the AIR
+/// server cannot be reached); the payment is tried again at the next start.
+pub fn psp_reconcile(
+    wallet: &mut Wallet,
+    air: &AirSettings,
+) -> Result<Vec<ReconcileReport>, WalletError> {
+    use crate::psp::ReconcileStatus;
+    let now = sp_wire::air_request::addr::now_secs();
+    let mut out = psp_nothing_due(wallet)?;
+    let to_do: Vec<_> = wallet
+        .open_reconciliations(now)
+        .into_iter()
+        .filter(|o| o.state != ReconcileStatus::NothingDue)
+        .collect();
+    if to_do.is_empty() {
+        return Ok(out);
+    }
+    // The settings are needed from here on: a missing one is named.
+    Party::Psp.address(air).map_err(WalletError::Invalid)?;
+    let psp = Party::Psp.did(air).to_hex();
+
+    let push = |out: &mut Vec<ReconcileReport>, id: &str, what: Reconciled| {
+        out.push(ReconcileReport {
+            id: id.to_string(),
+            what,
+        });
+    };
+    for open in to_do {
+        let id = open.id.clone();
+        if open.mint != psp {
+            push(
+                &mut out,
+                &id,
+                Reconciled::NotSent(format!(
+                    "purchase {id} was sealed to the PSP {}, but air.psp_did is {psp}. A reconciliation request is for the PSP the purchase was sent to, so nothing was sent",
+                    open.mint
+                )),
+            );
+            continue;
+        }
+        if open.state == ReconcileStatus::Due {
+            let keysets = match psp_keysets(wallet, air) {
+                Ok(keysets) => keysets,
+                Err(e) => {
+                    push(&mut out, &id, Reconciled::Failed(e.to_string()));
+                    break;
+                }
+            };
+            if let Err(e) = wallet.build_reconcile(&id, &keysets, now) {
+                push(&mut out, &id, Reconciled::Failed(e.to_string()));
+                continue;
+            }
+        }
+        let mut step = send_saved(wallet, air, &id)?;
+        if matches!(step, Step::NoReply) {
+            // A request the PSP refused gets no reply, so what is left to ask is
+            // whether the request's keyset is still one the PSP signs with.
+            if let Ok(keysets) = psp_keysets(wallet, air) {
+                let sent = wallet.reconcile_to_send(&id)?;
+                if !crate::psp::keyset_is_live(&keysets, &sent.keyset)
+                    && wallet.build_reconcile(&id, &keysets, now).is_ok()
+                {
+                    step = send_saved(wallet, air, &id)?;
+                }
+            }
+        }
+        match step {
+            Step::Settled(settled) => push(&mut out, &id, Reconciled::Settled(settled)),
+            Step::Already => {}
+            Step::NoReply => {
+                let open = wallet
+                    .open_reconciliations(now)
+                    .into_iter()
+                    .find(|o| o.id == id);
+                match open {
+                    // nothing more can be built and nothing came back: said once
+                    Some(o) if o.state == ReconcileStatus::Lost && !o.told_lost => {
+                        wallet.note_told_lost(&id)?;
+                        let loss = wallet.reconcile_loss(&id).expect("the payment is open");
+                        let what = Reconciled::NotAccepted {
+                            loss,
+                            attempts: o.attempts,
+                        };
+                        push(&mut out, &id, what);
+                    }
+                    Some(o) => push(
+                        &mut out,
+                        &id,
+                        Reconciled::Waiting {
+                            attempts: o.attempts,
+                            open_until: o.open_until,
+                        },
+                    ),
+                    None => {}
+                }
+            }
+            Step::Failed { why, network } => {
+                push(&mut out, &id, Reconciled::Failed(why));
+                if network {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// What closing the reconciliation window came to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Closed {
+    /// The payments the last resend settled ([`Reconciled::Settled`]), and the
+    /// ones whose last resend was answered with a refusal or a bad answer
+    /// ([`Reconciled::Failed`]); the failed ones are deleted all the same, and
+    /// reported in `lost`.
+    pub reports: Vec<ReconcileReport>,
+    /// The payments kept, with their key and saved request, because the last
+    /// resend could not be sent: [`Reconciled::Failed`] for the one whose call
+    /// failed, [`Reconciled::NotSent`] for the others (the AIR settings are
+    /// missing, or an earlier call failed and the AIR server cannot be reached).
+    /// They are closed at the next start.
+    pub kept: Vec<ReconcileReport>,
+    /// What [`Wallet::close_expired`] deleted, one [`crate::psp::Loss`] each.
+    pub lost: Vec<crate::psp::Loss>,
+}
+
+/// Close the reconciliation window at `now`: send each expired payment's saved
+/// request one last time, then delete what is left ([`Wallet::close_expired`]).
+///
+/// The PSP answers an identical resend of a request it took even after the
+/// deadline (it holds the stored answer, or the record it saved before signing),
+/// and never forfeits a payment with such a record, so a payment whose last
+/// answer was lost can still be settled here. For each payment whose `open_until`
+/// is `now` or earlier and that has a saved request:
+///
+/// - the saved bytes are sent once, as they are, with the usual `air.attempts`
+///   tries ([`psp_reconcile`] does the same before the close). No request is
+///   built, even when the request's keyset has left the PSP's live set, and
+///   nothing loops;
+/// - an answer is checked and applied by [`Wallet::apply_reconcile`], as on any
+///   settle: the payment is settled and is not reported lost;
+/// - no answer, a refusal or a bad answer: the payment is deleted and reported
+///   lost, as before;
+/// - **the send could not be made** (the AIR settings are missing, or the call
+///   failed, which stops the sends: the AIR server cannot be reached): the
+///   payment is **not deleted**. It is kept with its key and its saved request
+///   ([`Closed::kept`]), and so is every later expired payment that was not
+///   tried, and the close is tried again at the next start. Deleting it would
+///   lose a payment the PSP may have settled already.
+///
+/// A payment with no saved request (nothing due, or none built) is deleted with
+/// nothing sent. A request is for the PSP the purchase was sealed to; a payment
+/// sealed to another one than `air.psp_did` is deleted with nothing sent.
+pub fn psp_close_expired(
+    wallet: &mut Wallet,
+    air: &AirSettings,
+    now: u64,
+) -> Result<Closed, WalletError> {
+    let mut reports = Vec::new();
+    let mut kept: Vec<ReconcileReport> = Vec::new();
+    let psp = Party::Psp.did(air).to_hex();
+    let address = Party::Psp.address(air);
+    let mut unreachable = false;
+    for (id, mint) in wallet.expired_requests(now) {
+        if mint != psp {
+            continue;
+        }
+        let not_sent = |why: String| ReconcileReport {
+            id: id.clone(),
+            what: Reconciled::NotSent(why),
+        };
+        if let Err(e) = &address {
+            kept.push(not_sent(format!(
+                "the saved request was not sent one last time: {e}"
+            )));
+            continue;
+        }
+        if unreachable {
+            kept.push(not_sent(
+                "the saved request was not sent one last time: an earlier call failed and the AIR server cannot be reached"
+                    .into(),
+            ));
+            continue;
+        }
+        match send_saved(wallet, air, &id)? {
+            Step::Settled(settled) => reports.push(ReconcileReport {
+                id,
+                what: Reconciled::Settled(settled),
+            }),
+            Step::Already | Step::NoReply => {}
+            Step::Failed { why, network } => {
+                let report = ReconcileReport {
+                    id,
+                    what: Reconciled::Failed(why),
+                };
+                if network {
+                    unreachable = true;
+                    kept.push(report);
+                } else {
+                    reports.push(report);
+                }
+            }
+        }
+    }
+    let keep: Vec<String> = kept.iter().map(|r| r.id.clone()).collect();
+    let lost = wallet.close_expired_keeping(now, &keep)?;
+    Ok(Closed {
+        reports,
+        kept,
+        lost,
+    })
+}
+
 /// A POST to the PSP: `route` is `rollover` or `check-state`, `body` the request
 /// JSON. A sealed request, a signed reply, and a refusal that maps to the `400`
 /// of the same meaning ([`WalletError::Refused`], or
@@ -287,8 +660,7 @@ pub fn psp_post(
 // ---------------------------------------------------------------- the ESP
 
 /// The ESP mint's live keyset IDs, remembered in the wallet under `base` (new
-/// outputs name the current one, and notes from before keysets were recorded
-/// fall back to them).
+/// outputs name the current one).
 pub fn sync_esp_keysets(
     wallet: &mut Wallet,
     air: &AirSettings,
@@ -368,25 +740,6 @@ pub fn send_exchange(
         wallet,
         air,
         KIND_EXCHANGE,
-        &body,
-        &crate::esp_replies::exchange_refusal,
-        &[400],
-    )
-}
-
-/// Send a transfer to the ESP mint. Refusals are read as the exchange's are
-/// ([`send_exchange`]).
-pub fn send_transfer(
-    wallet: &mut Wallet,
-    air: &AirSettings,
-    request: &TransferRequest,
-) -> Result<TransferResponse, WalletError> {
-    let body = serde_json::to_vec(request)
-        .map_err(|e| WalletError::Mint(format!("transfer over AIR: {e}")))?;
-    crate::air::send_esp(
-        wallet,
-        air,
-        KIND_TRANSFER,
         &body,
         &crate::esp_replies::exchange_refusal,
         &[400],
@@ -510,40 +863,116 @@ pub fn send_fsp_spend(
 }
 
 /// Send one pending FSP request (again) and settle it. A `400` cancels it
-/// (nothing happened at the mint); anything else leaves it pending.
+/// (nothing happened at the mint), unless the mint names notes that are spent
+/// (`note_spent_elsewhere` and `spent`): those leave the balance and the request's
+/// other notes are free again (see below). Anything else leaves it pending.
 pub fn settle_fsp(wallet: &mut Wallet, air: &AirSettings, id: &str) -> Result<String, WalletError> {
+    settle_fsp_with(wallet, id, &mut |w, service, op| match op {
+        crate::fsp::FspOp::Issue { request, .. } => {
+            send_fsp_issue(w, air, service, request).map(FspReply::Issue)
+        }
+        crate::fsp::FspOp::Spend { request, .. } => {
+            send_fsp_spend(w, air, service, request).map(FspReply::Spend)
+        }
+    })
+}
+
+/// What the FSP mint answered to a pending request.
+pub(crate) enum FspReply {
+    Issue(sp_wire::fsp::IssueResponse),
+    Spend(sp_wire::fsp::SpendResponse),
+}
+
+/// [`settle_fsp`], with the request sent by `send`.
+///
+/// **Notes the mint says are spent.** An FSP spend (a payment or a rollover) or
+/// issue that the mint refuses with `note_spent_elsewhere` names every input that
+/// is already spent. They go to the spent record and leave the balance, the
+/// request's other notes are free again, and the request is dropped, as the ESP
+/// rollover does (`send_rollover`). Without this the notes were freed like those of
+/// any refusal and picked again: a stale FSP rollover was built and refused on every
+/// connection, and `fsp pay` chose the same spent note on every attempt.
+///
+/// A refusal that names no note, or a position the request does not have, is a
+/// `Mint` error and nothing is marked spent: the request is cancelled and its
+/// notes are free, as after a plain refusal, so it is not sent again on every
+/// connection. That holds for a rollover, a payment and an issue alike.
+///
+/// What it returns differs by who is waiting. A rollover is nobody's request, so
+/// it is `Ok` with a line for the log. A payment or an issue did not happen, so it
+/// is `Err(SpentElsewhere)`, whose text says what was done with the notes.
+pub(crate) fn settle_fsp_with(
+    wallet: &mut Wallet,
+    id: &str,
+    send: &mut dyn FnMut(
+        &mut Wallet,
+        ServiceDid,
+        &crate::fsp::FspOp,
+    ) -> Result<FspReply, WalletError>,
+) -> Result<String, WalletError> {
     let p = wallet
         .pending_fsp()
         .iter()
         .find(|p| p.id == id)
         .cloned()
         .ok_or_else(|| WalletError::Unknown(format!("no pending FSP request {id}")))?;
-    let sent = match &p.op {
-        crate::fsp::FspOp::Issue { request, .. } => send_fsp_issue(wallet, air, p.service, request)
-            .and_then(|r| {
-                let o = wallet.finish_fsp_issue(id, &r)?;
-                let mut text = format!("issued {} FSP (fee {})", o.fsp, o.fee);
-                for r in &o.refused {
-                    text.push_str(&format!("; not issued, ESP freed: {r}"));
-                }
-                Ok(text)
-            }),
-        crate::fsp::FspOp::Spend { request, .. } => {
-            let rollover = request.pay == 0;
-            send_fsp_spend(wallet, air, p.service, request).and_then(|r| {
-                let paid = wallet.finish_fsp_spend(id, &r)?;
-                Ok(if rollover {
-                    "rolled over to the current keyset".to_string()
-                } else {
-                    format!("paid {paid} FSP")
-                })
+    let rollover = matches!(&p.op, crate::fsp::FspOp::Spend { request, .. } if request.pay == 0);
+    let sent = send(wallet, p.service, &p.op).and_then(|reply| match (&p.op, reply) {
+        (crate::fsp::FspOp::Issue { .. }, FspReply::Issue(r)) => {
+            let o = wallet.finish_fsp_issue(id, &r)?;
+            let mut text = format!("issued {} FSP (fee {})", o.fsp, o.fee);
+            for r in &o.refused {
+                text.push_str(&format!("; not issued, ESP freed: {r}"));
+            }
+            Ok(text)
+        }
+        (crate::fsp::FspOp::Spend { .. }, FspReply::Spend(r)) => {
+            let paid = wallet.finish_fsp_spend(id, &r)?;
+            Ok(if rollover {
+                "rolled over to the current keyset".to_string()
+            } else {
+                format!("paid {paid} FSP")
             })
         }
-    };
-    if let Err(WalletError::Refused(_)) = &sent {
-        wallet.cancel_fsp(id)?;
+        _ => Err(WalletError::Mint(
+            "the FSP mint answered with the other kind of reply".into(),
+        )),
+    });
+    match sent {
+        Err(WalletError::Refused(why)) => {
+            wallet.cancel_fsp(id)?;
+            Err(WalletError::Refused(why))
+        }
+        Err(WalletError::SpentElsewhere { why, inputs }) => {
+            // A mint that names no note, or one the request does not have, has
+            // given an answer that cannot be used: nothing is marked spent. The
+            // request is cancelled and its notes freed, as for a plain refusal,
+            // so it is not sent again on every connection.
+            let notes = p.op.note_ids().len();
+            if inputs.is_empty() || inputs.iter().any(|&i| i >= notes) {
+                wallet.cancel_fsp(id)?;
+                return Err(WalletError::Mint(format!(
+                    "the mint named a note the request did not have: it named positions {inputs:?} of a request of {notes} note(s) ({why}). The request is cancelled, nothing is marked spent, and its notes are free again"
+                )));
+            }
+            let report = wallet.mark_spent_in_fsp(id, &inputs)?;
+            if rollover {
+                Ok(format!(
+                    "rollover refused ({why}): {} note(s) marked spent, {} freed",
+                    report.marked_spent, report.freed
+                ))
+            } else {
+                Err(WalletError::SpentElsewhere {
+                    why: format!(
+                        "{why}. {} note(s) are marked spent in the wallet, {} other note(s) are free again",
+                        report.marked_spent, report.freed
+                    ),
+                    inputs,
+                })
+            }
+        }
+        other => other,
     }
-    sent
 }
 
 /// What happened when the wallet checked an FSP mint.
@@ -584,9 +1013,9 @@ pub fn fsp_sync(
     for id in ids {
         match settle_fsp(wallet, air, &id) {
             Ok(text) => out.log.push(format!("pending {id}: {text}")),
-            Err(e) => out.log.push(format!(
-                "pending {id} not finished, retried on the next connection: {e}"
-            )),
+            Err(e) => out
+                .log
+                .push(fsp_failure(wallet, "pending", "not finished", &id, &e)),
         }
     }
     // Staggered: one random swap time per rotation, kept in the wallet file
@@ -619,12 +1048,30 @@ pub fn fsp_sync(
         let id = request.hash();
         match settle_fsp(wallet, air, &id) {
             Ok(text) => out.log.push(format!("rollover {id}: {text}")),
-            Err(e) => out.log.push(format!(
-                "rollover {id} failed, retried on the next connection: {e}"
-            )),
+            Err(e) => out
+                .log
+                .push(fsp_failure(wallet, "rollover", "failed", &id, &e)),
         }
     }
     Ok(out)
+}
+
+/// The log line for an FSP request that `settle_fsp` could not finish. A request
+/// that is still pending is tried again on the next connection. One the wallet
+/// cancelled on the way (the mint named a position the request did not have, see
+/// `settle_fsp_with`) is gone, so it is not retried and the line says so.
+pub(crate) fn fsp_failure(
+    wallet: &Wallet,
+    what: &str,
+    unfinished: &str,
+    id: &str,
+    e: &WalletError,
+) -> String {
+    if wallet.pending_fsp().iter().any(|p| p.id == id) {
+        format!("{what} {id} {unfinished}, retried on the next connection: {e}")
+    } else {
+        format!("{what} {id} cancelled, not retried: {e}")
+    }
 }
 
 // ---------------------------------------------------------------- rollover and handoffs
@@ -663,10 +1110,10 @@ fn send_rollover(wallet: &mut Wallet, id: &str, post: Post<'_>) -> Result<String
         .iter()
         .find(|p| p.id == id)
         .cloned()
-        .ok_or_else(|| WalletError::Invalid(format!("no rollover {id}")))?;
+        .ok_or_else(|| WalletError::Unknown(format!("no pending rollover {id}")))?;
     let received = p.schedule.starts_with(crate::handoff::SWAP_TAG);
     let body = serde_json::to_vec(&p.body)
-        .map_err(|e| WalletError::Mint(format!("{}/rollover: {e}", p.url)))?;
+        .map_err(|e| WalletError::Mint(format!("rollover at {}: {e}", p.record)))?;
     let reply: Result<serde_json::Value, WalletError> = post(wallet, "rollover", &body);
     match reply {
         Ok(v) => {
@@ -733,16 +1180,6 @@ fn send_rollover(wallet: &mut Wallet, id: &str, post: Post<'_>) -> Result<String
             wallet.cancel_rollover(&id)?;
             Ok(format!(
                 "the mint refused the swap of received notes, which stay in the balance as they are: {why}"
-            ))
-        }
-        Err(WalletError::SpentElsewhere { why, .. } | WalletError::Refused(why))
-            if p.schedule.starts_with(crate::legacy::RECEIVE_TAG) =>
-        {
-            // A swap that `receive-psp` (wallet 0.4.0) stored: nothing here was
-            // ever this wallet's, so a refusal ends it.
-            wallet.cancel_rollover(&id)?;
-            Ok(format!(
-                "the mint refused the swap of received notes, so none of them was kept: {why}. Tell the sender"
             ))
         }
         Err(WalletError::SpentElsewhere { why, inputs }) => {

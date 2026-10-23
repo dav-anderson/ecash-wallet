@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use ecash_wallet::config::{self, AirSettings};
+use ecash_wallet::date::format_utc;
 use ecash_wallet::esp::ExchangeBuild;
 use ecash_wallet::redeem::{EntryOutcome, RedeemOutcome, RedemptionState};
 use ecash_wallet::store::Handover;
@@ -15,13 +16,6 @@ use secp256k1::SecretKey;
 use sp_wire::ServiceDid;
 use sp_wire::seal::SecretKey as DidSecretKey;
 use sp_wire::units::ESP_PER_PSP;
-
-/// What the wallet's records call the PSP and the ESP (their live keysets, their
-/// swap times, the mint a handoff names). Neither is dialled: both are reached
-/// over AIR, by DID. They are the URLs older wallet files recorded for the
-/// default mints, so the records in those files are still found.
-const PSP_RECORD: &str = "http://127.0.0.1:3000";
-const ESP_RECORD: &str = "http://127.0.0.1:3100";
 
 const USAGE: &str = "\
 ecash-wallet [--wallet FILE] [--config FILE] [--regtest|--signet|--testnet] <command>
@@ -35,24 +29,35 @@ ecash-wallet [--wallet FILE] [--config FILE] [--regtest|--signet|--testnet] <com
 
   buy-psp --mint-key HEX [--sync] AMOUNT...
       Make the encrypted payload for a PSP purchase and print it as hex, for
-      the OP_RETURN. AMOUNT is each note's size in PSP (a power of two). The
-      payload names the PSP's current keyset. With --sync the wallet asks the
-      PSP for it over AIR first; without, it uses the one last seen (and
-      sends nothing). Each purchase gets a one-off reply key of its own, kept
-      in the wallet file, so the PSP cannot link two purchases.
+      the OP_RETURN. AMOUNT is each note's size in PSP (a power of two), and
+      together they must come to at least psp.min_purchase (50 PSP by default;
+      a smaller purchase is refused, before anything is sent, because the PSP's
+      fees can eat it whole; 100 PSP is a realistic purchase). The payload names
+      the PSP's current keyset. With --sync the wallet asks the PSP for it over
+      AIR first; without, it uses the one last seen (and sends nothing). Each
+      purchase gets a one-off reply key of its own, kept in the wallet file, so
+      the PSP cannot link two purchases. The payload is ONE-TIME USE: pay it
+      exactly once. A second payment carrying the same payload buys nothing and
+      its funds are lost.
   claim-psp [--wait SECONDS]
-      Pick up the notes of every pending purchase. When the PSP handles a
-      payment it writes a record to the AIR server: the signatures, or that it
-      holds the payment, or the reason it rejected the purchase, with what it
-      received. This reads each purchase's record, checks the PSP's signature
-      and claims the notes, waiting up to SECONDS (default 60) for records that
-      are not there yet and saying which are not. Needs air.server and
-      air.host. Any other command also picks up what is already there when it
-      starts. There is nothing to paste.
-      A payment the PSP holds or rejects stays open: the wallet keeps the
-      purchase and its key, and says until when. If the PSP has not settled it
-      by then it forfeits the payment and keeps the bitcoin, and the wallet
-      deletes the purchase and the key (any command does this when it starts).
+      Pick up the notes of every pending purchase, and settle what the PSP
+      holds or owes. When the PSP handles a payment it writes a record to the
+      AIR server: the signatures, or that it holds the payment, or the reason it
+      rejected the purchase, with what it received, or a credit it owes. This
+      reads each purchase's record, checks the PSP's signature and claims the
+      notes, waiting up to SECONDS (default 60) for records that are not there
+      yet and saying which are not. Needs air.server and air.host. Any other
+      command also picks up what is already there when it starts. There is
+      nothing to paste.
+      A payment the PSP holds or rejects, and a credit it owes, are settled by a
+      reconciliation request the wallet builds from the PSP's rules and sends
+      itself, here and once at the start of any other command, until the
+      window the record names closes: it saves the request before it sends it,
+      and sends the same request again while the PSP has not answered. If the
+      payment is not settled by then the PSP forfeits it and the funds are
+      lost; the wallet says so, with the amount, and deletes the purchase and
+      the key. When the PSP's fees take the whole amount nothing can be issued,
+      nothing is sent, and the wallet says the payment is lost.
   exchange --service DID --psp N [--amounts A,B,C] [--resume ID]
       Exchange at least N PSP for ESP bound to a service (its 33-byte AIR DID,
       66 hex characters). The smallest exchange is 1 PSP. The mint's exchange is exact, so the
@@ -75,13 +80,13 @@ ecash-wallet [--wallet FILE] [--config FILE] [--regtest|--signet|--testnet] <com
       (DID, 66 hex characters), so only the holder of the matching secret key
       can open it. It carries PSP only, never a DID key. The notes leave this
       wallet, kept as a pending handoff until you reclaim, cancel or finish it.
-      The string starts SPHP1:. This replaces the old send-psp token.
+      The string starts SPHP2:. This replaces the old send-psp token.
   handoff export-fsp --fsp SERVICE:UNITS... --did-key-file FILE [--out FILE]
       An FSP handoff, to your own new device: a little FSP (enough to pay to
       fetch your wallet from the AIR) and the DID secret key from FILE (64 hex
       characters). NOT ENCRYPTED: it holds the key it would be encrypted to.
       Anyone who sees it can spend the notes and act as your DID. Move it in
-      person or by QR code, never over a network. The string starts SPHF1:.
+      person or by QR code, never over a network. The string starts SPHF2:.
       To show either as a QR code, pipe the output to `qrencode -t ANSIUTF8`
       (about 20 notes fit one code; see DESIGN.md).
   handoff import STRING|FILE|- [--did-key-file FILE] [--did-key-out FILE]
@@ -89,12 +94,12 @@ ecash-wallet [--wallet FILE] [--config FILE] [--regtest|--signet|--testnet] <com
       Take a handoff in; the kind is read from its start. It is checked against
       the key sets this wallet has seen, and refused if damaged, of another
       version, or imported before. The old SPH1: handoff is refused.
-      A PSP handoff (SPHP1:) needs --did-key-file, the secret key of the DID it
+      A PSP handoff (SPHP2:) needs --did-key-file, the secret key of the DID it
       was sealed to. The notes count in the balance at once and are swapped at
       the PSP mint for fresh notes only this wallet knows, now and at every
       start while the mint is out of reach (`balance` shows how much is still
       unswapped). Until the swap goes through the sender can still reclaim.
-      An FSP handoff (SPHF1:) is never swapped. Its DID key is written to
+      An FSP handoff (SPHF2:) is never swapped. Its DID key is written to
       --did-key-out (required), never printed. Fetch your wallet from the AIR
       afterwards and run `merge FILE` on it.
   handoff list
@@ -102,8 +107,7 @@ ecash-wallet [--wallet FILE] [--config FILE] [--regtest|--signet|--testnet] <com
   handoff check ID
       Ask the PSP mint where a PSP handoff you made stands, from its record of
       which notes are spent: none (still yours to reclaim), all (the receiver
-      has it: the handoff is done), or some (the rest can be reclaimed). Old
-      send-psp tokens in a wallet file are PSP handoffs now and work here too.
+      has it: the handoff is done), or some (the rest can be reclaimed).
   handoff reclaim ID
       Swap what is left of a PSP handoff back to this wallet at the mint, while
       the receiver has not swapped. The mint takes whichever swap reaches it
@@ -151,9 +155,6 @@ ecash-wallet [--wallet FILE] [--config FILE] [--regtest|--signet|--testnet] <com
       keysets with their start and retire times, and the next rotation.
   esp-schedule [--by YYYY-MM-DD]
       When this wallet's ESP is redeemable: now, by DATE, and by month.
-  migrate
-      Move a wallet file from before the networks had their own folders,
-      ~/.ecash-wallet/wallet.json, into regtest/.
 
   The fsp commands always need --service: there is no default. storage.wallet
   lists the AIR services that back up the wallet; it is not the service FSP is
@@ -164,9 +165,7 @@ ecash-wallet [--wallet FILE] [--config FILE] [--regtest|--signet|--testnet] <com
   It asks nothing; a failure is logged and tried again next time.
 
 The wallet file is --wallet, else $ECASH_WALLET_FILE, else
-~/.ecash-wallet/<network>/wallet.json (main, regtest, signet, testnet; an old
-~/.ecash-wallet/wallet.json is refused until `ecash-wallet migrate` moves it to
-regtest/).
+~/.ecash-wallet/<network>/wallet.json (main, regtest, signet, testnet).
 
 The PSP and the ESP are reached over AIR only: their mint info (which network and
 wire version), keys, keysets, rotation window, fees, rollover, check-state,
@@ -182,8 +181,10 @@ service's DID, on the AIR server of its air.fsp entry (ECASH_AIR_FSP), written
 serve` prints its entry). An fsp command for a service with no entry is refused,
 naming air.fsp. No call the wallet makes is HTTP. `config` prints every setting.";
 
-/// The arguments left after flags are taken out.
-struct Args(Vec<String>);
+/// The arguments left after flags are taken out, and the name of the command
+/// they belong to (`balance`, `handoff check`, `fsp pay`), so an error about
+/// them can say which command it is. The name is empty until the command is known.
+struct Args(Vec<String>, String);
 
 impl Args {
     /// Take `--name VALUE`, if present.
@@ -192,7 +193,10 @@ impl Args {
             return Ok(None);
         };
         if at + 1 >= self.0.len() {
-            return Err(WalletError::Invalid(format!("{name} needs a value")));
+            return Err(WalletError::Invalid(match self.1.as_str() {
+                "" => format!("{name} needs a value"),
+                command => format!("{command}: {name} needs a value"),
+            }));
         }
         let value = self.0.remove(at + 1);
         self.0.remove(at);
@@ -218,11 +222,35 @@ impl Args {
     fn done(self) -> Result<(), WalletError> {
         match self.0.first() {
             Some(extra) => Err(WalletError::Invalid(format!(
-                "unexpected argument `{extra}`"
+                "{}: unexpected argument `{extra}`. It is run as: {}",
+                self.1,
+                run_as(&self.1)
             ))),
             None => Ok(()),
         }
     }
+}
+
+/// How a command is run, from its line in the help text (the first, for a
+/// command with several): `ecash-wallet handoff check ID`.
+fn run_as(command: &str) -> String {
+    let line = USAGE.lines().find(|l| {
+        l.starts_with("  ")
+            && !l.starts_with("   ")
+            && (l.trim() == command
+                || l.trim().starts_with(&format!("{command} "))
+                || l.contains(&format!("| {command} ")))
+    });
+    match line {
+        Some(l) => format!("ecash-wallet {}", l.trim()),
+        None => format!("ecash-wallet {command} (see --help)"),
+    }
+}
+
+/// The error for a command given the wrong number of arguments: which command it
+/// is, what it takes, and how it is run.
+fn takes(command: &str, what: &str) -> WalletError {
+    WalletError::Invalid(format!("{command} takes {what}: {}", run_as(command)))
 }
 
 fn number(text: &str, what: &str) -> Result<u64, WalletError> {
@@ -238,41 +266,7 @@ fn wallet_path(flag: Option<String>) -> Result<PathBuf, WalletError> {
     let home = env::var("HOME")
         .map_err(|_| WalletError::Invalid("HOME is not set: use --wallet FILE".into()))?;
     let base = PathBuf::from(home).join(".ecash-wallet");
-    if base.join("wallet.json").exists() {
-        return Err(WalletError::Invalid(format!(
-            "{} is a wallet file from before each network had its own. It is a regtest wallet. Run `ecash-wallet migrate` once to move it to {} (nothing is deleted)",
-            base.join("wallet.json").display(),
-            base.join("regtest").join("wallet.json").display()
-        )));
-    }
     Ok(base.join(network()).join("wallet.json"))
-}
-
-/// Move a pre-network `~/.ecash-wallet/wallet.json` to `regtest/wallet.json`.
-/// A rename; refused if the target exists.
-fn migrate_wallet() -> Result<(), WalletError> {
-    let home = env::var("HOME").map_err(|_| WalletError::Invalid("HOME is not set".into()))?;
-    let base = PathBuf::from(home).join(".ecash-wallet");
-    let (from, to) = (
-        base.join("wallet.json"),
-        base.join("regtest").join("wallet.json"),
-    );
-    if !from.exists() {
-        return Err(WalletError::Invalid(format!(
-            "nothing to migrate: {} does not exist",
-            from.display()
-        )));
-    }
-    if to.exists() {
-        return Err(WalletError::Invalid(format!(
-            "{} already exists: nothing was moved",
-            to.display()
-        )));
-    }
-    std::fs::create_dir_all(base.join("regtest"))?;
-    std::fs::rename(&from, &to)?;
-    println!("moved {} to {}", from.display(), to.display());
-    Ok(())
 }
 
 /// The network this run is on: `--regtest`, `--signet` or `--testnet`, else
@@ -343,31 +337,58 @@ fn verify_mint_of(wallet: &mut Wallet, party: config::Party) -> Result<(), Walle
     result
 }
 
-/// Check the PSP (`verify_mint_of`) and give the name its records use
-/// ([`PSP_RECORD`]).
-fn psp_base(wallet: &mut Wallet) -> Result<&'static str, WalletError> {
+/// Check the PSP (`verify_mint_of`) and give the name its records use (its live
+/// keysets, its swap times, the mint a handoff names): the PSP's DID in lowercase
+/// hex, as for an FSP. The PSP is never dialled; it is reached over AIR, by DID.
+fn psp_base(wallet: &mut Wallet) -> Result<String, WalletError> {
     verify_mint_of(wallet, config::Party::Psp)?;
-    Ok(PSP_RECORD)
+    Ok(ecash_wallet::fsp::record_of(air_settings().psp_did()))
 }
 
-/// Check the ESP (`verify_mint_of`) and give the name its records use
-/// ([`ESP_RECORD`]).
-fn esp_base(wallet: &mut Wallet) -> Result<&'static str, WalletError> {
+/// Check the ESP (`verify_mint_of`) and give the name its records use: the ESP's
+/// DID in lowercase hex, as for the PSP.
+fn esp_base(wallet: &mut Wallet) -> Result<String, WalletError> {
     verify_mint_of(wallet, config::Party::Esp)?;
-    Ok(ESP_RECORD)
+    Ok(ecash_wallet::fsp::record_of(air_settings().esp_did()))
 }
 
-fn buy_psp(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
+/// The steps every command that uses the wallet starts with, and that use the
+/// network: the FSP mints are checked, what the PSP has delivered is picked up,
+/// the PSP's reconciliations are settled, and the PSP and ESP key sets are kept
+/// live. A command takes a `Startup` and runs it once its own arguments have been
+/// read and checked (a command that forgot to would leave the value unused, which
+/// the compiler warns about), so a user error never waits on the network.
+#[must_use = "a command runs the startup steps once its arguments are checked"]
+struct Startup(());
+
+impl Startup {
+    fn new() -> Startup {
+        Startup(())
+    }
+
+    /// Run the startup steps.
+    fn run(self, wallet: &mut Wallet) {
+        startup_fsp_sync(wallet);
+        startup_psp_pickup(wallet);
+        startup_psp_reconcile(wallet);
+        startup_rotation_sync(wallet);
+    }
+
+    /// The same without the reconciliation, for `claim-psp`, which settles the
+    /// PSP's payments itself after it has waited for their records and says
+    /// every result.
+    fn run_for_claim(self, wallet: &mut Wallet) {
+        startup_fsp_sync(wallet);
+        startup_psp_pickup(wallet);
+        startup_rotation_sync(wallet);
+    }
+}
+
+fn buy_psp(wallet: &mut Wallet, mut args: Args, start: Startup) -> Result<(), WalletError> {
     let mint_key = args
         .flag("--mint-key")?
         .ok_or_else(|| WalletError::Invalid("--mint-key HEX is required".into()))?;
-    if args.switch("--sync") {
-        let base = psp_base(wallet)?;
-        let air = air_settings();
-        let w = ecash_wallet::mint_info::psp_window(wallet, &air)?;
-        wallet.note_live_keysets(base, &w)?;
-        ecash_wallet::mint_info::sync_psp_limits(wallet, &air)?;
-    }
+    let sync = args.switch("--sync");
     if args.flag("--reply-did")?.is_some() {
         return Err(WalletError::Invalid(
             "--reply-did was removed: every purchase makes a one-off reply key of its own (so the PSP cannot link two purchases) and keeps its secret in the wallet file. The PSP's delivery is picked up with `claim-psp`"
@@ -381,8 +402,25 @@ fn buy_psp(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
         .collect::<Result<Vec<_>, _>>()?;
     let mint_key = sp_wire::seal::parse_public_key(&mint_key)
         .map_err(|e| WalletError::Invalid(e.to_string()))?;
+    // Every flag is read before the PSP is asked anything: a user error never
+    // depends on the network. That includes a purchase below psp.min_purchase.
+    ecash_wallet::psp::check_outputs(
+        &amounts,
+        wallet.psp_max_denomination(),
+        wallet.psp_min_purchase(),
+    )
+    .map_err(|e| WalletError::Invalid(format!("buy-psp: {e}")))?;
+    start.run(wallet);
+    if sync {
+        let base = psp_base(wallet)?;
+        let air = air_settings();
+        let w = ecash_wallet::mint_info::psp_window(wallet, &air)?;
+        wallet.note_live_keysets(&base, &w)?;
+        ecash_wallet::mint_info::sync_psp_limits(wallet, &air)?;
+    }
     let built = wallet.build_psp_payload(&amounts, &mint_key)?;
     eprintln!("purchase {}", built.id);
+    eprintln!("{}", ecash_wallet::psp::ONE_TIME_USE);
     eprintln!(
         "{} bytes. Put the hex below in an OP_RETURN and pay the PSP. When the PSP settles it delivers the notes over AIR: `claim-psp` waits for them, and any command picks them up when it starts if they are there.",
         built.payload.len()
@@ -414,7 +452,7 @@ fn pickup_line(p: &ecash_wallet::mint_info::PickedUp) -> String {
             }
             if c.credit_cents > 0 {
                 line.push_str(&format!(
-                    "; you overpaid, and the PSP owes you a credit of {}.{:02} USD. The purchase's key is kept for the PSP's follow-up",
+                    "; you overpaid, and the PSP owes you a credit of {}.{:02} USD. The wallet claims it with a reconciliation request, and keeps the purchase's key until it is settled",
                     c.credit_cents / 100,
                     c.credit_cents % 100
                 ));
@@ -432,9 +470,6 @@ fn pickup_line(p: &ecash_wallet::mint_info::PickedUp) -> String {
         Pickup::NotThere => format!(
             "purchase {id}: not delivered yet. The PSP settles a payment at 6 confirmations and then writes the record; run `claim-psp` again later"
         ),
-        Pickup::NoKey => format!(
-            "purchase {id}: made before purchases had a key of their own, so the PSP's record cannot be opened and nothing can be picked up for it"
-        ),
         Pickup::Bad(why) => format!("purchase {id}: {why}"),
     }
 }
@@ -445,27 +480,6 @@ fn now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
-}
-
-/// `secs` (Unix time) as `2026-10-28 14:03 UTC`.
-fn format_utc(secs: u64) -> String {
-    let days = (secs / 86_400) as i64;
-    let rest = secs % 86_400;
-    // days since 1970-01-01 to a civil date (H. Hinnant's algorithm)
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + i64::from(month <= 2);
-    format!(
-        "{year:04}-{month:02}-{day:02} {:02}:{:02} UTC",
-        rest / 3_600,
-        rest % 3_600 / 60
-    )
 }
 
 /// One line about a purchase the PSP is holding or rejected. `new` is true when
@@ -491,28 +505,104 @@ fn open_line(id: &str, o: &ecash_wallet::store::OpenPurchase, new: bool) -> Stri
     };
     let lead = if new { "" } else { "still open: " };
     format!(
-        "purchase {id}: {lead}{what}. Nothing was signed. The purchase and its key are kept open until {}; if it is not settled by then the PSP forfeits the payment and keeps the bitcoin",
+        "purchase {id}: {lead}{what}. Nothing was signed. The purchase and its key are kept open until {}, and the wallet sends the PSP a reconciliation request for it. If it is not settled by then the PSP forfeits the payment and the funds are lost",
         format_utc(o.open_until)
     )
 }
 
-/// At startup, and before anything is read: forget the purchases and keys whose
-/// reconciliation window has closed. The PSP forfeits a payment still open then,
-/// so nothing can come for it. Says what it deleted; changes nothing otherwise.
+/// One line about one payment's reconciliation.
+fn reconcile_line(r: &ecash_wallet::mint_info::ReconcileReport) -> String {
+    use ecash_wallet::mint_info::Reconciled;
+    let id = &r.id;
+    match &r.what {
+        Reconciled::Settled(s) => format!(
+            "purchase {id}: the PSP accepted the {}: {} PSP received in {} note(s)",
+            if s.credit {
+                "credit claim"
+            } else {
+                "corrected request"
+            },
+            s.units,
+            s.claimed.len()
+        ),
+        Reconciled::NothingDue(loss) => loss.nothing_due(),
+        Reconciled::Waiting {
+            attempts,
+            open_until,
+        } => format!(
+            "purchase {id}: the reconciliation request ({attempts} built) is sent and the PSP has not answered. The same request is sent again at the next start, until {}",
+            format_utc(*open_until)
+        ),
+        Reconciled::NotAccepted { loss, attempts } => loss.not_accepted(*attempts),
+        Reconciled::NotSent(why) => format!("purchase {id}: not sent: {why}"),
+        Reconciled::Failed(why) => {
+            format!("purchase {id}: not settled, tried again at the next start: {why}")
+        }
+    }
+}
+
+/// Settle the PSP's open payments (see `mint_info::psp_reconcile`), checking the
+/// PSP's network first when there is something to send. What has nothing due is
+/// said even when the PSP cannot be reached.
+fn reconcile_psp(
+    wallet: &mut Wallet,
+) -> Result<Vec<ecash_wallet::mint_info::ReconcileReport>, WalletError> {
+    let mut reports = ecash_wallet::mint_info::psp_nothing_due(wallet)?;
+    let sendable = wallet
+        .open_reconciliations(now_secs())
+        .iter()
+        .any(|o| o.state != ecash_wallet::psp::ReconcileStatus::NothingDue);
+    if sendable {
+        air_settings().require().map_err(WalletError::Invalid)?;
+        psp_base(wallet)?;
+        reports.extend(ecash_wallet::mint_info::psp_reconcile(
+            wallet,
+            &air_settings(),
+        )?);
+    }
+    Ok(reports)
+}
+
+/// At startup, and before anything is read: close the reconciliation window of
+/// the payments whose `open_until` has passed. Each one that still has a saved
+/// request gets it sent one last time, identical (the PSP answers it even after
+/// the deadline); an answer settles the payment. What is left is forgotten, with
+/// its key: the PSP forfeits a payment still open then, so nothing can come for
+/// it. A payment whose last resend could not be sent (the AIR settings are
+/// missing, or the AIR server cannot be reached) is not forgotten: it is kept
+/// and closed at the next start. Says what it settled, what it kept and what it
+/// deleted; changes nothing otherwise.
 fn close_expired_psp(wallet: &mut Wallet) {
-    match wallet.close_expired(now_secs()) {
+    use ecash_wallet::mint_info::Reconciled;
+    match ecash_wallet::mint_info::psp_close_expired(wallet, &air_settings(), now_secs()) {
         Ok(closed) => {
-            for id in closed {
+            for r in &closed.reports {
+                match &r.what {
+                    Reconciled::Failed(why) => eprintln!(
+                        "psp: purchase {}: the last resend before the window closed failed: {why}",
+                        r.id
+                    ),
+                    _ => eprintln!("psp: {}", reconcile_line(r)),
+                }
+            }
+            for r in &closed.kept {
+                let (Reconciled::Failed(why) | Reconciled::NotSent(why)) = &r.what else {
+                    continue;
+                };
                 eprintln!(
-                    "psp: purchase {id}: its reconciliation window has closed, so the PSP forfeits the payment if it is still open. The purchase and its key are deleted"
+                    "psp: purchase {}: its window has closed, and the last resend of its request could not be sent ({why}). The payment is kept, and the resend is tried again at the next start",
+                    r.id
                 );
+            }
+            for loss in closed.lost {
+                eprintln!("psp: {}", loss.forfeited());
             }
         }
         Err(e) => eprintln!("psp: closed purchases not deleted, retried on the next run: {e}"),
     }
 }
 
-fn claim_psp(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
+fn claim_psp(wallet: &mut Wallet, mut args: Args, start: Startup) -> Result<(), WalletError> {
     let wait = match args.flag("--wait")? {
         Some(text) => number(&text, "--wait")?,
         None => PICKUP_WAIT_SECS,
@@ -523,16 +613,13 @@ fn claim_psp(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
                 .into(),
         ));
     }
-    if wallet.pending_purchases().is_empty() {
+    start.run_for_claim(wallet);
+    if wallet.pending_purchases().is_empty() && wallet.open_reconciliations(now_secs()).is_empty() {
         println!("no pending purchases");
         return Ok(());
     }
     // Only a purchase with a record still to read needs the PSP's address.
-    if wallet
-        .pending_purchases()
-        .iter()
-        .any(|p| p.reply_secret.is_some() && p.open.is_none())
-    {
+    if wallet.pending_purchases().iter().any(|p| p.open.is_none()) {
         psp_base(wallet)?;
     }
     let picked = ecash_wallet::mint_info::psp_pickup(wallet, &air_settings(), wait)?;
@@ -548,18 +635,48 @@ fn claim_psp(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
             not_done += 1;
         }
     }
+    // What the pickup opened (and the credits) are settled now.
+    let mut unsettled = 0;
+    for r in reconcile_psp(wallet)? {
+        println!("{}", reconcile_line(&r));
+        if !matches!(
+            r.what,
+            ecash_wallet::mint_info::Reconciled::Settled(_)
+                | ecash_wallet::mint_info::Reconciled::NothingDue(_)
+        ) {
+            unsettled += 1;
+        }
+    }
     if not_done > 0 {
         return Err(WalletError::Unknown(format!(
             "{not_done} purchase(s) are not picked up (waited {wait} s)"
         )));
     }
+    if unsettled > 0 {
+        return Err(WalletError::Unknown(format!(
+            "{unsettled} payment(s) are not settled yet"
+        )));
+    }
     Ok(())
 }
 
-fn exchange(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
-    let base = esp_base(wallet)?;
-    let resume = args.flag("--resume")?;
-    let built: ExchangeBuild = match resume {
+/// What `exchange` was asked to do, read from its flags before the ESP is
+/// contacted.
+enum ExchangeAsk {
+    /// `--resume ID`: send a pending exchange again.
+    Resume(ExchangeBuild),
+    /// `--service DID --psp N [--amounts A,B,C]`: build a new one.
+    New {
+        service: ServiceDid,
+        psp: u64,
+        amounts: Option<Vec<u64>>,
+    },
+}
+
+fn exchange(wallet: &mut Wallet, mut args: Args, start: Startup) -> Result<(), WalletError> {
+    // Every flag is read, and a missing or bad one refused, before the ESP is
+    // asked anything: a user error never depends on the network.
+    let ask = match args.flag("--resume")? {
         Some(id) => {
             args.done()?;
             let pending = wallet
@@ -567,7 +684,7 @@ fn exchange(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
                 .iter()
                 .find(|p| p.id == id)
                 .ok_or_else(|| WalletError::Unknown(format!("no pending exchange {id}")))?;
-            ExchangeBuild {
+            ExchangeAsk::Resume(ExchangeBuild {
                 id: pending.id.clone(),
                 request: pending.request.clone(),
                 psp_spent: pending
@@ -577,7 +694,7 @@ fn exchange(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
                     .map(|i| i.amount.units)
                     .sum(),
                 change_esp: pending.change_esp,
-            }
+            })
         }
         None => {
             let service = args
@@ -598,7 +715,22 @@ fn exchange(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
                 None => None,
             };
             args.done()?;
-            let service = service_did(&service)?;
+            ExchangeAsk::New {
+                service: service_did(&service)?,
+                psp,
+                amounts,
+            }
+        }
+    };
+    start.run(wallet);
+    let base = esp_base(wallet)?;
+    let built: ExchangeBuild = match ask {
+        ExchangeAsk::Resume(built) => built,
+        ExchangeAsk::New {
+            service,
+            psp,
+            amounts,
+        } => {
             ecash_wallet::mint_info::sync_esp_keysets(wallet, &air_settings(), &base)?;
             ecash_wallet::mint_info::sync_esp_limits(wallet, &air_settings())?;
             wallet.build_exchange(psp, service, amounts.as_deref())?
@@ -682,15 +814,16 @@ fn write_private(path: &std::path::Path, text: &str) -> Result<(), std::io::Erro
 
 /// Take the ESP an FSP mint kept for this service (`fsp-mint export-esp`) into
 /// the wallet.
-fn receive(wallet: &mut Wallet, args: Args) -> Result<(), WalletError> {
+fn receive(wallet: &mut Wallet, args: Args, start: Startup) -> Result<(), WalletError> {
     let rest = args.rest();
     let [path] = rest.as_slice() else {
-        return Err(WalletError::Invalid("receive takes one file".into()));
+        return Err(takes("receive", "one file"));
     };
     let text = std::fs::read_to_string(path)?;
-    let handover: Handover = serde_json::from_str(&text).map_err(|e| {
-        WalletError::Invalid(format!("{path}: not a file from fsp-mint export-esp: {e}"))
-    })?;
+    // sp-wire's own parse of the file `fsp-mint export-esp` writes.
+    let handover = Handover::read(text.as_bytes())
+        .map_err(|e| WalletError::Invalid(format!("{path}: {e}")))?;
+    start.run(wallet);
     let (count, units) = wallet.receive_handover(&handover)?;
     println!(
         "received {units} ESP in {count} note(s) for {}, redeemable after day {}",
@@ -849,8 +982,9 @@ fn send_redemption(
     )))
 }
 
-fn redeem(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
-    let base = esp_base(wallet)?;
+fn redeem(wallet: &mut Wallet, mut args: Args, start: Startup) -> Result<(), WalletError> {
+    // Every flag is read, and a missing or bad one refused, before the ESP is
+    // asked anything: a user error never depends on the network.
     let collect = match args.0.iter().position(|a| a == "--collect") {
         Some(at) => {
             args.0.remove(at);
@@ -860,6 +994,8 @@ fn redeem(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
     };
     if collect {
         args.done()?;
+        start.run(wallet);
+        esp_base(wallet)?;
         let queued: Vec<String> = wallet
             .pending_redemptions()
             .iter()
@@ -880,6 +1016,8 @@ fn redeem(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
     };
     if let Some(id) = args.flag("--resume")? {
         args.done()?;
+        start.run(wallet);
+        esp_base(wallet)?;
         return send_redemption(wallet, key.as_ref(), id);
     }
     let key = key.ok_or_else(|| WalletError::Invalid("--service-key HEX is required".into()))?;
@@ -891,26 +1029,20 @@ fn redeem(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
         None => None,
     };
     args.done()?;
+    start.run(wallet);
+    let base = esp_base(wallet)?;
     let mut fees = ecash_wallet::mint_info::fetch_redeem_fees(wallet, &air_settings())?;
-    if let Some(n) = max_bytes {
-        fees.max_request_bytes = fees.max_request_bytes.min(n);
-    }
+    fees.caller_max_bytes = max_bytes;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
     ecash_wallet::mint_info::sync_esp_keysets(wallet, &air_settings(), &base)?;
     let plan = wallet.plan_redemption(&key, &memo, &fees, now)?;
-    for why in &plan.skipped {
-        eprintln!("{why}");
+    for line in plan.lines(&fees) {
+        eprintln!("{line}");
     }
     let built = plan.built;
-    eprintln!(
-        "fee rate {} ESP units a byte; at most {} bytes a request; {} request(s)",
-        fees.fee_per_byte,
-        fees.max_request_bytes,
-        built.len()
-    );
     for b in &built {
         eprintln!(
             "redemption {}: {} note(s) worth {} ESP ({}), {} bytes, fee {} ESP ({}), expected payout {} ESP ({})",
@@ -950,10 +1082,14 @@ fn later_failure_line(first: &mut Option<WalletError>, e: WalletError) -> Option
     None
 }
 
-fn balance(wallet: &Wallet, args: Args) -> Result<(), WalletError> {
+fn balance(wallet: &mut Wallet, args: Args, start: Startup) -> Result<(), WalletError> {
     args.done()?;
+    start.run(wallet);
     let b = wallet.balance();
     println!("psp  {}", b.psp);
+    if let Some(line) = wallet.pending_psp_credit(now_secs()).balance_line() {
+        println!("       {line}");
+    }
     println!("esp  {}", b.esp);
     for ((service, day), units) in &b.esp_by_terms {
         println!("       {units} for {service}, redeemable after day {day}");
@@ -974,7 +1110,7 @@ fn balance(wallet: &Wallet, args: Args) -> Result<(), WalletError> {
     let (unknown, unknown_units) = wallet.fsp_unknown_service();
     if unknown > 0 {
         println!(
-            "       {unknown_units} FSP in {unknown} note(s) whose service is not known yet: they are not spent until it is. Connect to their mint (any `fsp` command) to fill it in"
+            "       {unknown_units} FSP in {unknown} note(s) whose service is not known (from a wallet file written before FSP notes recorded their service): they are not spent"
         );
     }
     for p in wallet.pending_fsp() {
@@ -997,9 +1133,6 @@ fn balance(wallet: &Wallet, args: Args) -> Result<(), WalletError> {
     }
     for p in wallet.pending_exchanges() {
         println!("pending exchange {}", p.id);
-    }
-    for p in wallet.pending_transfers() {
-        println!("pending transfer {}", p.id);
     }
     for p in wallet.pending_redemptions() {
         match p.state {
@@ -1034,12 +1167,6 @@ fn balance(wallet: &Wallet, args: Args) -> Result<(), WalletError> {
             b.unswapped_psp
         );
     }
-    if wallet.legacy_receive_psp() > 0 {
-        println!(
-            "waiting {} PSP from an old receive-psp token: its swap is stored and sent again at the next start. It is not counted above until the swap goes through",
-            wallet.legacy_receive_psp()
-        );
-    }
     let pending = wallet
         .handoffs_out()
         .iter()
@@ -1063,7 +1190,7 @@ fn did_key_from_file(path: &str) -> Result<DidSecretKey, WalletError> {
         .map_err(|_| WalletError::Invalid(format!("{path}: a DID secret key is 64 hex characters")))
 }
 
-fn handoff(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
+fn handoff(wallet: &mut Wallet, mut args: Args, start: Startup) -> Result<(), WalletError> {
     if args.0.is_empty() {
         return Err(WalletError::Invalid(
             "handoff needs export-psp, export-fsp, import, check, reclaim, list, cancel or done. Run with --help"
@@ -1071,15 +1198,17 @@ fn handoff(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
         ));
     }
     let what = args.0.remove(0);
+    args.1 = format!("handoff {what}");
     match what.as_str() {
-        "export-psp" => handoff_export_psp(wallet, args),
-        "export-fsp" => handoff_export_fsp(wallet, args),
+        "export-psp" => handoff_export_psp(wallet, args, start),
+        "export-fsp" => handoff_export_fsp(wallet, args, start),
         "export" => Err(WalletError::Invalid(
             "`handoff export` was split in two, because the combined handoff could be built in ways that are not allowed. Use `handoff export-psp` (a developer to a user: PSP only, sealed to the user's DID) or `handoff export-fsp` (your own new device: FSP and your DID key)".into(),
         )),
-        "import" => handoff_import(wallet, args),
+        "import" => handoff_import(wallet, args, start),
         "list" => {
             args.done()?;
+            start.run(wallet);
             for h in wallet.handoffs_out() {
                 println!(
                     "out {} {} {:?} {} PSP {} FSP in {} note(s){}{}{}",
@@ -1133,8 +1262,9 @@ fn handoff(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
         "check" => {
             let rest = args.rest();
             let [id] = rest.as_slice() else {
-                return Err(WalletError::Invalid("handoff check takes an ID".into()));
+                return Err(takes("handoff check", "one handoff ID"));
             };
+            start.run(wallet);
             let standing = ecash_wallet::mint_info::check_handoff(wallet, &air_settings(), id)?;
             print_standing(id, &standing);
             Ok(())
@@ -1142,8 +1272,9 @@ fn handoff(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
         "reclaim" => {
             let rest = args.rest();
             let [id] = rest.as_slice() else {
-                return Err(WalletError::Invalid("handoff reclaim takes an ID".into()));
+                return Err(takes("handoff reclaim", "one handoff ID"));
             };
+            start.run(wallet);
             let done = ecash_wallet::mint_info::reclaim_handoff(wallet, &air_settings(), id)?;
             for line in &done.log {
                 println!("{line}");
@@ -1154,8 +1285,9 @@ fn handoff(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
         "cancel" => {
             let rest = args.rest();
             let [id] = rest.as_slice() else {
-                return Err(WalletError::Invalid("handoff cancel takes an ID".into()));
+                return Err(takes("handoff cancel", "one handoff ID"));
             };
+            start.run(wallet);
             let n = wallet.cancel_handoff(id)?;
             println!(
                 "put back {n} note(s) without asking the mint. If the other wallet already has the handoff, it holds the same secrets: the first of you to swap or spend a note wins. For a PSP handoff, `handoff reclaim` lets the mint decide first"
@@ -1165,8 +1297,9 @@ fn handoff(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
         "done" => {
             let rest = args.rest();
             let [id] = rest.as_slice() else {
-                return Err(WalletError::Invalid("handoff done takes an ID".into()));
+                return Err(takes("handoff done", "one handoff ID"));
             };
+            start.run(wallet);
             wallet.finish_handoff(id)?;
             println!("handoff {id} is done; its notes are no longer kept here");
             Ok(())
@@ -1246,7 +1379,11 @@ fn check_out_file(out: &Option<String>) -> Result<(), WalletError> {
     Ok(())
 }
 
-fn handoff_export_psp(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
+fn handoff_export_psp(
+    wallet: &mut Wallet,
+    mut args: Args,
+    start: Startup,
+) -> Result<(), WalletError> {
     let to = args.flag("--to")?.ok_or_else(|| {
         WalletError::Invalid(
             "a PSP handoff is sealed to the recipient: give their DID public key with --to (66 hex characters)".into(),
@@ -1261,13 +1398,18 @@ fn handoff_export_psp(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletE
     check_out_file(&out)?;
     let recipient = sp_wire::seal::parse_public_key(&to)
         .map_err(|e| WalletError::Invalid(format!("--to: {e}")))?;
+    start.run(wallet);
     let ids = wallet.select_psp_handoff(psp)?;
-    let mint = psp_base(wallet)?;
-    let made = wallet.export_psp_handoff(&ids, &mint, &recipient)?;
+    psp_base(wallet)?;
+    let made = wallet.export_psp_handoff(&ids, air_settings().psp_did(), &recipient)?;
     handoff_deliver(&made, out)
 }
 
-fn handoff_export_fsp(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
+fn handoff_export_fsp(
+    wallet: &mut Wallet,
+    mut args: Args,
+    start: Startup,
+) -> Result<(), WalletError> {
     let mut fsp = Vec::new();
     while let Some(v) = args.flag("--fsp")? {
         let (service, units) = v
@@ -1287,6 +1429,7 @@ fn handoff_export_fsp(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletE
     args.done()?;
     check_out_file(&out)?;
     let key = did_key_from_file(&did_file)?;
+    start.run(wallet);
     let ids = wallet.select_fsp_handoff(&fsp)?;
     let made = wallet.export_fsp_handoff(&ids, &key)?;
     handoff_deliver(&made, out)
@@ -1307,7 +1450,7 @@ fn handoff_text(arg: &str) -> Result<String, WalletError> {
     Ok(arg.to_string())
 }
 
-fn handoff_import(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
+fn handoff_import(wallet: &mut Wallet, mut args: Args, start: Startup) -> Result<(), WalletError> {
     use ecash_wallet::handoff::{FSP_WARNING, HandoffKind, PSP_WARNING};
     let from = args.flag("--from")?.unwrap_or_default();
     let did_out = args.flag("--did-key-out")?;
@@ -1334,7 +1477,8 @@ fn handoff_import(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError
                 )
             })?;
             let key = did_key_from_file(&file)?;
-            wallet.import_psp_handoff(&text, &key, &from)?
+            start.run(wallet);
+            wallet.import_psp_handoff(&text, &key, air_settings().psp_did(), &from)?
         }
         _ => {
             if did_file.is_some() {
@@ -1355,6 +1499,7 @@ fn handoff_import(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError
                 }
                 Some(_) => {}
             }
+            start.run(wallet);
             wallet.import_fsp_handoff(&text, &from)?
         }
     };
@@ -1406,11 +1551,12 @@ fn handoff_import(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError
     Ok(())
 }
 
-fn merge_command(wallet: &mut Wallet, args: Args) -> Result<(), WalletError> {
+fn merge_command(wallet: &mut Wallet, args: Args, start: Startup) -> Result<(), WalletError> {
     let rest = args.rest();
     let [path] = rest.as_slice() else {
-        return Err(WalletError::Invalid("merge takes one wallet file".into()));
+        return Err(takes("merge", "one wallet file"));
     };
+    start.run(wallet);
     let r = wallet.merge_file(std::path::Path::new(path))?;
     println!(
         "merged {path}: {} note(s) added, {} removed because the other copy spent them, {} pending request(s) added, {} ended; version {}",
@@ -1452,7 +1598,7 @@ fn startup_rotation_sync(wallet: &mut Wallet) {
             }
             Err(_) => continue,
         };
-        match ecash_wallet::mint_info::rotation_sync(wallet, &air_settings(), kind, base) {
+        match ecash_wallet::mint_info::rotation_sync(wallet, &air_settings(), kind, &base) {
             Ok(lines) => {
                 for l in lines {
                     eprintln!("{name}: {l}");
@@ -1472,7 +1618,7 @@ fn startup_psp_pickup(wallet: &mut Wallet) {
     let waiting = wallet
         .pending_purchases()
         .iter()
-        .filter(|p| p.reply_secret.is_some() && p.open.is_none())
+        .filter(|p| p.open.is_none())
         .count();
     if waiting == 0 {
         return;
@@ -1488,10 +1634,7 @@ fn startup_psp_pickup(wallet: &mut Wallet) {
         Ok(picked) => {
             for p in &picked {
                 use ecash_wallet::mint_info::Pickup;
-                if !matches!(
-                    p.what,
-                    Pickup::NotThere | Pickup::NoKey | Pickup::StillOpen(_)
-                ) {
+                if !matches!(p.what, Pickup::NotThere | Pickup::StillOpen(_)) {
                     eprintln!("psp: {}", pickup_line(p));
                 }
             }
@@ -1499,6 +1642,29 @@ fn startup_psp_pickup(wallet: &mut Wallet) {
         Err(e) => {
             eprintln!("psp: the PSP's deliveries were not checked, retried on the next run: {e}")
         }
+    }
+}
+
+/// At startup, right after the pickup: settle the PSP's open payments (a held or
+/// rejected purchase, a credit) with the reconciliation request each one's rules
+/// call for. Nothing is asked when none is open, and a payment that is waiting
+/// for the PSP's answer is not mentioned (the same request is sent again at the
+/// next start). A missing `air.server` or `air.host` is said, as a note.
+fn startup_psp_reconcile(wallet: &mut Wallet) {
+    match reconcile_psp(wallet) {
+        Ok(reports) => {
+            for r in &reports {
+                if !matches!(r.what, ecash_wallet::mint_info::Reconciled::Waiting { .. }) {
+                    eprintln!("psp: {}", reconcile_line(r));
+                }
+            }
+        }
+        Err(e @ WalletError::Invalid(_)) => {
+            eprintln!("psp: the payments waiting to be settled were not checked: {e}")
+        }
+        Err(e) => eprintln!(
+            "psp: the payments waiting to be settled were not checked, retried on the next run: {e}"
+        ),
     }
 }
 
@@ -1542,28 +1708,21 @@ fn fsp_service(args: &mut Args) -> Result<ServiceDid, WalletError> {
     }
 }
 
-fn fsp(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
+fn fsp(wallet: &mut Wallet, mut args: Args, start: Startup) -> Result<(), WalletError> {
     if args.0.is_empty() {
         return Err(WalletError::Invalid(
             "fsp needs issue, pay or sync. Run with --help".into(),
         ));
     }
     let what = args.0.remove(0);
+    args.1 = format!("fsp {what}");
     let service = fsp_service(&mut args)?;
-    // The service's mint is reached through its air.fsp entry: without one the
-    // command is refused here, naming the setting, before anything is sent.
-    let air = air_settings();
-    air.fsp_for(service).map_err(WalletError::Invalid)?;
-    verify_mint_of(wallet, config::Party::Fsp(service))?;
-    // Every connection: pending requests, keys, rollover.
-    let sync = ecash_wallet::mint_info::fsp_sync(wallet, &air, service)?;
-    for line in sync.log {
-        eprintln!("fsp {service}: {line}");
-    }
-    match what.as_str() {
+    // Every flag is read, and a missing or bad one refused, before any mint is
+    // asked anything: a user error never depends on the network.
+    let ask = match what.as_str() {
         "sync" => {
             args.done()?;
-            Ok(())
+            FspAsk::Sync
         }
         "issue" => {
             let units: Option<u128> = match (args.flag("--esp")?, args.flag("--psp")?) {
@@ -1573,24 +1732,7 @@ fn fsp(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
                 _ => return Err(WalletError::Invalid("give --esp or --psp, not both".into())),
             };
             args.done()?;
-            let fees = ecash_wallet::mint_info::fsp_fees(wallet, &air, service)?;
-            // Notes from before keysets were recorded name the ESP mint's
-            // live set; best effort, the Issuer refuses a missing one.
-            if let Ok(esp) = esp_base(wallet) {
-                if let Err(e) =
-                    ecash_wallet::mint_info::sync_esp_keysets(wallet, &air_settings(), esp)
-                {
-                    eprintln!("esp: keysets not read: {e}");
-                }
-            }
-            let request = wallet.build_fsp_issue(service, units, fees.issue_fee_per_byte)?;
-            let id = request.hash();
-            println!("issue {id}: {} group(s)", request.groups.len());
-            println!(
-                "{}",
-                ecash_wallet::mint_info::settle_fsp(wallet, &air, &id)?
-            );
-            Ok(())
+            FspAsk::Issue(units)
         }
         "pay" => {
             let units = number(
@@ -1601,6 +1743,39 @@ fn fsp(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
             )?;
             let memo = args.flag("--memo")?.unwrap_or_default();
             args.done()?;
+            FspAsk::Pay { units, memo }
+        }
+        other => {
+            return Err(WalletError::Invalid(format!(
+                "unknown fsp command `{other}`"
+            )));
+        }
+    };
+    // The service's mint is reached through its air.fsp entry: without one the
+    // command is refused here, naming the setting, before anything is sent.
+    let air = air_settings();
+    air.fsp_for(service).map_err(WalletError::Invalid)?;
+    start.run(wallet);
+    verify_mint_of(wallet, config::Party::Fsp(service))?;
+    // Every connection: pending requests, keys, rollover.
+    let sync = ecash_wallet::mint_info::fsp_sync(wallet, &air, service)?;
+    for line in sync.log {
+        eprintln!("fsp {service}: {line}");
+    }
+    match ask {
+        FspAsk::Sync => Ok(()),
+        FspAsk::Issue(units) => {
+            let fees = ecash_wallet::mint_info::fsp_fees(wallet, &air, service)?;
+            let request = wallet.build_fsp_issue(service, units, fees.issue_fee_per_byte)?;
+            let id = request.hash();
+            println!("issue {id}: {} group(s)", request.groups.len());
+            println!(
+                "{}",
+                ecash_wallet::mint_info::settle_fsp(wallet, &air, &id)?
+            );
+            Ok(())
+        }
+        FspAsk::Pay { units, memo } => {
             let request = wallet.build_fsp_spend(service, units, &memo)?;
             let id = request.hash();
             println!("spend {id}");
@@ -1610,13 +1785,17 @@ fn fsp(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
             );
             Ok(())
         }
-        other => Err(WalletError::Invalid(format!(
-            "unknown fsp command `{other}`"
-        ))),
     }
 }
 
-fn fsp_window(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
+/// What `fsp` was asked to do, read from its flags before any mint is contacted.
+enum FspAsk {
+    Sync,
+    Issue(Option<u128>),
+    Pay { units: u64, memo: String },
+}
+
+fn fsp_window(wallet: &mut Wallet, mut args: Args, start: Startup) -> Result<(), WalletError> {
     let service = service_did(
         &args
             .flag("--service")?
@@ -1625,6 +1804,7 @@ fn fsp_window(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
     args.done()?;
     let air = air_settings();
     air.fsp_for(service).map_err(WalletError::Invalid)?;
+    start.run(wallet);
     sync_and_log(wallet, service);
     let w = ecash_wallet::mint_info::fsp_rotation(wallet, &air, service)?;
     let when = |t: Option<u64>| match t {
@@ -1667,12 +1847,13 @@ fn fsp_window(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
     Ok(())
 }
 
-fn esp_schedule(wallet: &Wallet, mut args: Args) -> Result<(), WalletError> {
+fn esp_schedule(wallet: &mut Wallet, mut args: Args, start: Startup) -> Result<(), WalletError> {
     let by = match args.flag("--by")? {
         Some(d) => Some(ecash_wallet::date::parse_date(&d).map_err(WalletError::Invalid)?),
         None => None,
     };
     args.done()?;
+    start.run(wallet);
     let s = wallet.esp_schedule(today(), by);
     println!("esp held      {}", s.total);
     println!("mature now    {}", s.mature_now);
@@ -1750,7 +1931,7 @@ fn config_command(loaded: &config::Loaded, args: Args) -> Result<(), WalletError
 }
 
 fn run(raw: Vec<String>) -> Result<(), WalletError> {
-    let mut args = Args(raw);
+    let mut args = Args(raw, String::new());
     let wallet_flag = args.flag("--wallet")?;
     let config_flag = args.flag("--config")?;
     let _ = NETWORK.set(take_network(&mut args)?);
@@ -1759,9 +1940,7 @@ fn run(raw: Vec<String>) -> Result<(), WalletError> {
         return Ok(());
     }
     let command = args.0.remove(0);
-    if command == "migrate" {
-        return migrate_wallet();
-    }
+    args.1 = command.clone();
     let path = wallet_path(wallet_flag)?;
     let loaded = load_settings(&path, config_flag)?;
     if command == "config" {
@@ -1774,32 +1953,26 @@ fn run(raw: Vec<String>) -> Result<(), WalletError> {
     for warning in settings.air.placeholder_warnings() {
         eprintln!("{warning}");
     }
-    let mut wallet = Wallet::open(&path)?;
-    // A wallet file from before an FSP note's service was kept: fill it in from
-    // the mints seen, and leave the rest marked unknown.
-    match wallet.fill_fsp_services() {
-        Ok(0) => {}
-        Ok(n) => eprintln!("the service of {n} FSP note(s) was filled in from the mints seen"),
-        Err(e) => eprintln!("FSP services not filled in: {e}"),
-    }
-    startup_fsp_sync(&mut wallet);
-    startup_psp_pickup(&mut wallet);
-    startup_rotation_sync(&mut wallet);
+    let mut wallet = Wallet::open(&path, network())?;
+    wallet.set_psp_min_purchase(settings.psp.min_purchase)?;
+    // The startup steps use the network, so a command runs them itself once its
+    // own arguments are read and checked: a user error never waits on the network.
+    let start = Startup::new();
     match command.as_str() {
-        "fsp" => fsp(&mut wallet, args),
-        "fsp-window" => fsp_window(&mut wallet, args),
-        "esp-schedule" => esp_schedule(&wallet, args),
-        "buy-psp" => buy_psp(&mut wallet, args),
-        "claim-psp" => claim_psp(&mut wallet, args),
-        "exchange" => exchange(&mut wallet, args),
-        "receive" => receive(&mut wallet, args),
-        "redeem" => redeem(&mut wallet, args),
-        "balance" => balance(&wallet, args),
+        "fsp" => fsp(&mut wallet, args, start),
+        "fsp-window" => fsp_window(&mut wallet, args, start),
+        "esp-schedule" => esp_schedule(&mut wallet, args, start),
+        "buy-psp" => buy_psp(&mut wallet, args, start),
+        "claim-psp" => claim_psp(&mut wallet, args, start),
+        "exchange" => exchange(&mut wallet, args, start),
+        "receive" => receive(&mut wallet, args, start),
+        "redeem" => redeem(&mut wallet, args, start),
+        "balance" => balance(&mut wallet, args, start),
         "send-psp" | "receive-psp" | "sent" => Err(WalletError::Invalid(format!(
-            "`{command}` was removed. A PSP handoff replaces it: `handoff export-psp --to DID --psp N` to give PSP, `handoff import` to take it, `handoff check ID` and `handoff reclaim ID` for what `sent --check` and `sent --reclaim` did. Tokens in an old wallet file are PSP handoffs now (see `handoff list`)"
+            "`{command}` was removed. A PSP handoff replaces it: `handoff export-psp --to DID --psp N` to give PSP, `handoff import` to take it, `handoff check ID` and `handoff reclaim ID` for what `sent --check` and `sent --reclaim` did."
         ))),
-        "handoff" => handoff(&mut wallet, args),
-        "merge" => merge_command(&mut wallet, args),
+        "handoff" => handoff(&mut wallet, args, start),
+        "merge" => merge_command(&mut wallet, args, start),
         other => Err(WalletError::Invalid(format!(
             "unknown command `{other}`. Run with --help"
         ))),
@@ -1841,7 +2014,7 @@ mod tests {
 
     #[test]
     fn an_fsp_command_without_service_is_refused() {
-        let mut args = Args(vec!["--units".into(), "5".into()]);
+        let mut args = Args(vec!["--units".into(), "5".into()], String::new());
         match fsp_service(&mut args) {
             Err(WalletError::Invalid(m)) => assert!(m.contains("--service"), "{m}"),
             other => panic!("expected a refusal, got {other:?}"),
@@ -1853,12 +2026,15 @@ mod tests {
     #[test]
     fn an_fsp_command_takes_the_service_it_is_given() {
         let did = config::BUILTIN_SPI_DID.to_string();
-        let mut args = Args(vec![
-            "--service".into(),
-            did.clone(),
-            "--units".into(),
-            "5".into(),
-        ]);
+        let mut args = Args(
+            vec![
+                "--service".into(),
+                did.clone(),
+                "--units".into(),
+                "5".into(),
+            ],
+            String::new(),
+        );
         assert_eq!(fsp_service(&mut args).unwrap().to_hex(), did);
         assert_eq!(args.0, vec!["--units".to_string(), "5".to_string()]);
     }

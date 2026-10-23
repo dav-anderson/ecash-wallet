@@ -4,6 +4,10 @@
 //! signs the canonical request, sends it, and collects the outcome by sending it
 //! again.
 //!
+//! One test starts from fsp-mint instead of from notes the fixture signs: the ESP
+//! that fsp-mint kept is written by its `export_esp`, taken in by a service's
+//! wallet and redeemed.
+//!
 //! A redemption never calls the PSP, so the PSP stand-in refuses every call.
 //! These are plain tests with their own runtime, because the operator's calls
 //! use the blocking HTTP client. The AIR client always dials port 5702, so they
@@ -17,25 +21,26 @@ use std::sync::{Arc, Mutex};
 
 use axum::Router;
 use ecash_wallet::config::AirSettings;
-use ecash_wallet::mint_info::{fetch_redeem_fees, send_redeem, sync_esp_keysets};
+use ecash_wallet::mint_info::{fetch_redeem_fees, send_redeem, settle_fsp, sync_esp_keysets};
 use ecash_wallet::redeem::{EntryOutcome, RedeemOutcome, RedemptionState};
-use ecash_wallet::store::{HandedNote, Handover};
-use ecash_wallet::{Wallet, WalletError};
+use ecash_wallet::store::{HandedNote, Handover, StoredTerms};
+use ecash_wallet::{Kind, Wallet, WalletError};
 use esp_mint::admin::{self, AdminState};
-use esp_mint::exchange::{Burn, Psp};
+use esp_mint::config::Config;
 use esp_mint::queue::Queue;
 use esp_mint::redeem::{self, Reason};
-use esp_mint::responses::Responses;
 use esp_mint::server::EspState;
 use esp_mint::terms::Terms;
-use mint_types::{Amount, BlindNonce, MintInput, MintOutput, Nonce, Note};
-use rand::rngs::OsRng;
+use fsp_mint::export::export_esp;
+use fsp_mint::issue::Issues;
+use mint_types::{Amount, Note};
 use secp256k1::{Keypair, SECP256K1, SecretKey};
 use serde_json::{Value, json};
 use sp_wire::ServiceDid;
 use tokio::runtime::Runtime;
 
-use common::EspAt;
+use common::air::{EspAt, Mints, service_keypair};
+use common::{EspMint, NoPsp, esp_record, open_wallet, scratch};
 
 /// A test amount, a power of two (about $1.10). Every ESP note is one.
 const ONE: u64 = 1 << 40;
@@ -48,29 +53,11 @@ const PAST2: u64 = 200;
 const FUTURE: u64 = 1_000_000;
 const RATE: u128 = 1_000_000;
 const MEMO: &str = "btc:bc1qpayhere";
-/// What the wallet's records call the ESP (a key for its live keysets). Nothing
-/// dials it.
-const RECORD: &str = "http://127.0.0.1:3100";
-
 fn now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs()
-}
-
-fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("ecash-wallet-rdflow-{}-{name}", {
-        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        format!(
-            "{}-{}",
-            std::process::id(),
-            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        )
-    }));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
 }
 
 fn secret(n: u8) -> SecretKey {
@@ -81,18 +68,6 @@ fn secret(n: u8) -> SecretKey {
 
 fn service() -> ServiceDid {
     ServiceDid::from(Keypair::from_secret_key(SECP256K1, &secret(1)).public_key())
-}
-
-struct NoPsp;
-
-impl Psp for NoPsp {
-    fn melt(&self, _inputs: &[MintInput], _memo: &str) -> Result<Amount, String> {
-        Err("a redemption does not use the PSP".into())
-    }
-
-    fn burns(&self, _nonces: &[Nonce]) -> Result<Vec<Burn>, String> {
-        Err("a redemption does not use the PSP".into())
-    }
 }
 
 fn serve(rt: &Runtime, app: Router) -> String {
@@ -110,6 +85,7 @@ struct Mint {
     /// The wallet's `[air]` settings pointing at the ESP mint.
     air: AirSettings,
     admin: String,
+    esp: EspMint,
     state: Arc<EspState>,
     queue_path: PathBuf,
     /// Last, so the turn on the AIR server ends after the rest is dropped.
@@ -117,79 +93,46 @@ struct Mint {
 }
 
 fn start(rt: &Runtime, dir: &Path, max_bytes: usize) -> Mint {
-    let (logic, master) = esp_mint::mint::open(&dir.join("esp")).unwrap();
-    let responses = Responses::open(&dir.join("esp").join("responses.json")).unwrap();
-    let queue_path = dir.join("esp").join("queue.json");
-    let state = Arc::new(EspState {
-        logic: Mutex::new(logic),
-        master,
-        psp: Box::new(NoPsp),
-        responses: Mutex::new(responses),
-        queue_path: queue_path.clone(),
-        queue_lock: Mutex::new(()),
-        in_flight: Default::default(),
-        config: esp_mint::config::Handle::new(esp_mint::config::Config {
+    // A redemption never calls the PSP.
+    let esp = EspMint::open(
+        &dir.join("esp"),
+        Box::new(NoPsp),
+        Config {
             redeem_fee_per_byte: RATE as u64,
             redeem_max_request_bytes: max_bytes,
-            ..esp_mint::config::Config::default()
-        }),
-        rotor: None,
-        rollovers: None,
-    });
+            ..Config::default()
+        },
+        0,
+    );
+    let state = Arc::clone(&esp.state);
+    let queue_path = state.queue_path.clone();
     // The listener keeps its state in a folder of its own, outside `dir`, which a
     // test removes while the listener is still running.
-    let esp = EspAt::new(Arc::clone(&state), &scratch("airstate"));
-    let air = esp.air(10, 3);
+    let at = EspAt::new(Arc::clone(&state), &scratch("airstate"));
+    let air = at.air(10, 3);
     let admin = serve(
         rt,
         admin::router(Arc::new(AdminState {
             queue_path: queue_path.clone(),
             lock: Mutex::new(()),
             token: None,
-            esp: Some(Arc::clone(&state)),
+            esp: Arc::clone(&state),
         })),
     );
     Mint {
         air,
         admin,
+        esp,
         state,
         queue_path,
-        _esp: esp,
+        _esp: at,
     }
 }
 
 /// A note the mint has issued for `service` and `day`, handed over as a
 /// customer would.
 fn handed(mint: &Mint, units: u64, day: u64) -> HandedNote {
-    let terms = Terms {
-        service: service(),
-        redeemable_after_day: day,
-    };
-    let keypair = Keypair::new(SECP256K1, &mut OsRng);
-    let nonce = Nonce(keypair.public_key());
-    let (blind_point, blinding_key) = bdhke::blind_message(&nonce.as_hash_preimage(), None);
-    let amount = Amount::from_units(units);
-    let sk = mint.state.master.key_for(amount, &terms);
-    let outcome = mint
-        .state
-        .logic
-        .lock()
-        .unwrap()
-        .issue_with_key(
-            &sk,
-            &MintOutput {
-                amount,
-                blind_nonce: BlindNonce(blind_point),
-            },
-        )
-        .unwrap();
-    let signature = bdhke::unblind_message(&outcome.0, &blinding_key, &sk.public_key(SECP256K1));
-    HandedNote {
-        amount: units,
-        note: Note { nonce, signature },
-        spend_secret: keypair.secret_key(),
-        keyset: esp_mint::rotation::keyset_id(&mint.state.master),
-    }
+    mint.esp.handed(&service(), units, day)
 }
 
 fn give(wallet: &mut Wallet, day: u64, notes: Vec<HandedNote>) {
@@ -203,12 +146,7 @@ fn give(wallet: &mut Wallet, day: u64, notes: Vec<HandedNote>) {
 }
 
 fn is_spent(mint: &Mint, note: &Note) -> bool {
-    mint.state
-        .logic
-        .lock()
-        .unwrap()
-        .is_spent(note.nonce)
-        .unwrap()
+    mint.esp.is_spent(note)
 }
 
 /// True when the mint signed this wallet note under its service and day.
@@ -237,7 +175,12 @@ fn admin_post(mint: &Mint, path: &str, body: &Value) -> Value {
 
 /// Send one built request the way the command does: on `refund_required` or
 /// `outputs_over_limit` rebuild from the mint's totals and send again.
-fn send(mint: &Mint, wallet: &mut Wallet, mut id: String) -> RedeemOutcome {
+fn send(mint: &Mint, wallet: &mut Wallet, id: String) -> RedeemOutcome {
+    send_to(&mint.air, wallet, id)
+}
+
+/// As [`send`], to the ESP mint the `[air]` settings `air` point at.
+fn send_to(air: &AirSettings, wallet: &mut Wallet, mut id: String) -> RedeemOutcome {
     for _ in 0..4 {
         let body = wallet
             .pending_redemptions()
@@ -246,7 +189,7 @@ fn send(mint: &Mint, wallet: &mut Wallet, mut id: String) -> RedeemOutcome {
             .unwrap()
             .body()
             .unwrap();
-        match send_redeem(wallet, &mint.air, &body) {
+        match send_redeem(wallet, air, &body) {
             Ok(response) => return wallet.finish_redemption(&id, &response).unwrap(),
             Err(WalletError::RedeemRefused {
                 code,
@@ -269,8 +212,8 @@ fn queued_then_declined_then_collected_with_the_fee_shown_and_retries_idempotent
     let dir = scratch("decline");
     let rt = Runtime::new().unwrap();
     let mint = start(&rt, &dir, 1 << 20);
-    let mut wallet = Wallet::open(&dir.join("wallet.json")).unwrap();
-    sync_esp_keysets(&mut wallet, &mint.air, RECORD).unwrap();
+    let mut wallet = open_wallet(&dir.join("wallet.json")).unwrap();
+    sync_esp_keysets(&mut wallet, &mint.air, &esp_record(&mint.air)).unwrap();
     let a = handed(&mint, 4 * ONE, PAST);
     let b = handed(&mint, 2 * ONE, PAST2);
     let (na, nb) = (a.note, b.note);
@@ -316,8 +259,8 @@ fn queued_then_declined_then_collected_with_the_fee_shown_and_retries_idempotent
     assert_eq!(again.entry, Some(EntryOutcome::Open));
     assert_eq!(Queue::open(&mint.queue_path).unwrap().len(), 1);
     // and the wallet survives a reopen with the redemption still waiting
-    let mut wallet = Wallet::open(&dir.join("wallet.json")).unwrap();
-    sync_esp_keysets(&mut wallet, &mint.air, RECORD).unwrap();
+    let mut wallet = open_wallet(&dir.join("wallet.json")).unwrap();
+    sync_esp_keysets(&mut wallet, &mint.air, &esp_record(&mint.air)).unwrap();
     assert_eq!(wallet.pending_redemptions().len(), 1);
 
     admin_post(
@@ -355,8 +298,8 @@ fn a_paid_entry_is_collected_as_completed() {
     let dir = scratch("paid");
     let rt = Runtime::new().unwrap();
     let mint = start(&rt, &dir, 1 << 20);
-    let mut wallet = Wallet::open(&dir.join("wallet.json")).unwrap();
-    sync_esp_keysets(&mut wallet, &mint.air, RECORD).unwrap();
+    let mut wallet = open_wallet(&dir.join("wallet.json")).unwrap();
+    sync_esp_keysets(&mut wallet, &mint.air, &esp_record(&mint.air)).unwrap();
     give(&mut wallet, PAST, vec![handed(&mint, ONE, PAST)]);
     let fees = fetch_redeem_fees(&mut wallet, &mint.air).unwrap();
     let b = wallet
@@ -386,8 +329,8 @@ fn a_note_immature_at_the_mint_is_refunded_and_nothing_owed_fee_taken() {
     let dir = scratch("refund");
     let rt = Runtime::new().unwrap();
     let mint = start(&rt, &dir, 1 << 20);
-    let mut wallet = Wallet::open(&dir.join("wallet.json")).unwrap();
-    sync_esp_keysets(&mut wallet, &mint.air, RECORD).unwrap();
+    let mut wallet = open_wallet(&dir.join("wallet.json")).unwrap();
+    sync_esp_keysets(&mut wallet, &mint.air, &esp_record(&mint.air)).unwrap();
     // a small mature note that cannot pay the fee, and a large one the mint
     // will find immature
     let small = handed(&mint, SMALL, PAST);
@@ -449,8 +392,8 @@ fn a_note_spent_elsewhere_is_dropped_on_rebuild_and_the_rest_is_queued() {
         spend_secret: x.spend_secret,
         keyset: x.keyset.clone(),
     };
-    let mut first = Wallet::open(&dir.join("first.json")).unwrap();
-    sync_esp_keysets(&mut first, &mint.air, RECORD).unwrap();
+    let mut first = open_wallet(&dir.join("first.json")).unwrap();
+    sync_esp_keysets(&mut first, &mint.air, &esp_record(&mint.air)).unwrap();
     give(&mut first, PAST, vec![x]);
     let fees = fetch_redeem_fees(&mut first, &mint.air).unwrap();
     let b = first
@@ -459,8 +402,8 @@ fn a_note_spent_elsewhere_is_dropped_on_rebuild_and_the_rest_is_queued() {
         .remove(0);
     send(&mint, &mut first, b.id);
     // a second copy of the wallet still holds the same note, and one more
-    let mut second = Wallet::open(&dir.join("second.json")).unwrap();
-    sync_esp_keysets(&mut second, &mint.air, RECORD).unwrap();
+    let mut second = open_wallet(&dir.join("second.json")).unwrap();
+    sync_esp_keysets(&mut second, &mint.air, &esp_record(&mint.air)).unwrap();
     give(&mut second, PAST, vec![copy, handed(&mint, 2 * ONE, PAST)]);
     let b = second
         .build_redemption(&secret(1), MEMO, &fees, now())
@@ -487,8 +430,8 @@ fn a_below_fee_refusal_moves_the_notes_the_mint_calls_spent_to_the_spent_record(
         spend_secret: x.spend_secret,
         keyset: x.keyset.clone(),
     };
-    let mut first = Wallet::open(&dir.join("first.json")).unwrap();
-    sync_esp_keysets(&mut first, &mint.air, RECORD).unwrap();
+    let mut first = open_wallet(&dir.join("first.json")).unwrap();
+    sync_esp_keysets(&mut first, &mint.air, &esp_record(&mint.air)).unwrap();
     give(&mut first, PAST, vec![x]);
     let fees = fetch_redeem_fees(&mut first, &mint.air).unwrap();
     let b = first
@@ -500,8 +443,8 @@ fn a_below_fee_refusal_moves_the_notes_the_mint_calls_spent_to_the_spent_record(
 
     // a second wallet holds only a copy of the spent note. It looks worth the
     // fee to the wallet, but to the mint it is worth nothing: below_fee
-    let mut second = Wallet::open(&dir.join("second.json")).unwrap();
-    sync_esp_keysets(&mut second, &mint.air, RECORD).unwrap();
+    let mut second = open_wallet(&dir.join("second.json")).unwrap();
+    sync_esp_keysets(&mut second, &mint.air, &esp_record(&mint.air)).unwrap();
     give(&mut second, PAST, vec![copy]);
     let b = second
         .build_redemption(&secret(1), MEMO, &fees, now())
@@ -527,11 +470,12 @@ fn a_below_fee_refusal_moves_the_notes_the_mint_calls_spent_to_the_spent_record(
     assert!(second.notes().is_empty());
     assert!(second.pending_redemptions().is_empty());
     // the wallet does not offer the spent note again
-    assert!(
-        second
-            .build_redemption(&secret(1), MEMO, &fees, now())
-            .is_err()
-    );
+    match second.build_redemption(&secret(1), MEMO, &fees, now()) {
+        Err(WalletError::NotEnough(why)) => {
+            assert!(why.contains("holds no free ESP for that service"), "{why}")
+        }
+        other => panic!("expected no free ESP, got {other:?}"),
+    }
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -545,8 +489,8 @@ fn a_redemption_over_the_ceiling_is_split_and_each_part_is_queued() {
     let most = ecash_wallet::redeem::MAX_OUTPUTS_PER_TERMS;
     let ceiling = redeem::encoded_len(2, MEMO.len(), most, most);
     let mint = start(&rt, &dir, ceiling as usize);
-    let mut wallet = Wallet::open(&dir.join("wallet.json")).unwrap();
-    sync_esp_keysets(&mut wallet, &mint.air, RECORD).unwrap();
+    let mut wallet = open_wallet(&dir.join("wallet.json")).unwrap();
+    sync_esp_keysets(&mut wallet, &mint.air, &esp_record(&mint.air)).unwrap();
     give(
         &mut wallet,
         PAST,
@@ -581,8 +525,8 @@ fn notes_below_the_fee_and_notes_of_another_service_are_refused_locally() {
     let dir = scratch("below");
     let rt = Runtime::new().unwrap();
     let mint = start(&rt, &dir, 1 << 20);
-    let mut wallet = Wallet::open(&dir.join("wallet.json")).unwrap();
-    sync_esp_keysets(&mut wallet, &mint.air, RECORD).unwrap();
+    let mut wallet = open_wallet(&dir.join("wallet.json")).unwrap();
+    sync_esp_keysets(&mut wallet, &mint.air, &esp_record(&mint.air)).unwrap();
     give(&mut wallet, PAST, vec![handed(&mint, 1_000, PAST)]);
     let fees = fetch_redeem_fees(&mut wallet, &mint.air).unwrap();
     assert!(matches!(
@@ -595,5 +539,128 @@ fn notes_below_the_fee_and_notes_of_another_service_are_refused_locally() {
     ));
     assert!(wallet.pending_redemptions().is_empty());
     assert!(wallet.notes().iter().all(|n| n.reserved_by.is_none()));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn esp_that_fsp_mint_kept_is_exported_received_and_redeemed_once_mature() {
+    let dir = scratch("export-esp");
+    // Both mints are real and rotate; the FSP mint first issued at `NOW`.
+    let m = Mints::start(&dir, "20", "2", None);
+    let service = common::air::service();
+
+    // A customer hands ESP over to the service's FSP mint, on two days: one long
+    // past, one far ahead of any clock.
+    let mut user = m.wallet_on_days(&dir, "user", &[(PAST, &[2 * ONE, ONE]), (FUTURE, &[ONE])]);
+    let issue = user.build_fsp_issue(service, None, 0).unwrap();
+    settle_fsp(&mut user, &m.air, &issue.hash()).unwrap();
+    assert_eq!(user.balance().fsp, u128::from(4 * ONE));
+    assert_eq!(user.balance().esp, 0, "the ESP went to the FSP mint");
+
+    // What fsp-mint kept, as its own file holds it.
+    let data = dir.join("fsp");
+    let kept = Issues::open(&data).unwrap().data.kept;
+    let on = |day: u64| kept.iter().filter(move |k| k.redeemable_after_day == day);
+    assert_eq!(
+        on(PAST).map(|k| u128::from(k.amount)).sum::<u128>(),
+        u128::from(3 * ONE)
+    );
+    assert_eq!(
+        on(FUTURE).map(|k| u128::from(k.amount)).sum::<u128>(),
+        u128::from(ONE)
+    );
+    assert_eq!(on(PAST).count() + on(FUTURE).count(), kept.len());
+    assert!(kept.iter().all(|k| !k.exported));
+
+    // `export_esp` writes one file for each day: nothing here is made by hand.
+    let out = scratch("export-esp-out");
+    let written = export_esp(&data, &out, service, 1_234).unwrap();
+    let (past_file, future_file) = (
+        out.join(format!("esp-{PAST}-1234.json")),
+        out.join(format!("esp-{FUTURE}-1234.json")),
+    );
+    assert_eq!(
+        written,
+        vec![
+            (past_file.clone(), on(PAST).count()),
+            (future_file.clone(), on(FUTURE).count()),
+        ]
+    );
+
+    // The service's wallet takes both files in with `receive_handover`, read as
+    // the command reads them.
+    let mut svc = open_wallet(&dir.join("service.json")).unwrap();
+    for file in [&past_file, &future_file] {
+        let handover = Handover::read(&std::fs::read(file).unwrap()).unwrap();
+        svc.receive_handover(&handover).unwrap();
+    }
+    // Every kept note is in the wallet: its amount, spend secret, service, day and
+    // the ESP keyset that signed it.
+    assert_eq!(svc.notes().len(), kept.len());
+    let keysets = svc.snapshot().keysets;
+    for k in &kept {
+        let held = svc
+            .notes()
+            .iter()
+            .find(|n| n.note == k.note)
+            .expect("a kept note is in the wallet");
+        assert_eq!(
+            (held.kind, held.amount, held.spend_secret, held.terms),
+            (
+                Kind::Esp,
+                k.amount,
+                k.spend_secret,
+                Some(StoredTerms {
+                    service,
+                    redeemable_after_day: k.redeemable_after_day,
+                })
+            )
+        );
+        assert_eq!(keysets[&held.id()], k.keyset);
+    }
+
+    // The same file again adds nothing: it is refused, and the wallet file is as
+    // it was.
+    let before = std::fs::read(svc.path()).unwrap();
+    let again = Handover::read(&std::fs::read(&past_file).unwrap()).unwrap();
+    match svc.receive_handover(&again) {
+        Err(WalletError::Invalid(why)) => {
+            assert!(why.contains("is already in this wallet"), "{why}")
+        }
+        other => panic!("expected the file to be refused the second time, got {other:?}"),
+    }
+    assert_eq!(svc.notes().len(), kept.len());
+    assert_eq!(std::fs::read(svc.path()).unwrap(), before);
+
+    // The service redeems what is mature at the ESP mint. The notes of the far
+    // day are not offered; they stay in the wallet.
+    let air = m.esp_at.air(10, 3);
+    sync_esp_keysets(&mut svc, &air, &esp_record(&air)).unwrap();
+    let fees = fetch_redeem_fees(&mut svc, &air).unwrap();
+    assert_eq!(fees.fee_per_byte, 0, "the ESP mint charges no fee here");
+    let built = svc
+        .build_redemption(&service_keypair().secret_key(), MEMO, &fees, now())
+        .unwrap();
+    assert_eq!(built.len(), 1);
+    let done = send_to(&air, &mut svc, built[0].id.clone());
+    assert_eq!(done.message, "payout queued");
+    assert_eq!(done.accepted_esp, u128::from(3 * ONE));
+    assert_eq!((done.rejected_esp, done.fee_esp), (0, 0));
+    assert_eq!(done.owed_esp, u128::from(3 * ONE));
+    for k in &kept {
+        assert_eq!(
+            m.esp.is_spent(&k.note),
+            k.redeemable_after_day == PAST,
+            "note of day {}",
+            k.redeemable_after_day
+        );
+    }
+    assert_eq!(svc.notes().len(), on(FUTURE).count());
+    assert!(
+        svc.notes()
+            .iter()
+            .all(|n| n.terms.unwrap().redeemable_after_day == FUTURE)
+    );
+    assert_eq!(Queue::open(&m.esp.state.queue_path).unwrap().len(), 1);
     std::fs::remove_dir_all(&dir).unwrap();
 }

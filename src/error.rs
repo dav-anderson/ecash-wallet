@@ -118,3 +118,39 @@ impl From<SealError> for WalletError {
         WalletError::Seal(e)
     }
 }
+
+/// Helpers for tests: the message of a refused call, after checking which
+/// error it is. A bare `is_err()` would pass for any failure.
+#[cfg(test)]
+pub(crate) mod expect {
+    use super::WalletError;
+    use std::fmt::Debug;
+
+    pub fn invalid<T: Debug>(r: Result<T, WalletError>) -> String {
+        match r {
+            Err(WalletError::Invalid(m)) => m,
+            other => panic!("expected WalletError::Invalid, got {other:?}"),
+        }
+    }
+
+    pub fn unknown<T: Debug>(r: Result<T, WalletError>) -> String {
+        match r {
+            Err(WalletError::Unknown(m)) => m,
+            other => panic!("expected WalletError::Unknown, got {other:?}"),
+        }
+    }
+
+    pub fn mint<T: Debug>(r: Result<T, WalletError>) -> String {
+        match r {
+            Err(WalletError::Mint(m)) => m,
+            other => panic!("expected WalletError::Mint, got {other:?}"),
+        }
+    }
+
+    pub fn not_enough<T: Debug>(r: Result<T, WalletError>) -> String {
+        match r {
+            Err(WalletError::NotEnough(m)) => m,
+            other => panic!("expected WalletError::NotEnough, got {other:?}"),
+        }
+    }
+}

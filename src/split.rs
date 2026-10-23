@@ -43,23 +43,6 @@ pub fn split(total: u128) -> Result<Vec<u64>, WalletError> {
     Ok(notes)
 }
 
-/// Exactly `n` notes that add up to `total`, each a power of two, largest first:
-/// the fewest, with the largest note halved until there are `n`. `None` when
-/// that cannot be done (fewer than the fewest, or more than `total`).
-pub fn split_into(total: u128, n: usize) -> Option<Vec<u64>> {
-    let mut notes = split(total).ok()?;
-    if n < notes.len() || n as u128 > total {
-        return None;
-    }
-    while notes.len() < n {
-        let i = notes.iter().position(|&a| a > 1)?;
-        let half = notes[i] / 2;
-        notes[i] = half;
-        notes.insert(i + 1, half);
-    }
-    Some(notes)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -86,24 +69,6 @@ mod tests {
         assert_eq!(split(1u128 << 63).unwrap(), vec![top]);
         assert_eq!(split((1u128 << 64) + 1).unwrap(), vec![top, top, 1]);
         assert!(split(u128::MAX).is_err());
-    }
-
-    #[test]
-    fn a_split_into_n_halves_the_largest_until_there_are_n() {
-        assert_eq!(split_into(13, 3).unwrap(), vec![8, 4, 1]);
-        assert_eq!(split_into(13, 4).unwrap(), vec![4, 4, 4, 1]);
-        assert_eq!(split_into(13, 13).unwrap(), vec![1; 13]);
-        assert!(split_into(13, 2).is_none());
-        assert!(split_into(13, 14).is_none());
-        for n in 15..=100 {
-            let notes = split_into(100_000_000_000, n).unwrap();
-            assert_eq!(notes.len(), n);
-            assert_eq!(
-                notes.iter().map(|&a| u128::from(a)).sum::<u128>(),
-                100_000_000_000
-            );
-            assert!(notes.iter().all(|a| a.is_power_of_two()));
-        }
     }
 
     #[test]

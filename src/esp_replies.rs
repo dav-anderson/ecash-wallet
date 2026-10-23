@@ -4,7 +4,7 @@
 //! - [`parse_esp_limits`] and [`parse_redeem_fees`] read the fees reply (AIR
 //!   kind 7),
 //! - [`exchange_refusal`] reads the body of a `400`-equivalent refusal of an
-//!   exchange or a transfer, and [`redeem_refusal`] that of a `400` or `413` of a
+//!   exchange, and [`redeem_refusal`] that of a `400` or `413` of a
 //!   redemption.
 //!
 //! A refusal that is not a `400` (and for the redemption not a `413`) is not read
@@ -15,23 +15,21 @@ use sp_wire::esp::redeem::Totals;
 use crate::error::WalletError;
 use crate::redeem::RedeemFees;
 
-/// The `exchange.max_items` and `transfer.max_items` of a fees body.
+/// The `exchange.max_items` of a fees body. (The body also carries the ESP's
+/// transfer limit; the wallet makes no transfer, so it does not read it.)
 pub fn parse_esp_limits(text: &str) -> Result<crate::store::EspLimits, String> {
     let body: serde_json::Value =
         serde_json::from_str(text).map_err(|e| format!("not JSON: {e}"))?;
-    let read = |part: &str| -> Result<usize, String> {
-        body[part]["max_items"]
-            .as_u64()
-            .map(|n| n as usize)
-            .ok_or_else(|| format!("no {part}.max_items"))
-    };
+    let exchange = body["exchange"]["max_items"]
+        .as_u64()
+        .map(|n| n as usize)
+        .ok_or_else(|| "no exchange.max_items".to_string())?;
     Ok(crate::store::EspLimits {
-        exchange_max_items: Some(read("exchange")?),
-        transfer_max_items: Some(read("transfer")?),
+        exchange_max_items: Some(exchange),
     })
 }
 
-/// Read the body of a `400` refusal of an exchange or a transfer. The ESP mint adds `code` and
+/// Read the body of a `400` refusal of an exchange. The ESP mint adds `code` and
 /// `spent` when PSP notes in the request were spent by a different request. That
 /// is [`WalletError::SpentElsewhere`]. Any other refusal, or a body that does not
 /// say so, is [`WalletError::Refused`].
@@ -89,6 +87,7 @@ pub fn parse_redeem_fees(text: &str) -> Result<RedeemFees, String> {
         fee_per_byte,
         max_request_bytes,
         max_memo_bytes,
+        caller_max_bytes: None,
     })
 }
 
@@ -121,100 +120,189 @@ pub fn redeem_refusal(text: &str) -> WalletError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use esp_mint::config::Config;
+    use esp_mint::exchange::Rejection;
+    use esp_mint::redeem::RedeemRejection;
+    use serde_json::{Value, json};
+    use sp_wire::esp::redeem::{NoteResult, Reason};
+
+    /// The body esp-mint answers a refused redemption with: the rejection's own
+    /// details, its text and its code.
+    fn redeem_body(r: &RedeemRejection) -> Value {
+        let mut body = r.details();
+        body["error"] = json!(r.to_string());
+        body["code"] = json!(r.code());
+        body
+    }
+
+    /// The fees body of an esp-mint with these limits and rates.
+    fn fees_of(exchange_items: usize, transfer_items: usize) -> Value {
+        let config = Config {
+            exchange_max_items: exchange_items,
+            transfer_max_items: transfer_items,
+            redeem_fee_per_byte: 1_000_000,
+            redeem_max_request_bytes: 15 << 20,
+            redeem_max_memo_bytes: 256,
+            ..Config::default()
+        };
+        esp_mint::server::fees_body(&config)
+    }
 
     #[test]
     fn a_below_fee_body_carries_the_per_note_reasons() {
-        let body = r#"{"error":"x","code":"below_fee","value_esp":"10","fee_esp":"20","notes":[{"accepted":false,"reason":"already_spent","burned":false},{"accepted":false,"reason":null,"burned":false}]}"#;
-        match redeem_refusal(body) {
-            WalletError::RedeemRefused { code, notes, .. } => {
+        let r = RedeemRejection::BelowFee {
+            value: 10,
+            fee: 20,
+            notes: vec![
+                NoteResult {
+                    accepted: false,
+                    reason: Some(Reason::AlreadySpent),
+                    burned: false,
+                },
+                NoteResult {
+                    accepted: false,
+                    reason: None,
+                    burned: false,
+                },
+            ],
+        };
+        let body = redeem_body(&r);
+        match redeem_refusal(&body.to_string()) {
+            WalletError::RedeemRefused {
+                code, why, notes, ..
+            } => {
                 assert_eq!(code, "below_fee");
+                assert_eq!(why, r.to_string());
                 assert_eq!(notes.len(), 2);
-                assert_eq!(
-                    notes[0].reason,
-                    Some(sp_wire::esp::redeem::Reason::AlreadySpent)
-                );
+                assert_eq!(notes[0].reason, Some(Reason::AlreadySpent));
                 assert_eq!(notes[1].reason, None);
             }
             other => panic!("expected RedeemRefused, got {other:?}"),
         }
-        // a mint that sends no list gives none
-        match redeem_refusal(r#"{"error":"x","code":"below_fee"}"#) {
-            WalletError::RedeemRefused { notes, .. } => assert!(notes.is_empty()),
+        // every other refusal has no `notes`: esp-mint adds the list to
+        // `below_fee` only (`RedeemRejection::details`)
+        let bad = RedeemRejection::BadServiceSignature;
+        match redeem_refusal(&redeem_body(&bad).to_string()) {
+            WalletError::RedeemRefused {
+                code, why, notes, ..
+            } => {
+                assert_eq!(code, "bad_service_signature");
+                assert_eq!(why, bad.to_string());
+                assert!(notes.is_empty());
+            }
             other => panic!("expected RedeemRefused, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn a_transfer_refusal_that_names_spent_inputs_is_read() {
-        let body =
-            r#"{"error":"note 1 is already spent","code":"note_spent_elsewhere","spent":[1]}"#;
-        // a transfer's body goes through exchange_refusal
-        match exchange_refusal(body) {
-            WalletError::SpentElsewhere { inputs, .. } => assert_eq!(inputs, vec![1]),
-            other => panic!("expected SpentElsewhere, got {other:?}"),
         }
     }
 
     #[test]
     fn the_note_limits_are_read_from_the_fees_body() {
-        let body = r#"{"exchange":{"max_items":50},"transfer":{"max_items":7},"redeem":{}}"#;
-        let l = parse_esp_limits(body).unwrap();
+        let body = fees_of(50, 7);
+        let l = parse_esp_limits(&body.to_string()).unwrap();
         assert_eq!(l.exchange_max_items, Some(50));
-        assert_eq!(l.transfer_max_items, Some(7));
-        assert!(
-            parse_esp_limits(r#"{"exchange":{"max_items":50}}"#)
-                .unwrap_err()
-                .contains("transfer.max_items")
+        // the body's transfer section is the mint's own and is not read: a body
+        // without it is as good
+        let mut without = body;
+        without.as_object_mut().unwrap().remove("transfer").unwrap();
+        assert_eq!(
+            parse_esp_limits(&without.to_string())
+                .unwrap()
+                .exchange_max_items,
+            Some(50)
         );
-        assert!(parse_esp_limits("nope").is_err());
+        without.as_object_mut().unwrap().remove("exchange").unwrap();
+        assert_eq!(
+            parse_esp_limits(&without.to_string()).unwrap_err(),
+            "no exchange.max_items"
+        );
+        let e = parse_esp_limits("nope").unwrap_err();
+        assert!(e.starts_with("not JSON:"), "{e}");
     }
 
     #[test]
     fn the_fees_body_is_read_and_a_different_size_formula_is_refused() {
-        let body = r#"{"redeem":{"fee_per_byte":"1000000","max_request_bytes":15728640,"max_memo_bytes":256,"size":{"fixed":120,"per_input":187,"per_output":82,"plus":"the memo's length in bytes"}}}"#;
-        let fees = parse_redeem_fees(body).unwrap();
+        let body = fees_of(50, 7);
+        let fees = parse_redeem_fees(&body.to_string()).unwrap();
         assert_eq!(fees.fee_per_byte, 1_000_000);
         assert_eq!(fees.max_request_bytes, 15 << 20);
         assert_eq!(fees.max_memo_bytes, 256);
-        let changed = body.replace("\"per_input\":187", "\"per_input\":188");
+        let mut changed = body;
+        changed["redeem"]["size"]["per_input"] = json!(188);
+        let e = parse_redeem_fees(&changed.to_string()).unwrap_err();
         assert!(
-            parse_redeem_fees(&changed)
-                .unwrap_err()
-                .contains("per_input")
+            e.contains("per_input = 188, but this wallet builds them with 187"),
+            "{e}"
         );
-        assert!(parse_redeem_fees("{}").is_err());
+        // a body with no redeem part at all
+        assert_eq!(
+            parse_redeem_fees("{}").unwrap_err(),
+            "no redeem.fee_per_byte"
+        );
     }
 
     #[test]
     fn a_redeem_refusal_keeps_its_code_and_totals() {
-        let body = r#"{"error":"refund_outputs are needed","code":"refund_required","totals":{"notes":[{"accepted":false,"reason":"immature","burned":true}],"accepted_esp":"0","rejected_esp":"5","fee_esp":"3","size_bytes":300,"fee_per_byte":"1","accepted_by_terms":[],"rejected_by_terms":[]}}"#;
-        match redeem_refusal(body) {
+        let r = RedeemRejection::RefundRequired {
+            totals: Totals {
+                notes: vec![NoteResult {
+                    accepted: false,
+                    reason: Some(Reason::Immature),
+                    burned: true,
+                }],
+                accepted_esp: 0,
+                rejected_esp: 5,
+                fee_esp: 3,
+                size_bytes: 300,
+                fee_per_byte: 1,
+                accepted_by_terms: vec![],
+                rejected_by_terms: vec![],
+            },
+        };
+        match redeem_refusal(&redeem_body(&r).to_string()) {
             WalletError::RedeemRefused { code, totals, .. } => {
                 assert_eq!(code, "refund_required");
                 let t = totals.unwrap();
                 assert_eq!((t.rejected_esp, t.fee_esp, t.size_bytes), (5, 3, 300));
+                assert_eq!(t.notes[0].reason, Some(Reason::Immature));
             }
             other => panic!("{other:?}"),
         }
-        match redeem_refusal(r#"{"error":"x","code":"below_fee","value_esp":"1","fee_esp":"2"}"#) {
+        // a refusal with no totals has none
+        let r = RedeemRejection::BelowFee {
+            value: 1,
+            fee: 2,
+            notes: vec![],
+        };
+        match redeem_refusal(&redeem_body(&r).to_string()) {
             WalletError::RedeemRefused { code, totals, .. } => {
                 assert_eq!(code, "below_fee");
                 assert!(totals.is_none());
             }
             other => panic!("{other:?}"),
         }
-        assert!(matches!(
-            redeem_refusal("junk"),
-            WalletError::RedeemRefused { .. }
-        ));
+        // not JSON at all (deliberately): the text is kept as it came
+        match redeem_refusal("junk") {
+            WalletError::RedeemRefused {
+                code, why, totals, ..
+            } => assert_eq!(
+                (code.as_str(), why.as_str(), totals),
+                ("unknown", "junk", None)
+            ),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
     fn a_spent_elsewhere_refusal_carries_which_notes() {
-        let body = r#"{"error":"a PSP note was spent by a different request","code":"note_spent_elsewhere","spent":[1,3]}"#;
-        match exchange_refusal(body) {
+        let r = Rejection::NoteSpentElsewhere { spent: vec![1, 3] };
+        // as esp-mint builds it for an exchange
+        let body = json!({
+            "error": r.to_string(),
+            "code": sp_wire::codes::NOTE_SPENT_ELSEWHERE,
+            "spent": [1, 3],
+        });
+        match exchange_refusal(&body.to_string()) {
             WalletError::SpentElsewhere { why, inputs } => {
-                assert_eq!(why, "a PSP note was spent by a different request");
+                assert_eq!(why, r.to_string());
                 assert_eq!(inputs, vec![1, 3]);
             }
             other => panic!("expected SpentElsewhere, got {other:?}"),
@@ -223,14 +311,18 @@ mod tests {
 
     #[test]
     fn every_other_400_is_an_ordinary_refusal() {
-        for body in [
-            r#"{"error":"an exchange must be exact"}"#,
+        let plain = json!({"error": Rejection::NoInputs.to_string()}).to_string();
+        // Off the contract on purpose: another code with indexes, the spent code
+        // with no indexes, the spent code with an empty list, and text that is
+        // not a body at all.
+        let off_contract = [
             r#"{"error":"x","code":"something_else","spent":[0]}"#,
             r#"{"error":"x","code":"note_spent_elsewhere"}"#,
             r#"{"error":"x","code":"note_spent_elsewhere","spent":[]}"#,
             "not json",
             "",
-        ] {
+        ];
+        for body in std::iter::once(plain.as_str()).chain(off_contract) {
             assert!(
                 matches!(exchange_refusal(body), WalletError::Refused(ref t) if t == body),
                 "{body}"

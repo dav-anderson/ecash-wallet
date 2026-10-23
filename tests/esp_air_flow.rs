@@ -1,11 +1,11 @@
 //! The ESP's calls over AIR, end to end: an `air_server` in this process,
 //! esp-mint's real AIR listener answering (with the same `serve` `esp-mint
 //! serve` runs), and the wallet asking, blocking, the way the command line does.
-//! Every call the wallet makes of the ESP runs against a real ESP mint (rotating
-//! or not, with a stand-in PSP for the exchange): mint info (`verify_esp`),
+//! Every call the wallet makes of the ESP runs against a real, rotating ESP mint
+//! (with a stand-in PSP for the exchange): mint info (`verify_esp`),
 //! keysets, fees and rotation (`sync_esp_keysets`, `sync_esp_limits`,
 //! `fetch_redeem_fees`, `esp_window`), rollover (`rotation_sync` for the ESP) and
-//! the three that spend, `send_exchange`, `send_transfer` and `send_redeem`.
+//! the two that spend, `send_exchange` and `send_redeem`.
 //! Refusals (a `400`, and a `409`, `413` and `404` that must not be taken for
 //! one), a mint that cannot answer, a request resent, a late reply, tampered and
 //! forged replies, the missing `air.server` and `air.host` (there is no HTTP
@@ -19,9 +19,10 @@
 //! built only with the `air-listener-tests` feature (the local-mints script
 //! turns on every feature).
 
+mod common;
+
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -33,20 +34,16 @@ use axum::{Json, Router};
 use ecash_wallet::air::{self, Party};
 use ecash_wallet::config::{AirSettings, BUILTIN_ESP_DID, BUILTIN_SPI_DID};
 use ecash_wallet::mint_info::{
-    esp_window, fetch_redeem_fees, rotation_sync, send_exchange, send_redeem, send_transfer,
-    sync_esp_keysets, sync_esp_limits, verify_esp, verify_psp,
+    esp_window, fetch_redeem_fees, rotation_sync, send_exchange, send_redeem, sync_esp_keysets,
+    sync_esp_limits, verify_esp, verify_psp,
 };
 use ecash_wallet::store::{HandedNote, Handover, PendingAirRequest, StoredNote, WalletData};
 use ecash_wallet::{Kind, Wallet, WalletError};
 use esp_mint::air_listener::{self, Serve, Settings};
-use esp_mint::config::{Config, Handle};
+use esp_mint::config::Config;
 use esp_mint::exchange;
 use esp_mint::psp_client::HttpPsp;
 use esp_mint::queue::Queue;
-use esp_mint::responses::Responses;
-use esp_mint::rotation::{Rollovers, Rotor};
-use esp_mint::server::{self, EspState};
-use esp_mint::terms::Terms;
 use mint_core::MintLogic;
 use mint_core::keygen;
 use mint_core::store::Store;
@@ -58,16 +55,14 @@ use secp256k1::{Keypair, SECP256K1, SecretKey};
 use sp_wire::air_request::addr::{self, reply_secret, seal_to, shared_wallet};
 use sp_wire::air_request::client::{self, ServerRef, block_on_new_runtime};
 use sp_wire::air_request::envelope::{STATUS_ANSWERED, WireRequest, build_reply};
-use sp_wire::air_request::{
-    KIND_EXCHANGE, KIND_FEES, KIND_MINT_INFO, KIND_TRANSFER, MintInfo, Served, local_server,
-};
+use sp_wire::air_request::{KIND_EXCHANGE, KIND_FEES, KIND_MINT_INFO, MintInfo, Served};
 use sp_wire::seal::SecretKey as DidKey;
 use sp_wire::{ServiceDid, WIRE_VERSION};
 
+use common::air::{server, slot_is_empty};
+use common::{EspMint, T0, esp_record, scratch};
+
 const NETWORK: &str = "main";
-/// What the wallet's records call the ESP (a key for its live keysets and swap
-/// times). Nothing dials it.
-const RECORD: &str = "http://127.0.0.1:3100";
 /// A test amount of PSP, as in the exchange tests.
 const ONE_PSP: u64 = 100_000_000_000;
 /// A test ESP note size, a power of two.
@@ -76,8 +71,7 @@ const ONE: u64 = 1 << 36;
 const PAST: u64 = 100;
 const DAY: u64 = 21_000;
 const MEMO: &str = "btc:bc1qpayhere";
-/// The rotating mint's clock at the start, and one rotation period.
-const T0: u64 = 1_800_000_000;
+/// One rotation period (the rotating mint's clock starts at `T0`).
 const H: u64 = 3600;
 /// Past the stagger window of a 1-hour period.
 const LATER: u64 = 100;
@@ -99,46 +93,6 @@ fn now() -> u64 {
         .as_secs()
 }
 
-fn scratch(name: &str) -> PathBuf {
-    static N: AtomicU64 = AtomicU64::new(0);
-    let dir = std::env::temp_dir().join(format!(
-        "ecash-wallet-espair-{}-{name}-{}",
-        std::process::id(),
-        N.fetch_add(1, Ordering::Relaxed)
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
-/// One test at a time on the shared AIR server. It has a single storage worker,
-/// so tests running in parallel starve each other past their timeouts.
-static AIR_TURN: Mutex<()> = Mutex::new(());
-
-/// The shared server plus this test's turn on it; the turn ends when this drops,
-/// whether the test passed, failed or panicked.
-struct Server {
-    server: ServerRef,
-    _turn: std::sync::MutexGuard<'static, ()>,
-}
-
-impl std::ops::Deref for Server {
-    type Target = ServerRef;
-
-    fn deref(&self) -> &ServerRef {
-        &self.server
-    }
-}
-
-fn server() -> Server {
-    let turn = AIR_TURN.lock().unwrap_or_else(|e| e.into_inner());
-    let server = local_server::start().expect("a local AIR server (is port 5702 free?)");
-    Server {
-        server,
-        _turn: turn,
-    }
-}
-
 fn mint_key() -> (DidKey, ServiceDid) {
     let key = DidKey::new();
     let did = addr::key_to_did(&key.public_key());
@@ -158,7 +112,7 @@ fn air_settings(server: &ServerRef, did: &ServiceDid, wait: u64, attempts: u32) 
 }
 
 fn open_wallet(dir: &Path, name: &str) -> Wallet {
-    Wallet::open(&dir.join(format!("{name}.json"))).unwrap()
+    Wallet::open(&dir.join(format!("{name}.json")), NETWORK).unwrap()
 }
 
 // ---------------------------------------------------------------- the listener
@@ -309,21 +263,27 @@ fn serve_http(rt: &tokio::runtime::Runtime, app: Router) -> String {
     format!("http://{addr}")
 }
 
-/// A real ESP mint, a stand-in PSP beside it (for the exchange, served over HTTP:
-/// the ESP's own calls to the PSP are SPI-local), and the listener's `serve` for
-/// the ESP.
+/// A real ESP mint (the shared, rotating fixture), a stand-in PSP beside it (for
+/// the exchange, served over HTTP: the ESP's own calls to the PSP are SPI-local),
+/// and the listener's `serve` for the ESP. Dereferences to the [`EspMint`].
 struct Esp {
     _rt: tokio::runtime::Runtime,
-    state: Arc<EspState>,
+    mint: EspMint,
     psp: Arc<AppState>,
-    /// The keyset the mint started on.
-    ks: String,
 }
 
-/// A mint that rotates (a manual clock at [`T0`], an hour per generation) or one
-/// that does not; the PSP the ESP calls is the stand-in unless `psp_url` is given
-/// (a dead one, for the tests of a mint that cannot answer).
-fn start_esp(dir: &Path, rotating: bool, config: Config, psp_url: Option<&str>) -> Esp {
+impl std::ops::Deref for Esp {
+    type Target = EspMint;
+
+    fn deref(&self) -> &EspMint {
+        &self.mint
+    }
+}
+
+/// A mint that rotates (a manual clock at [`T0`], an hour per generation); the
+/// PSP the ESP calls is the stand-in unless `psp_url` is given (a dead one, for
+/// the tests of a mint that cannot answer).
+fn start_esp(dir: &Path, config: Config, psp_url: Option<&str>) -> Esp {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -342,60 +302,19 @@ fn start_esp(dir: &Path, rotating: bool, config: Config, psp_url: Option<&str>) 
         .with_state((Arc::clone(&psp), Arc::clone(&memos)));
     let psp_base = serve_http(&rt, psp_app);
 
-    let data = dir.join("esp");
-    std::fs::create_dir_all(&data).unwrap();
-    let (logic, master, rotor, rollovers, ks) = if rotating {
-        let (rotor, logic) = Rotor::open_at(&data, 1, 1, T0).unwrap();
-        let master = rotor.current.master.clone();
-        let ks = rotor.current.id.clone();
-        (
-            logic,
-            master,
-            Some(Mutex::new(rotor)),
-            Some(Mutex::new(Rollovers::open(&data).unwrap())),
-            ks,
-        )
-    } else {
-        let (logic, master) = esp_mint::mint::open(&data).unwrap();
-        let ks = esp_mint::rotation::keyset_id(&master);
-        (logic, master, None, None, ks)
-    };
-    let state = Arc::new(EspState {
-        logic: Mutex::new(logic),
-        master,
-        psp: Box::new(HttpPsp::new(psp_url.unwrap_or(&psp_base)).unwrap()),
-        responses: Mutex::new(Responses::open(&data.join("responses.json")).unwrap()),
-        queue_path: data.join("queue.json"),
-        queue_lock: Mutex::new(()),
-        config: Handle::new(config),
-        rotor,
-        rollovers,
-        in_flight: Default::default(),
-    });
-    Esp {
-        _rt: rt,
-        state,
-        psp,
-        ks,
-    }
+    let mint = EspMint::open(
+        &dir.join("esp"),
+        Box::new(HttpPsp::new(psp_url.unwrap_or(&psp_base)).unwrap()),
+        config,
+        T0,
+    );
+    Esp { _rt: rt, mint, psp }
 }
 
 impl Esp {
     /// The listener's `serve` for this mint: what `esp-mint serve` runs.
     fn serve(&self) -> Arc<Serve> {
-        let state = Arc::clone(&self.state);
-        Arc::new(move |kind: u8, body: &[u8]| server::air_served(&state, kind, body))
-    }
-
-    fn set_clock(&self, t: u64) {
-        self.state
-            .rotor
-            .as_ref()
-            .unwrap()
-            .lock()
-            .unwrap()
-            .clock
-            .store(t, Ordering::SeqCst);
+        common::air::esp_serve(&self.mint.state)
     }
 
     /// A PSP note of `units`, issued by the stand-in PSP, as the wallet stores it.
@@ -436,62 +355,7 @@ impl Esp {
     /// An ESP note the mint has issued for the service `G` and `day`, handed over
     /// as a customer would.
     fn handed(&self, units: u64, day: u64) -> HandedNote {
-        self.handed_on(units, day, &self.ks, &self.state.master)
-    }
-
-    fn handed_on(
-        &self,
-        units: u64,
-        day: u64,
-        keyset: &str,
-        master: &esp_mint::keys::MasterSecret,
-    ) -> HandedNote {
-        let terms = Terms {
-            service: service(),
-            redeemable_after_day: day,
-        };
-        let keypair = Keypair::new(SECP256K1, &mut OsRng);
-        let nonce = Nonce(keypair.public_key());
-        let (blind_point, blinding_key) = bdhke::blind_message(&nonce.as_hash_preimage(), None);
-        let amount = Amount::from_units(units);
-        let sk = master.key_for(amount, &terms);
-        let outcome = self
-            .state
-            .logic
-            .lock()
-            .unwrap()
-            .issue_with_key(
-                &sk,
-                &MintOutput {
-                    amount,
-                    blind_nonce: BlindNonce(blind_point),
-                },
-            )
-            .unwrap();
-        let signature =
-            bdhke::unblind_message(&outcome.0, &blinding_key, &sk.public_key(SECP256K1));
-        HandedNote {
-            amount: units,
-            note: Note { nonce, signature },
-            spend_secret: keypair.secret_key(),
-            keyset: keyset.to_string(),
-        }
-    }
-
-    fn is_spent(&self, note: &Note) -> bool {
-        // A rotating mint keeps its spent lists by generation: the note is spent
-        // if either live generation says so (`Gens::is_spent`).
-        let logic = self.state.logic.lock().unwrap();
-        let spent = match &self.state.rotor {
-            Some(rotor) => rotor
-                .lock()
-                .unwrap()
-                .gens(&logic)
-                .is_spent(note.nonce)
-                .unwrap(),
-            None => logic.is_spent(note.nonce).unwrap(),
-        };
-        spent
+        self.mint.handed(&service(), units, day)
     }
 
     /// (issued, redeemed) ESP units.
@@ -509,6 +373,7 @@ impl Esp {
 fn wallet_with_psp(dir: &Path, name: &str, notes: Vec<StoredNote>) -> Wallet {
     let path = dir.join(format!("{name}.json"));
     let data = WalletData {
+        network: NETWORK.into(),
         keysets: notes
             .iter()
             .map(|n| (n.id(), "00".repeat(8)))
@@ -517,7 +382,7 @@ fn wallet_with_psp(dir: &Path, name: &str, notes: Vec<StoredNote>) -> Wallet {
         ..Default::default()
     };
     std::fs::write(&path, serde_json::to_vec(&data).unwrap()).unwrap();
-    Wallet::open(&path).unwrap()
+    Wallet::open(&path, NETWORK).unwrap()
 }
 
 fn give(wallet: &mut Wallet, day: u64, notes: Vec<HandedNote>) {
@@ -541,23 +406,23 @@ fn the_esp_reads_over_air_are_the_mints_own() {
     let server = server();
     let (key, did) = mint_key();
     let dir = scratch("reads");
-    let esp = start_esp(&dir, true, Config::default(), None);
+    let esp = start_esp(&dir, Config::default(), None);
     let listener = start_serving(&server, &key, &dir, esp.serve());
     let air = air_settings(&server, &did, 10, 3);
 
     let mut w = open_wallet(&dir, "air");
     verify_esp(&mut w, &air, NETWORK).unwrap();
-    sync_esp_keysets(&mut w, &air, RECORD).unwrap();
+    sync_esp_keysets(&mut w, &air, &esp_record(&air)).unwrap();
     sync_esp_limits(&mut w, &air).unwrap();
     let fees = fetch_redeem_fees(&mut w, &air).unwrap();
     let window = esp_window(&mut w, &air).unwrap();
     assert!(w.air_requests().is_empty(), "every request ended");
 
-    assert_eq!(w.esp_output_keyset(), esp.ks);
+    assert_eq!(w.esp_output_keyset(), esp.keyset);
     assert_eq!(w.esp_limits().exchange_max_items, Some(1000));
     assert_eq!(fees.max_memo_bytes, 256);
     assert!(fees.max_request_bytes > 0);
-    assert_eq!(window.current_id, esp.ks);
+    assert_eq!(window.current_id, esp.keyset);
     assert_eq!(window.period_hours, 1);
 
     // A mint on another network is refused, nothing sent.
@@ -573,32 +438,6 @@ fn the_esp_reads_over_air_are_the_mints_own() {
     listener.stop().unwrap();
 }
 
-#[test]
-fn rotation_of_a_mint_that_does_not_rotate_is_an_error_and_not_a_refusal() {
-    let server = server();
-    let (key, did) = mint_key();
-    let dir = scratch("no-rotation");
-    let esp = start_esp(&dir, false, Config::default(), None);
-    let listener = start_serving(&server, &key, &dir, esp.serve());
-    let air = air_settings(&server, &did, 10, 3);
-    let mut w = open_wallet(&dir, "w");
-
-    // A signed refusal that says it was a 404: a plain mint error with the
-    // status, never a refusal of anything.
-    match esp_window(&mut w, &air) {
-        Err(WalletError::Mint(why)) => assert!(why.contains("404"), "{why}"),
-        other => panic!("expected a mint error saying 404, got {other:?}"),
-    }
-    assert!(
-        w.air_requests().is_empty(),
-        "a signed refusal ends the request"
-    );
-    // The keysets still answer on a mint that does not rotate.
-    sync_esp_keysets(&mut w, &air, RECORD).unwrap();
-    assert_eq!(w.esp_output_keyset(), esp.ks);
-    listener.stop().unwrap();
-}
-
 // ---------------------------------------------------------------- rollover
 
 #[test]
@@ -606,7 +445,7 @@ fn an_esp_rotation_rollover_goes_over_air_and_ends_with_the_notes_on_the_new_key
     let server = server();
     let (key, did) = mint_key();
     let dir = scratch("roll");
-    let esp = start_esp(&dir, true, Config::default(), None);
+    let esp = start_esp(&dir, Config::default(), None);
     let listener = start_serving(&server, &key, &dir, esp.serve());
     let air = air_settings(&server, &did, 10, 3);
 
@@ -616,14 +455,14 @@ fn an_esp_rotation_rollover_goes_over_air_and_ends_with_the_notes_on_the_new_key
     let mut w = open_wallet(&dir, "air");
     give(&mut w, PAST, vec![a.clone(), b.clone()]);
     assert!(
-        rotation_sync(&mut w, &air, Kind::Esp, RECORD)
+        rotation_sync(&mut w, &air, Kind::Esp, &esp_record(&air))
             .unwrap()
             .is_empty()
     );
     esp.set_clock(T0 + H);
-    rotation_sync(&mut w, &air, Kind::Esp, RECORD).unwrap(); // draws the swap time
+    rotation_sync(&mut w, &air, Kind::Esp, &esp_record(&air)).unwrap(); // draws the swap time
     esp.set_clock(T0 + H + LATER);
-    let air_log = rotation_sync(&mut w, &air, Kind::Esp, RECORD).unwrap();
+    let air_log = rotation_sync(&mut w, &air, Kind::Esp, &esp_record(&air)).unwrap();
     assert!(
         air_log.iter().any(|l| l.contains("rolled over 2 note(s)")),
         "{air_log:?}"
@@ -639,21 +478,21 @@ fn an_esp_rotation_rollover_goes_over_air_and_ends_with_the_notes_on_the_new_key
     listener.stop().unwrap();
 }
 
-// ---------------------------------------------------------------- exchange, transfer, redeem
+// ---------------------------------------------------------------- exchange, redeem
 
 #[test]
 fn an_exchange_over_air_is_applied_once_and_a_resent_one_gets_the_stored_answer() {
     let server = server();
     let (key, did) = mint_key();
     let dir = scratch("exchange");
-    let esp = start_esp(&dir, false, Config::default(), None);
+    let esp = start_esp(&dir, Config::default(), None);
     let state_dir = scratch("exchange-state");
     let listener = start_serving(&server, &key, &state_dir, esp.serve());
     let air = air_settings(&server, &did, 10, 3);
 
     let note = esp.psp_note(4);
     let mut w = wallet_with_psp(&dir, "w", vec![note.clone()]);
-    sync_esp_keysets(&mut w, &air, RECORD).unwrap();
+    sync_esp_keysets(&mut w, &air, &esp_record(&air)).unwrap();
     sync_esp_limits(&mut w, &air).unwrap();
     let built = w.build_exchange(4, service(), None).unwrap();
 
@@ -673,68 +512,12 @@ fn an_exchange_over_air_is_applied_once_and_a_resent_one_gets_the_stored_answer(
 }
 
 #[test]
-fn a_transfer_over_air_is_applied_once_and_a_double_presentation_is_spent_elsewhere() {
-    let server = server();
-    let (key, did) = mint_key();
-    let dir = scratch("transfer");
-    let esp = start_esp(&dir, false, Config::default(), None);
-    let state_dir = scratch("transfer-state");
-    let listener = start_serving(&server, &key, &state_dir, esp.serve());
-    let air = air_settings(&server, &did, 10, 3);
-
-    let (a, b) = (esp.handed(2 * ONE, DAY), esp.handed(ONE, DAY));
-    let (na, nb) = (a.note, b.note);
-    let mut svc = open_wallet(&dir, "svc");
-    sync_esp_keysets(&mut svc, &air, RECORD).unwrap();
-    give(&mut svc, DAY, vec![a.clone(), b.clone()]);
-    // a second copy of the same notes, held by another wallet
-    let mut svc2 = open_wallet(&dir, "svc2");
-    sync_esp_keysets(&mut svc2, &air, RECORD).unwrap();
-    give(&mut svc2, DAY, vec![a, b]);
-    let issued = esp.totals().0;
-    // A transfer burns the notes (redeemed) and issues the new ones in their place
-    // (issued): both move once, by the same amount.
-    let after = (issued + 3 * ONE, 3 * ONE);
-
-    let built = svc.build_transfer(&secret(1), None, None).unwrap();
-    assert_eq!(built.esp_units, u128::from(3 * ONE));
-    let response = send_transfer(&mut svc, &air, &built.request).unwrap();
-    let done = svc.finish_transfer(&built.id, &response).unwrap();
-    assert_eq!(done.esp_units, u128::from(3 * ONE));
-    assert!(esp.is_spent(&na) && esp.is_spent(&nb));
-    assert_eq!(
-        esp.totals(),
-        after,
-        "the same amount is redeemed and issued again"
-    );
-
-    // The same request again: the stored answer.
-    let again = send_transfer(&mut svc, &air, &built.request).unwrap();
-    assert_eq!(json(&again), json(&response));
-    assert_eq!(esp.totals(), after);
-
-    // The other copy is a double presentation: `SpentElsewhere`, naming the
-    // note the mint found spent.
-    let dup = svc2.build_transfer(&secret(1), None, None).unwrap();
-    match send_transfer(&mut svc2, &air, &dup.request).unwrap_err() {
-        WalletError::SpentElsewhere { inputs, .. } => {
-            // the mint refuses on the first spent input and names only it
-            assert_eq!(inputs.len(), 1);
-        }
-        other => panic!("expected SpentElsewhere, got {other:?}"),
-    }
-    assert_eq!(esp.totals(), after, "nothing was applied");
-    listener.stop().unwrap();
-}
-
-#[test]
 fn a_redemption_goes_over_air_in_its_binary_encoding_and_a_resent_one_is_not_applied_twice() {
     let server = server();
     let (key, did) = mint_key();
     let dir = scratch("redeem");
     let esp = start_esp(
         &dir,
-        false,
         Config {
             redeem_fee_per_byte: 1_000_000,
             ..Config::default()
@@ -748,7 +531,7 @@ fn a_redemption_goes_over_air_in_its_binary_encoding_and_a_resent_one_is_not_app
     let a = esp.handed(4 * ONE, PAST);
     let na = a.note;
     let mut w = open_wallet(&dir, "w");
-    sync_esp_keysets(&mut w, &air, RECORD).unwrap();
+    sync_esp_keysets(&mut w, &air, &esp_record(&air)).unwrap();
     give(&mut w, PAST, vec![a]);
 
     // The fees come over AIR too.
@@ -787,9 +570,7 @@ fn a_400_is_a_refusal_over_air_but_a_409_a_413_and_a_404_are_not() {
     let dir = scratch("refusals");
     let esp = start_esp(
         &dir,
-        false,
         Config {
-            transfer_max_request_bytes: 1000,
             redeem_max_request_bytes: 100,
             ..Config::default()
         },
@@ -801,7 +582,7 @@ fn a_400_is_a_refusal_over_air_but_a_409_a_413_and_a_404_are_not() {
 
     let note = esp.psp_note(4);
     let mut w = wallet_with_psp(&dir, "w", vec![note.clone()]);
-    sync_esp_keysets(&mut w, &air, RECORD).unwrap();
+    sync_esp_keysets(&mut w, &air, &esp_record(&air)).unwrap();
     sync_esp_limits(&mut w, &air).unwrap();
     let built = w.build_exchange(4, service(), None).unwrap();
 
@@ -829,21 +610,9 @@ fn a_400_is_a_refusal_over_air_but_a_409_a_413_and_a_404_are_not() {
     w.finish_exchange(&built.id, &response).unwrap();
     assert!(esp.psp_spent(&note));
 
-    // A 413 on a transfer: a plain mint error that says so.
-    let mut svc = open_wallet(&dir, "svc");
-    sync_esp_keysets(&mut svc, &air, RECORD).unwrap();
-    let notes: Vec<_> = (0..8).map(|_| esp.handed(ONE, DAY)).collect();
-    give(&mut svc, DAY, notes);
-    let big = svc.build_transfer(&secret(1), None, None).unwrap();
-    match send_transfer(&mut svc, &air, &big.request).unwrap_err() {
-        WalletError::Mint(why) => assert!(why.contains("413"), "{why}"),
-        other => panic!("expected a mint error saying 413, got {other:?}"),
-    }
-    assert_eq!(svc.pending_transfers().len(), 1, "not cancelled");
-
     // A 413 on a redemption is `RedeemRefused` with its code.
     let mut r = open_wallet(&dir, "r");
-    sync_esp_keysets(&mut r, &air, RECORD).unwrap();
+    sync_esp_keysets(&mut r, &air, &esp_record(&air)).unwrap();
     give(&mut r, PAST, vec![esp.handed(ONE, PAST)]);
     let mut fees = fetch_redeem_fees(&mut r, &air).unwrap();
     assert_eq!(
@@ -870,14 +639,14 @@ fn a_psp_the_esp_cannot_reach_is_a_mint_error_that_keeps_the_exchange_pending() 
     let (key, did) = mint_key();
     let dir = scratch("dead-psp");
     // Nothing listens on port 9, where the ESP looks for its PSP.
-    let esp = start_esp(&dir, false, Config::default(), Some("http://127.0.0.1:9"));
+    let esp = start_esp(&dir, Config::default(), Some("http://127.0.0.1:9"));
     let state_dir = scratch("dead-psp-state");
     let listener = start_serving(&server, &key, &state_dir, esp.serve());
     let air = air_settings(&server, &did, 10, 3);
 
     let note = esp.psp_note(4);
     let mut w = wallet_with_psp(&dir, "w", vec![note.clone()]);
-    sync_esp_keysets(&mut w, &air, RECORD).unwrap();
+    sync_esp_keysets(&mut w, &air, &esp_record(&air)).unwrap();
     sync_esp_limits(&mut w, &air).unwrap();
     let built = w.build_exchange(4, service(), None).unwrap();
 
@@ -908,7 +677,7 @@ fn an_unanswered_exchange_is_kept_and_the_next_call_carries_on_with_it() {
     let server = server();
     let (key, did) = mint_key();
     let dir = scratch("kept");
-    let esp = start_esp(&dir, false, Config::default(), None);
+    let esp = start_esp(&dir, Config::default(), None);
     let state_dir = scratch("kept-state");
 
     let note = esp.psp_note(4);
@@ -917,7 +686,8 @@ fn an_unanswered_exchange_is_kept_and_the_next_call_carries_on_with_it() {
     let quick = air_settings(&server, &did, 1, 1);
     // (The keysets and limits cannot be read either, so name the mint's keyset
     // by hand as a wallet that had read them earlier would.)
-    w.note_esp_keysets(RECORD, &esp.ks, None).unwrap();
+    w.note_esp_keysets(&esp_record(&quick), &esp.keyset, None)
+        .unwrap();
     let built = w.build_exchange(4, service(), None).unwrap();
     match send_exchange(&mut w, &quick, &built.request) {
         Err(WalletError::Mint(why)) => {
@@ -945,12 +715,7 @@ fn an_unanswered_exchange_is_kept_and_the_next_call_carries_on_with_it() {
     assert!(esp.psp_spent(&note));
     let response = send_exchange(&mut w, &air, &built.request).unwrap();
     assert!(w.air_requests().is_empty());
-    thread::sleep(Duration::from_millis(500));
-    assert_eq!(
-        air_listener::read_next(&state_dir).unwrap(),
-        1,
-        "nothing was written"
-    );
+    assert!(slot_is_empty(&server, &did, 1), "nothing was written");
     w.finish_exchange(&built.id, &response).unwrap();
     assert_eq!(esp.totals(), (4 * ONE_PSP, 0));
     listener.stop().unwrap();
@@ -980,6 +745,7 @@ fn wallet_with_request(
         },
     };
     let data = WalletData {
+        network: NETWORK.into(),
         air_requests: vec![pending.clone()],
         ..Default::default()
     };
@@ -1017,15 +783,29 @@ fn a_tampered_forged_or_wrong_kind_reply_to_an_esp_call_is_refused_and_applies_n
     let (key, did) = mint_key();
     let (psp_key, _) = mint_key();
     let air = air_settings(&server, &did, 5, 1);
-    let answer: &[u8] = br#"{"keyset":"k","signatures":[],"keys":[]}"#;
     let now = addr::now_secs();
+    // What the mint answers honestly to each call, as its real reply types.
+    let fees_answer = serde_json::to_vec(&esp_mint::server::fees_body(&Config::default())).unwrap();
+    let exchange_answer = serde_json::to_vec(&sp_wire::esp::exchange::ExchangeResponse {
+        keyset: "ab".repeat(8),
+        service: service(),
+        redeemable_after_day: DAY,
+        signatures: vec![],
+        keys: vec![],
+        fee_per_byte: 0,
+        fee_esp: 0,
+        size_bytes: 0,
+    })
+    .unwrap();
 
-    // (a read and a call with a body; the body of an exchange here is never
-    // parsed by anyone, since no mint answers)
-    for (kind, body) in [
-        (KIND_FEES, Vec::new()),
-        (KIND_EXCHANGE, br#"{"x":1}"#.to_vec()),
+    // (a read and a call with a body; the body of an exchange here is a literal
+    // that is deliberately not an exchange request, and is never parsed by
+    // anyone, since no mint answers)
+    for (kind, body, answer) in [
+        (KIND_FEES, Vec::new(), fees_answer),
+        (KIND_EXCHANGE, br#"{"x":1}"#.to_vec(), exchange_answer),
     ] {
+        let answer = answer.as_slice();
         let call = |w: &mut Wallet| match kind {
             KIND_FEES => sync_esp_limits(w, &air).map(|_| ()),
             _ => air::answer(w, &air, Party::Esp, kind, &body).map(|_| ()),
@@ -1079,7 +859,7 @@ fn a_tampered_forged_or_wrong_kind_reply_to_an_esp_call_is_refused_and_applies_n
         let dir = scratch("wrong-kind");
         let (mut w, pending) = wallet_with_request(&dir, &did, kind, &body);
         let other_kind = if kind == KIND_EXCHANGE {
-            KIND_TRANSFER
+            KIND_FEES
         } else {
             KIND_EXCHANGE
         };
@@ -1107,9 +887,9 @@ fn a_tampered_forged_or_wrong_kind_reply_to_an_esp_call_is_refused_and_applies_n
 fn without_air_server_and_host_no_call_to_the_esp_is_made_and_the_error_names_the_setting() {
     let server = server();
     let dir = scratch("required");
-    let esp = start_esp(&dir, true, Config::default(), None);
+    let esp = start_esp(&dir, Config::default(), None);
     // A listener is up, and must be asked for nothing.
-    let (key, _) = mint_key();
+    let (key, did) = mint_key();
     let state_dir = scratch("required-state");
     let listener = start_serving(&server, &key, &state_dir, esp.serve());
     let air = AirSettings::default();
@@ -1118,7 +898,8 @@ fn without_air_server_and_host_no_call_to_the_esp_is_made_and_the_error_names_th
 
     let note = esp.psp_note(4);
     let mut w = wallet_with_psp(&dir, "w", vec![note.clone()]);
-    w.note_esp_keysets(RECORD, &esp.ks, None).unwrap();
+    w.note_esp_keysets(&esp_record(&air), &esp.keyset, None)
+        .unwrap();
     let built = w.build_exchange(4, service(), None).unwrap();
     let named_both = |why: &str| {
         assert!(
@@ -1135,24 +916,19 @@ fn without_air_server_and_host_no_call_to_the_esp_is_made_and_the_error_names_th
         other => panic!("expected the missing settings to be named, got {other:?}"),
     };
     invalid(verify_esp(&mut w, &air, NETWORK));
-    invalid(sync_esp_keysets(&mut w, &air, RECORD));
+    invalid(sync_esp_keysets(&mut w, &air, &esp_record(&air)));
     invalid(sync_esp_limits(&mut w, &air));
     invalid(fetch_redeem_fees(&mut w, &air).map(|_| ()));
     invalid(esp_window(&mut w, &air).map(|_| ()));
     invalid(send_exchange(&mut w, &air, &built.request).map(|_| ()));
     invalid(send_redeem(&mut w, &air, b"x").map(|_| ()));
-    invalid(rotation_sync(&mut w, &air, Kind::Esp, RECORD).map(|_| ()));
+    invalid(rotation_sync(&mut w, &air, Kind::Esp, &esp_record(&air)).map(|_| ()));
 
     // The exchange is still pending, its note reserved, and nothing went out.
     assert_eq!(w.pending_exchanges().len(), 1);
     assert!(!esp.psp_spent(&note));
     assert!(w.air_requests().is_empty());
-    thread::sleep(Duration::from_millis(300));
-    assert_eq!(
-        air_listener::read_next(&state_dir).unwrap(),
-        0,
-        "nothing went over AIR"
-    );
+    assert!(slot_is_empty(&server, &did, 0), "nothing went over AIR");
     listener.stop().unwrap();
 }
 
@@ -1162,7 +938,7 @@ fn the_psp_and_the_esp_share_an_air_server_and_each_is_asked_at_its_own_did() {
     let (esp_key, esp_did) = mint_key();
     let (psp_key, psp_did) = mint_key();
     let dir = scratch("shared");
-    let esp = start_esp(&dir, false, Config::default(), None);
+    let esp = start_esp(&dir, Config::default(), None);
     let esp_state = scratch("shared-esp");
     let psp_state = scratch("shared-psp");
     let listener = start_serving(&server, &esp_key, &esp_state, esp.serve());

@@ -87,10 +87,28 @@ fn fee_for(size: u64, fee_per_byte: u128) -> u128 {
 pub struct RedeemFees {
     /// ESP units per byte of the canonical encoding.
     pub fee_per_byte: u128,
-    /// The ceiling on one encoded request, in bytes.
+    /// The mint's ceiling on one encoded request, in bytes.
     pub max_request_bytes: u64,
     /// The longest payout memo, in bytes.
     pub max_memo_bytes: usize,
+    /// A lower ceiling the caller chose (`--max-bytes`). It never raises the mint's.
+    /// [`RedeemFees::ceiling`] is the one in force.
+    pub caller_max_bytes: Option<u64>,
+}
+
+impl RedeemFees {
+    /// The ceiling on one request that is in force: the mint's, or the caller's
+    /// when that is lower.
+    pub fn ceiling(&self) -> u64 {
+        self.caller_max_bytes
+            .map_or(self.max_request_bytes, |n| n.min(self.max_request_bytes))
+    }
+
+    /// Whether the ceiling in force is the caller's own (lower than the mint's).
+    fn ceiling_is_the_callers(&self) -> bool {
+        self.caller_max_bytes
+            .is_some_and(|n| n < self.max_request_bytes)
+    }
 }
 
 impl Default for RedeemFees {
@@ -100,6 +118,7 @@ impl Default for RedeemFees {
             fee_per_byte: DEFAULT_FEE_PER_BYTE,
             max_request_bytes: DEFAULT_MAX_REQUEST_BYTES as u64,
             max_memo_bytes: redeem::DEFAULT_MAX_MEMO_BYTES,
+            caller_max_bytes: None,
         }
     }
 }
@@ -175,6 +194,27 @@ pub struct RedeemPlan {
     pub built: Vec<RedeemBuild>,
     /// One line for each part that was not built, saying why.
     pub skipped: Vec<String>,
+}
+
+impl RedeemPlan {
+    /// The lines `redeem` prints about the plan before the requests: first the
+    /// summary (the rate, the ceiling in force and how many requests there are),
+    /// then one line for each part that was not sent.
+    pub fn lines(&self, fees: &RedeemFees) -> Vec<String> {
+        let whose = if fees.ceiling_is_the_callers() {
+            " (--max-bytes)"
+        } else {
+            ""
+        };
+        let mut lines = vec![format!(
+            "fee rate {} ESP units a byte; at most {} bytes a request{whose}; {} request(s)",
+            fees.fee_per_byte,
+            fees.ceiling(),
+            self.built.len()
+        )];
+        lines.extend(self.skipped.iter().cloned());
+        lines
+    }
 }
 
 /// What a reply, or a later look at the entry, did to the wallet.
@@ -588,8 +628,9 @@ fn sign_request(
 fn split(
     notes: Vec<StoredNote>,
     memo_bytes: usize,
-    max_bytes: u64,
+    fees: &RedeemFees,
 ) -> Result<Vec<Vec<StoredNote>>, WalletError> {
+    let max_bytes = fees.ceiling();
     let worst = |group: &[StoredNote]| -> u64 {
         let refs: Vec<&StoredNote> = group.iter().collect();
         let outputs = by_terms(&refs).len() * MAX_OUTPUTS_PER_TERMS;
@@ -602,8 +643,15 @@ fn split(
         if worst(&current) > max_bytes {
             let note = current.pop().unwrap_or_else(|| unreachable!());
             if current.is_empty() {
+                let need = worst(std::slice::from_ref(&note));
+                // Name the limit that is in force: the caller's own, or the mint's.
+                let limit = if fees.ceiling_is_the_callers() {
+                    format!("--max-bytes {max_bytes}")
+                } else {
+                    format!("the mint's ceiling of {max_bytes} bytes")
+                };
                 return Err(WalletError::Invalid(format!(
-                    "the mint's ceiling of {max_bytes} bytes is too small for even one note"
+                    "{limit} is too small for even one note: a request for one note can need {need} bytes"
                 )));
             }
             groups.push(std::mem::take(&mut current));
@@ -691,7 +739,7 @@ impl Wallet {
                 .then_with(|| b.amount.cmp(&a.amount))
                 .then_with(|| a.id().cmp(&b.id()))
         });
-        let groups = split(chosen, memo.len(), fees.max_request_bytes)?;
+        let groups = split(chosen, memo.len(), fees)?;
         let mut built = Vec::new();
         let mut pendings = Vec::new();
         let mut skipped = Vec::new();
@@ -717,9 +765,7 @@ impl Wallet {
                 ));
                 continue;
             }
-            if alloc.size_bytes > fees.max_request_bytes
-                || !mint_would_accept(&alloc, &accepted, &[])
-            {
+            if alloc.size_bytes > fees.ceiling() || !mint_would_accept(&alloc, &accepted, &[]) {
                 return Err(WalletError::Invalid(
                     "the request does not fit the mint's rules".into(),
                 ));
@@ -1177,6 +1223,11 @@ mod tests {
     use sp_wire::esp::queue::{EntryView, SignedOutput};
     use sp_wire::esp::redeem::NoteResult;
 
+    /// Open a wallet file of the test network.
+    fn open_wallet(path: &std::path::Path) -> Result<crate::Wallet, crate::WalletError> {
+        crate::Wallet::open(path, "regtest")
+    }
+
     /// Day 20_735 at noon.
     const NOW: u64 = 20_735 * 86_400 + 43_200;
     const PAST: u64 = 20_000;
@@ -1251,7 +1302,7 @@ mod tests {
 
     fn wallet_with(name: &str, notes: Vec<StoredNote>) -> (Wallet, PathBuf) {
         let dir = scratch(name);
-        let mut w = Wallet::open(&dir.join("wallet.json")).unwrap();
+        let mut w = open_wallet(&dir.join("wallet.json")).unwrap();
         w.update(|d| {
             // Every stored note records its keyset (the wallet never guesses).
             for n in &notes {
@@ -1537,7 +1588,7 @@ mod tests {
         assert_eq!(w.pending_redemptions()[0].body().unwrap(), b.body);
         assert_eq!(w.balance().pending_redemptions, 1);
         // the reservation survives a reopen, and a second build finds nothing free
-        let mut again = Wallet::open(w.path()).unwrap();
+        let mut again = open_wallet(w.path()).unwrap();
         assert_eq!(again.pending_redemptions().len(), 1);
         assert!(matches!(
             again.build_redemption(&key(1), MEMO, &fees(), NOW),
@@ -1903,7 +1954,8 @@ mod tests {
             .build_redemption(&key(1), MEMO, &fees(), NOW)
             .unwrap()
             .remove(0);
-        // an older mint sends no per-note list
+        // a refusal other than `below_fee` carries no per-note list (esp-mint
+        // adds `notes` to `BelowFee` only, `redeem.rs`'s `details`)
         let report = w.refuse_redemption(&b.id, &[]).unwrap();
         assert_eq!((report.marked_spent, report.freed), (0, 0));
         assert!(w.spent_notes().is_empty());
@@ -2052,7 +2104,7 @@ mod tests {
         let done = w.finish_redemption(&b.id, &r).unwrap();
         assert_eq!((done.freed, done.flagged_bad_proof), (1, 1));
         // still held, counted, flagged, and the flag survives a reopen
-        let mut w = Wallet::open(w.path()).unwrap();
+        let mut w = open_wallet(w.path()).unwrap();
         assert_eq!(w.notes().len(), 1);
         assert!(w.is_flagged_bad_proof(&ids[1]));
         let bal = w.balance();
@@ -2138,6 +2190,101 @@ mod tests {
                 .reserved_by
                 .is_none()
         );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_ceiling_too_small_for_one_note_names_the_limit_in_force() {
+        let (mut w, dir) = wallet_with("tiny-names", vec![esp_note(ONE, service(), PAST)]);
+        let before = serde_json::to_value(w.snapshot()).unwrap();
+        let invalid = |w: &mut Wallet, fees: &RedeemFees| match w.build_redemption(
+            &key(1),
+            MEMO,
+            fees,
+            NOW,
+        ) {
+            Err(WalletError::Invalid(why)) => why,
+            other => panic!("expected Invalid, got {other:?}"),
+        };
+
+        // The mint's ceiling is the one in force: it is named, and not --max-bytes.
+        // One note can need 120 + 187 + 15 (the memo) + 128 * 82 = 10818 bytes.
+        let mints = RedeemFees {
+            max_request_bytes: 200,
+            ..fees()
+        };
+        assert_eq!(
+            invalid(&mut w, &mints),
+            "the mint's ceiling of 200 bytes is too small for even one note: a request for one note can need 10818 bytes"
+        );
+        // The caller's lower ceiling is the one in force: --max-bytes is named.
+        let callers = RedeemFees {
+            caller_max_bytes: Some(200),
+            ..fees()
+        };
+        assert_eq!(
+            invalid(&mut w, &callers),
+            "--max-bytes 200 is too small for even one note: a request for one note can need 10818 bytes"
+        );
+        // A --max-bytes above the mint's raises nothing: the mint's is in force.
+        let higher = RedeemFees {
+            max_request_bytes: 200,
+            caller_max_bytes: Some(1_000_000),
+            ..fees()
+        };
+        assert_eq!(
+            invalid(&mut w, &higher),
+            "the mint's ceiling of 200 bytes is too small for even one note: a request for one note can need 10818 bytes"
+        );
+        assert_eq!(serde_json::to_value(w.snapshot()).unwrap(), before);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_plan_says_how_many_requests_before_the_parts_it_did_not_send() {
+        // As the dust test below: two big notes go in one request under this
+        // ceiling (120 + 2 * 187 + 15 + 128 * 82 = 11005 bytes) and a dust note,
+        // where the fee would take all of it, is not sent.
+        let notes = vec![
+            esp_note(ONE, service(), PAST),
+            esp_note(ONE, service(), PAST),
+            esp_note(1_000, service(), PAST2),
+        ];
+        let (mut w, dir) = wallet_with("plan-lines", notes);
+        let mints = RedeemFees {
+            max_request_bytes: 11005,
+            ..fees()
+        };
+        let plan = w.plan_redemption(&key(1), MEMO, &mints, NOW).unwrap();
+        let lines = plan.lines(&mints);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            lines[0],
+            "fee rate 1000000 ESP units a byte; at most 11005 bytes a request; 1 request(s)"
+        );
+        assert!(
+            lines[1].starts_with("not sent: the notes are worth 1000 ESP units, less than the fee"),
+            "{}",
+            lines[1]
+        );
+
+        // With the caller's own lower ceiling in force, the summary says so.
+        let callers = RedeemFees {
+            max_request_bytes: 1 << 20,
+            caller_max_bytes: Some(11005),
+            ..fees()
+        };
+        assert_eq!(
+            plan.lines(&callers)[0],
+            "fee rate 1000000 ESP units a byte; at most 11005 bytes a request (--max-bytes); 1 request(s)"
+        );
+        // A --max-bytes above the mint's changes nothing.
+        let higher = RedeemFees {
+            max_request_bytes: 11005,
+            caller_max_bytes: Some(1 << 30),
+            ..fees()
+        };
+        assert_eq!(plan.lines(&higher)[0], lines[0]);
         fs::remove_dir_all(&dir).unwrap();
     }
 

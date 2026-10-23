@@ -19,7 +19,7 @@
 //! and `handoff list`. This module does no I/O of its own:
 //! [`Wallet::export_psp_handoff`] and [`Wallet::export_fsp_handoff`] make a
 //! handoff, [`Wallet::import_handoff`] (or the two kind-specific imports) takes
-//! one in, the swap that a PSP import stores is sent by
+//! one in (`kind_of` says which a string needs), the swap that a PSP import stores is sent by
 //! [`crate::mint_info::complete_import`], and the sender's questions to the mint are
 //! asked by [`crate::mint_info::check_handoff`] and [`crate::mint_info::reclaim_handoff`].
 //!
@@ -138,7 +138,9 @@
 //!   body:
 //!   version      1   2
 //!   kind         1   0 (PSP)
-//!   mint         2+n the PSP mint's URL, a length and UTF-8
+//!   mint         2+n the PSP's DID in lowercase hex (66 characters), a length
+//!                and UTF-8: a name, not an address, since the PSP is reached
+//!                over AIR. A handoff that names anything else there is refused.
 //!   keysets      1+8k how many key sets the notes use, and each (8 bytes)
 //!   notes        2   how many notes
 //!     per note:
@@ -158,18 +160,18 @@
 //!     per group:
 //!     service   33   the service's AIR DID (compressed key)
 //!     mint, keysets, notes   as for PSP; the mint is the service's DID in hex
-//!                            (66 characters): a name, not an address, since an
-//!                            FSP mint is reached through the receiver's own
-//!                            `air.fsp` entry. A handoff from before that carries
-//!                            the mint's URL there, which is read and ignored.
+//!                            (66 characters) and nothing else: a name, not an
+//!                            address, since an FSP mint is reached through the
+//!                            receiver's own `air.fsp` entry. A handoff that
+//!                            names anything else there is refused.
 //!   did key     32   the DID secret key
 //! ```
 //!
 //! A note is [`NOTE_BYTES`] (100) bytes, 150 characters. The handoff's id is the
 //! first 16 bytes of SHA-256 of the body (not of the sealed bytes, which change
 //! every time they are sealed), in hex, so the sender and the receiver both
-//! have it. A PSP handoff of N notes of one key set with a 22-character URL is
-//! about 188 + 150N characters, an FSP handoff of one service about 232 + 150N.
+//! have it. A PSP handoff of N notes of one key set (the PSP named by its
+//! 66-character DID) is about 254 + 150N characters, an FSP handoff of one service about 233 + 150N.
 //! A QR code holds at most 4,296 alphanumeric characters (error correction L,
 //! version 40) or 3,391 (M), so one code holds about 27 notes at L or 21 at M. A
 //! funding handoff of $100 is 3 PSP notes (64, 32 and 4 PSP), about 640
@@ -221,16 +223,12 @@ pub(crate) const SWAP_TAG: &str = "handoff|";
 /// (`reclaim|<id>`). The same tag the old `sent --reclaim` used.
 pub(crate) const RECLAIM_TAG: &str = "reclaim|";
 
-/// The two kinds of handoff. `Combined` is only what a wallet file from 0.4.0
-/// may hold in its records; nothing makes or reads one now.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// The two kinds of handoff.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HandoffKind {
     Psp,
     Fsp,
-    /// The old combined handoff (wallet 0.4.0), in a record only.
-    #[default]
-    Combined,
 }
 
 impl HandoffKind {
@@ -238,7 +236,6 @@ impl HandoffKind {
         match self {
             HandoffKind::Psp => "PSP",
             HandoffKind::Fsp => "FSP",
-            HandoffKind::Combined => "combined (0.4.0)",
         }
     }
 }
@@ -311,7 +308,8 @@ pub struct PayloadNote {
 }
 
 /// What a PSP handoff holds: PSP notes of one mint, and nothing else. There is
-/// no field for a DID key or for FSP, so such a handoff cannot be built.
+/// no field for a DID key or for FSP, so such a handoff cannot be built. `mint`
+/// is the PSP's DID in lowercase hex.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PspPayload {
     pub mint: String,
@@ -352,16 +350,16 @@ fn keyset_bytes(id: &str) -> Result<[u8; 8], WalletError> {
     <[u8; 8]>::try_from(raw.as_slice()).map_err(|_| WalletError::Invalid("key-set ID".into()))
 }
 
-/// The mint's URL, its key sets and its notes, as in both bodies.
+/// The mint's name (a DID in hex), its key sets and its notes, as in both bodies.
 fn write_notes(b: &mut Vec<u8>, mint: &str, notes: &[PayloadNote]) -> Result<(), WalletError> {
-    let url = mint.as_bytes();
-    if url.is_empty() || url.len() > 0xFFFF {
+    let name = mint.as_bytes();
+    if name.is_empty() || name.len() > 0xFFFF {
         return Err(WalletError::Invalid(
-            "a handoff needs the mint's URL (up to 65,535 bytes)".into(),
+            "a handoff needs the mint's name (up to 65,535 bytes)".into(),
         ));
     }
-    b.extend_from_slice(&(url.len() as u16).to_be_bytes());
-    b.extend_from_slice(url);
+    b.extend_from_slice(&(name.len() as u16).to_be_bytes());
+    b.extend_from_slice(name);
     if notes.is_empty() {
         return Err(WalletError::Invalid("the handoff holds nothing".into()));
     }
@@ -629,15 +627,15 @@ fn read_head(c: &mut Cursor, want_kind: u8, label: &str) -> Result<(), WalletErr
     Ok(())
 }
 
-/// A mint's URL, key sets and notes. `seen` and `total` run across groups.
+/// A mint's name, key sets and notes. `seen` and `total` run across groups.
 fn read_notes(
     c: &mut Cursor,
     seen: &mut BTreeSet<[u8; 33]>,
     total: &mut usize,
 ) -> Result<(String, Vec<PayloadNote>), WalletError> {
-    let url_len = usize::from(c.u16()?);
-    let mint = String::from_utf8(c.take(url_len)?.to_vec())
-        .map_err(|_| WalletError::Invalid("a mint URL in it is not text".into()))?;
+    let name_len = usize::from(c.u16()?);
+    let mint = String::from_utf8(c.take(name_len)?.to_vec())
+        .map_err(|_| WalletError::Invalid("a mint name in it is not text".into()))?;
     if mint.is_empty() {
         return Err(WalletError::Invalid("the handoff names no mint".into()));
     }
@@ -728,6 +726,12 @@ fn parse_fsp_body(body: &[u8]) -> Result<FspPayload, WalletError> {
         let service = ServiceDid::from_slice(c.take(33)?)
             .map_err(|_| WalletError::Invalid("a service ID in it is not valid".into()))?;
         let (mint, notes) = read_notes(&mut c, &mut seen, &mut total)?;
+        let named = hex::encode(service.serialize());
+        if mint != named {
+            return Err(WalletError::Invalid(format!(
+                "an FSP handoff names each mint by its service's DID in hex ({named}), and this one names {mint:?}"
+            )));
+        }
         groups.push(FspGroup {
             service,
             mint,
@@ -764,8 +768,7 @@ pub enum HandoffState {
 pub struct OutgoingHandoff {
     pub id: String,
     pub state: HandoffState,
-    /// Which kind it is. Records from wallet 0.4.0 read as `Combined`.
-    #[serde(default)]
+    /// Which kind it is.
     pub kind: HandoffKind,
     /// PSP and FSP units in it.
     pub psp_units: u128,
@@ -777,9 +780,7 @@ pub struct OutgoingHandoff {
     /// The notes, until it is done.
     pub notes: Vec<StoredNote>,
     /// The PSP mint the notes are for: where `handoff check` and `handoff
-    /// reclaim` ask. Empty for an FSP handoff and for a record from wallet
-    /// 0.4.0, which did not keep it (those can only be cancelled).
-    #[serde(default)]
+    /// reclaim` ask. Empty for an FSP handoff.
     pub mint: String,
     /// The id of the stored swap back to this wallet, while a reclaim is out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -815,11 +816,9 @@ pub enum Standing {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IncomingHandoff {
     pub id: String,
-    /// Which kind it was. Records from wallet 0.4.0 read as `Combined`.
-    #[serde(default)]
+    /// Which kind it was.
     pub kind: HandoffKind,
     /// Who it came from, as the importer named them (may be empty).
-    #[serde(default)]
     pub from: String,
     pub psp_units: u128,
     pub fsp_units: u128,
@@ -964,19 +963,6 @@ impl Wallet {
             .sum()
     }
 
-    /// PSP units of a swap that wallet 0.4.0's `receive-psp` stored and did not
-    /// send. Unlike [`Wallet::unswapped_psp`] these are **not** in the balance:
-    /// the wallet holds the signed request but not the notes' secrets, so it
-    /// cannot count them until the swap goes through, which the next sync tries.
-    pub fn legacy_receive_psp(&self) -> u128 {
-        self.pending_rollovers()
-            .iter()
-            .filter(|p| p.kind == Kind::Psp && p.schedule.starts_with(crate::legacy::RECEIVE_TAG))
-            .flat_map(|p| p.outputs.iter())
-            .map(|o| u128::from(o.amount))
-            .sum()
-    }
-
     /// The notes of `ids`, all free and all of `kind`.
     fn pick_notes(&self, ids: &[String], kind: Kind) -> Result<Vec<StoredNote>, WalletError> {
         if ids.is_empty() {
@@ -1012,23 +998,20 @@ impl Wallet {
     }
 
     /// Make a PSP handoff of the notes `ids`, sealed to `recipient`'s DID public
-    /// key, and take the notes out of this wallet in the same write. `psp_mint`
-    /// is the PSP mint's URL. A PSP handoff has no way to carry a DID key or FSP
+    /// key, and take the notes out of this wallet in the same write. `psp` is the
+    /// PSP's DID: the handoff names the mint by it in lowercase hex, as the
+    /// wallet's records do. A PSP handoff has no way to carry a DID key or FSP
     /// and cannot be made without the recipient's key.
     pub fn export_psp_handoff(
         &mut self,
         ids: &[String],
-        psp_mint: &str,
+        psp: ServiceDid,
         recipient: &DidPublicKey,
     ) -> Result<HandoffExport, WalletError> {
-        if psp_mint.trim().is_empty() {
-            return Err(WalletError::Invalid(
-                "give the PSP mint's URL for the PSP notes".into(),
-            ));
-        }
+        let psp_mint = crate::fsp::record_of(psp);
         let picked = self.pick_notes(ids, Kind::Psp)?;
         let payload = PspPayload {
-            mint: psp_mint.to_string(),
+            mint: psp_mint.clone(),
             notes: picked
                 .iter()
                 .map(|n| self.payload_note(n, false))
@@ -1042,7 +1025,7 @@ impl Wallet {
             picked,
             (payload.units(), 0),
             false,
-            psp_mint.to_string(),
+            psp_mint,
         )
     }
 
@@ -1235,8 +1218,8 @@ impl Wallet {
         })
     }
 
-    /// The pending PSP handoff `id` this wallet made, which can be asked about
-    /// at the mint: a PSP handoff with a recorded mint.
+    /// The PSP handoff `id` this wallet made, which can be asked about at the
+    /// mint (an FSP handoff cannot).
     fn askable(&self, id: &str) -> Result<OutgoingHandoff, WalletError> {
         let h = self
             .data()
@@ -1248,11 +1231,6 @@ impl Wallet {
         if h.kind == HandoffKind::Fsp {
             return Err(WalletError::Invalid(format!(
                 "handoff {id} is an FSP handoff. The mint keeps no record of who holds an FSP note, so there is nothing to check or reclaim there: use `handoff cancel {id}` if it never arrived, `handoff done {id}` once it did"
-            )));
-        }
-        if h.state == HandoffState::Pending && h.mint.trim().is_empty() {
-            return Err(WalletError::Invalid(format!(
-                "handoff {id} was recorded by wallet 0.4.0, which did not keep the mint, so the mint cannot be asked about it. Use `handoff cancel {id}` (local only)"
             )));
         }
         Ok(h)
@@ -1365,7 +1343,7 @@ impl Wallet {
             .iter()
             .find(|p| p.id == id)
             .cloned()
-            .ok_or_else(|| WalletError::Invalid(format!("no rollover {id}")))?;
+            .ok_or_else(|| WalletError::Unknown(format!("no pending rollover {id}")))?;
         let free: Vec<StoredNote> = p
             .inputs
             .iter()
@@ -1396,9 +1374,9 @@ impl Wallet {
                 .iter()
                 .map(|n| self.payload_note(n, false))
                 .collect::<Result<Vec<_>, _>>()?;
-            let current = swap_keyset(self.data().live_keysets.get(&old.url), &notes);
+            let current = swap_keyset(self.data().live_keysets.get(&old.record), &notes);
             Some(build_psp_swap(
-                &old.url,
+                &old.record,
                 &notes,
                 old.schedule.clone(),
                 &current,
@@ -1430,7 +1408,7 @@ impl Wallet {
             .iter()
             .find(|p| p.id == id)
             .cloned()
-            .ok_or_else(|| WalletError::Invalid(format!("no rollover {id}")))?;
+            .ok_or_else(|| WalletError::Unknown(format!("no pending rollover {id}")))?;
         let spent_ids: BTreeSet<String> = positions
             .iter()
             .filter_map(|&i| p.inputs.get(i).cloned())
@@ -1466,13 +1444,15 @@ impl Wallet {
     }
 
     /// Take in a handoff of either kind. A PSP handoff needs `recipient`, the
-    /// DID secret key it was sealed to; an FSP handoff ignores it. `from` names
+    /// DID secret key it was sealed to, and `psp`, this wallet's PSP (its DID),
+    /// which the handoff must name; an FSP handoff ignores both. `from` names
     /// the sender for the record (may be empty). Use [`kind_of`] first to know
     /// which key a string needs.
     pub fn import_handoff(
         &mut self,
         text: &str,
         recipient: Option<&DidSecretKey>,
+        psp: ServiceDid,
         from: &str,
     ) -> Result<Imported, WalletError> {
         match kind_of(text)? {
@@ -1482,7 +1462,7 @@ impl Wallet {
                         "this is a PSP handoff, sealed to a DID key: give the DID secret key it was made for".into(),
                     )
                 })?;
-                self.import_psp_handoff(text, key, from)
+                self.import_psp_handoff(text, key, psp, from)
             }
             _ => self.import_fsp_handoff(text, from),
         }
@@ -1492,14 +1472,24 @@ impl Wallet {
     /// notes are not added: a swap at the PSP mint is stored in the same write
     /// as the import record, and the caller sends it
     /// ([`crate::mint_info::complete_import`]). There is no way to import one
-    /// without the swap.
+    /// without the swap. The handoff must name this wallet's PSP, `psp`, by its
+    /// DID in lowercase hex and by nothing else (not a URL, a name, another DID
+    /// or capitals); otherwise it is refused and nothing is added.
     pub fn import_psp_handoff(
         &mut self,
         text: &str,
         key: &DidSecretKey,
+        psp: ServiceDid,
         from: &str,
     ) -> Result<Imported, WalletError> {
         let (payload, id) = PspPayload::open(text, key)?;
+        let named = crate::fsp::record_of(psp);
+        if payload.mint != named {
+            return Err(WalletError::Invalid(format!(
+                "a PSP handoff names the PSP by its DID in lowercase hex ({named}), and this one names {:?}. Nothing was imported",
+                payload.mint
+            )));
+        }
         let group = Group {
             kind: Kind::Psp,
             service: None,
@@ -1732,7 +1722,7 @@ pub(crate) fn settle_reclaim(d: &mut WalletData, schedule: &str, ok: bool) {
 /// finished by sending the same request again (the mint answers a repeat by
 /// request hash). No fee.
 pub(crate) fn build_psp_swap(
-    url: &str,
+    record: &str,
     notes: &[PayloadNote],
     tag: String,
     current: &str,
@@ -1772,7 +1762,7 @@ pub(crate) fn build_psp_swap(
     Ok(PendingRollover {
         id: r.hash(),
         kind: Kind::Psp,
-        url: url.to_string(),
+        record: record.to_string(),
         body: serde_json::to_value(&r).map_err(|e| WalletError::Invalid(e.to_string()))?,
         inputs: notes
             .iter()
@@ -1784,8 +1774,8 @@ pub(crate) fn build_psp_swap(
     })
 }
 
-/// The key set a swap at `url` asks its outputs to be signed with: the mint's
-/// current key set as last seen, or, if this wallet has not seen it yet, the
+/// The key set a swap at the mint `record` asks its outputs to be signed with:
+/// the mint's current key set as last seen, or, if this wallet has not seen it yet, the
 /// first note's (the mint signs with any live key set named, and refuses one
 /// that is retired or unknown).
 pub(crate) fn swap_keyset(
@@ -1813,8 +1803,14 @@ struct Group {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::expect;
     use std::fs;
     use std::path::{Path, PathBuf};
+
+    /// Open a wallet file of the test network.
+    fn open_wallet(path: &std::path::Path) -> Result<crate::Wallet, crate::WalletError> {
+        crate::Wallet::open(path, "regtest")
+    }
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("ecash-wallet-handoff-{}-{name}", {
@@ -1832,10 +1828,17 @@ mod tests {
 
     const KS_A: &str = "0123456789abcdef";
     const KS_B: &str = "fedcba9876543210";
-    const PSP_URL: &str = "http://127.0.0.1:3000";
+    /// The PSP of the wallets under test, and the name its records and a PSP
+    /// handoff give it: its DID in lowercase hex.
+    fn the_psp() -> ServiceDid {
+        service(9)
+    }
+
+    fn psp_name() -> String {
+        crate::fsp::record_of(the_psp())
+    }
     /// What an FSP group's mint field holds in these tests: a name, never dialled
     /// (a handoff this wallet exports names the service's DID there).
-    const FSP_MINT: &str = "fsp-mint";
 
     fn service(n: u8) -> ServiceDid {
         let sk = SecretKey::from_slice(&[n; 32]).unwrap();
@@ -1863,7 +1866,7 @@ mod tests {
     /// A wallet with PSP notes (4, 2, 1) and FSP notes for service 1 (8, 8) and
     /// service 2 (2), each with a key set, and the FSP mints seen.
     fn funded(dir: &Path, name: &str) -> Wallet {
-        let mut w = Wallet::open(&dir.join(name)).unwrap();
+        let mut w = open_wallet(&dir.join(name)).unwrap();
         w.update(|d| {
             for (kind, amount, svc, ks) in [
                 (Kind::Psp, 4, None, KS_A),
@@ -1908,7 +1911,7 @@ mod tests {
     /// A PSP handoff of `units` PSP from a funded wallet, sealed to `did()`.
     fn psp_out(a: &mut Wallet, units: u128) -> HandoffExport {
         let ids = a.select_psp_handoff(units).unwrap();
-        a.export_psp_handoff(&ids, PSP_URL, &did().public_key())
+        a.export_psp_handoff(&ids, the_psp(), &did().public_key())
             .unwrap()
     }
 
@@ -1955,20 +1958,6 @@ mod tests {
         assert!(!ALPHABET.contains(&b' '));
     }
 
-    #[test]
-    fn the_two_prefixes_are_distinct_and_versioned() {
-        assert_ne!(PSP_PREFIX, FSP_PREFIX);
-        assert_ne!(PSP_PREFIX, OLD_PREFIX);
-        assert_ne!(FSP_PREFIX, OLD_PREFIX);
-        for p in [PSP_PREFIX, FSP_PREFIX] {
-            assert!(
-                p.starts_with("SPH") && p.ends_with(&format!("{FORMAT_VERSION}:")),
-                "{p}"
-            );
-            assert!(p.bytes().all(|c| ALPHABET.contains(&c)));
-        }
-    }
-
     // ---- PSP handoff ---------------------------------------------------------
 
     #[test]
@@ -1990,8 +1979,10 @@ mod tests {
         assert_eq!(a.handoffs_out()[0].kind, HandoffKind::Psp);
         assert!(!a.handoffs_out()[0].with_did_key);
 
-        let mut b = Wallet::open(&dir.join("b.json")).unwrap();
-        let got = b.import_psp_handoff(&out.text, &did(), "dev").unwrap();
+        let mut b = open_wallet(&dir.join("b.json")).unwrap();
+        let got = b
+            .import_psp_handoff(&out.text, &did(), the_psp(), "dev")
+            .unwrap();
         assert_eq!(got.id, out.id);
         assert_eq!(got.kind, HandoffKind::Psp);
         assert_eq!((got.psp_units, got.fsp_units), (5, 0));
@@ -2030,7 +2021,7 @@ mod tests {
             (HandoffKind::Psp, true, "dev")
         );
         // and survives a reopen
-        let again = Wallet::open(b.path()).unwrap();
+        let again = open_wallet(b.path()).unwrap();
         assert_eq!(again.handoffs_in(), b.handoffs_in());
         assert_eq!(again.unswapped_psp(), 5);
         assert_eq!(again.balance().psp, 5);
@@ -2042,21 +2033,21 @@ mod tests {
         let dir = scratch("psp-key");
         let mut a = funded(&dir, "a.json");
         let out = psp_out(&mut a, 7);
-        let mut b = Wallet::open(&dir.join("b.json")).unwrap();
+        let mut b = open_wallet(&dir.join("b.json")).unwrap();
         let file_before = fs::read(b.path()).ok();
         let e = b
-            .import_psp_handoff(&out.text, &other_did(), "")
+            .import_psp_handoff(&out.text, &other_did(), the_psp(), "")
             .unwrap_err()
             .to_string();
         assert!(e.contains("cannot be opened with this DID key"), "{e}");
         // the dispatcher needs a key for a PSP handoff
         let e = b
-            .import_handoff(&out.text, None, "")
+            .import_handoff(&out.text, None, the_psp(), "")
             .unwrap_err()
             .to_string();
         assert!(e.contains("give the DID secret key"), "{e}");
         let e = b
-            .import_handoff(&out.text, Some(&other_did()), "")
+            .import_handoff(&out.text, Some(&other_did()), the_psp(), "")
             .unwrap_err()
             .to_string();
         assert!(e.contains("cannot be opened"), "{e}");
@@ -2064,7 +2055,9 @@ mod tests {
         assert!(b.handoffs_in().is_empty());
         assert_eq!(fs::read(b.path()).ok(), file_before, "nothing was written");
         // the right key opens it, through the dispatcher too
-        let got = b.import_handoff(&out.text, Some(&did()), "").unwrap();
+        let got = b
+            .import_handoff(&out.text, Some(&did()), the_psp(), "")
+            .unwrap();
         assert_eq!(got.kind, HandoffKind::Psp);
         assert_eq!(got.psp_units, 7);
         // the handoff holds no plain secret: the note's spend secret is not in
@@ -2086,15 +2079,15 @@ mod tests {
             .map(payload_note)
             .collect();
         let payload = PspPayload {
-            mint: PSP_URL.into(),
+            mint: psp_name(),
             notes,
         };
         let plain = payload.body().unwrap();
         // the body, framed under the PSP prefix with a good check, unencrypted
         let text = frame(PSP_PREFIX, &plain);
-        let mut b = Wallet::open(&dir.join("b.json")).unwrap();
+        let mut b = open_wallet(&dir.join("b.json")).unwrap();
         let e = b
-            .import_psp_handoff(&text, &did(), "")
+            .import_psp_handoff(&text, &did(), the_psp(), "")
             .unwrap_err()
             .to_string();
         assert!(
@@ -2116,7 +2109,7 @@ mod tests {
             .map(payload_note)
             .collect();
         let body = PspPayload {
-            mint: PSP_URL.into(),
+            mint: psp_name(),
             notes: psp_notes,
         }
         .body()
@@ -2127,12 +2120,12 @@ mod tests {
                 &sp_wire::seal::encrypt(&did().public_key(), bytes).unwrap(),
             )
         };
-        let mut b = Wallet::open(&dir.join("b.json")).unwrap();
+        let mut b = open_wallet(&dir.join("b.json")).unwrap();
         // a DID key after the notes
         let mut with_key = body.clone();
         with_key.extend_from_slice(&did().to_array());
         let e = b
-            .import_psp_handoff(&seal(&with_key), &did(), "")
+            .import_psp_handoff(&seal(&with_key), &did(), the_psp(), "")
             .unwrap_err()
             .to_string();
         assert!(e.contains("PSP notes and nothing else"), "{e}");
@@ -2140,7 +2133,7 @@ mod tests {
         let fsp_body = FspPayload {
             groups: vec![FspGroup {
                 service: service(1),
-                mint: FSP_MINT.into(),
+                mint: hex::encode(service(1).serialize()),
                 notes: a
                     .notes()
                     .iter()
@@ -2154,43 +2147,46 @@ mod tests {
         .body()
         .unwrap();
         let e = b
-            .import_psp_handoff(&seal(&fsp_body), &did(), "")
+            .import_psp_handoff(&seal(&fsp_body), &did(), the_psp(), "")
             .unwrap_err()
             .to_string();
         assert!(e.contains("not a PSP handoff inside"), "{e}");
         // the right body, as a control
-        b.import_psp_handoff(&seal(&body), &did(), "").unwrap();
+        b.import_psp_handoff(&seal(&body), &did(), the_psp(), "")
+            .unwrap();
         fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
-    fn a_psp_handoff_needs_a_mint_and_only_psp_notes() {
+    fn a_psp_handoff_holds_only_psp_notes_and_is_refused_for_anything_else() {
         let dir = scratch("psp-refuse");
         let mut a = funded(&dir, "a.json");
         let to = did().public_key();
         let psp_ids = a.select_psp_handoff(1).unwrap();
         let fsp_ids = a.select_fsp_handoff(&[(service(2), 2)]).unwrap();
-        // a blank mint URL
-        assert!(a.export_psp_handoff(&psp_ids, " ", &to).is_err());
         // an FSP note in a PSP handoff, alone or mixed in
         let e = a
-            .export_psp_handoff(&fsp_ids, PSP_URL, &to)
+            .export_psp_handoff(&fsp_ids, the_psp(), &to)
             .unwrap_err()
             .to_string();
         assert!(e.contains("carries PSP notes only"), "{e}");
         let mixed = [psp_ids[0].clone(), fsp_ids[0].clone()];
         let e = a
-            .export_psp_handoff(&mixed, PSP_URL, &to)
+            .export_psp_handoff(&mixed, the_psp(), &to)
             .unwrap_err()
             .to_string();
         assert!(e.contains("carries PSP notes only"), "{e}");
         // nothing, a note twice, a note that is not here
-        assert!(a.export_psp_handoff(&[], PSP_URL, &to).is_err());
+        let e = expect::invalid(a.export_psp_handoff(&[], the_psp(), &to));
+        assert!(e.contains("the handoff holds nothing"), "{e}");
         let twice = [psp_ids[0].clone(), psp_ids[0].clone()];
-        assert!(a.export_psp_handoff(&twice, PSP_URL, &to).is_err());
+        let e = expect::invalid(a.export_psp_handoff(&twice, the_psp(), &to));
+        assert!(e.contains("selected twice"), "{e}");
+        let gone = "00".repeat(33);
+        let e = expect::unknown(a.export_psp_handoff(&[gone.clone()], the_psp(), &to));
         assert!(
-            a.export_psp_handoff(&["00".repeat(33)], PSP_URL, &to)
-                .is_err()
+            e.contains(&format!("note {gone} is not in this wallet")),
+            "{e}"
         );
         // a held-back note
         let id = psp_ids[0].clone();
@@ -2202,7 +2198,7 @@ mod tests {
         })
         .unwrap();
         let e = a
-            .export_psp_handoff(&psp_ids, PSP_URL, &to)
+            .export_psp_handoff(&psp_ids, the_psp(), &to)
             .unwrap_err()
             .to_string();
         assert!(e.contains("held back"), "{e}");
@@ -2215,12 +2211,13 @@ mod tests {
         })
         .unwrap();
         let e = a
-            .export_psp_handoff(&[nid], PSP_URL, &to)
+            .export_psp_handoff(&[nid], the_psp(), &to)
             .unwrap_err()
             .to_string();
         assert!(e.contains("no recorded key set"), "{e}");
         // not enough
-        assert!(a.select_psp_handoff(1000).is_err());
+        let e = expect::not_enough(a.select_psp_handoff(1000));
+        assert!(e.contains("add up to exactly 1000"), "{e}");
         assert!(a.handoffs_out().is_empty(), "nothing was taken out");
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -2245,7 +2242,7 @@ mod tests {
         assert_eq!(a.balance().psp, before.psp, "no PSP went with it");
         assert!(a.handoffs_out()[0].with_did_key);
 
-        let mut b = Wallet::open(&dir.join("b.json")).unwrap();
+        let mut b = open_wallet(&dir.join("b.json")).unwrap();
         let got = b.import_fsp_handoff(&out.text, "old phone").unwrap();
         assert_eq!(got.id, out.id);
         assert_eq!(got.kind, HandoffKind::Fsp);
@@ -2273,7 +2270,7 @@ mod tests {
         }
         // the dispatcher takes it with no key given, and a second import is refused
         let e = b
-            .import_handoff(&out.text, None, "")
+            .import_handoff(&out.text, None, the_psp(), "")
             .unwrap_err()
             .to_string();
         assert!(e.contains("imported already"), "{e}");
@@ -2285,19 +2282,31 @@ mod tests {
         let dir = scratch("fsp-refuse");
         let mut a = funded(&dir, "a.json");
         // nothing chosen
-        assert!(a.select_fsp_handoff(&[]).is_err());
-        assert!(a.select_fsp_handoff(&[(service(1), 0)]).is_err());
-        assert!(a.export_fsp_handoff(&[], &did()).is_err());
+        let e = expect::invalid(a.select_fsp_handoff(&[]));
+        assert!(e.contains("choose at least one service"), "{e}");
+        let e = expect::invalid(a.select_fsp_handoff(&[(service(1), 0)]));
+        assert!(e.contains("choose at least one service"), "{e}");
+        let e = expect::invalid(a.export_fsp_handoff(&[], &did()));
+        assert!(e.contains("the handoff holds nothing"), "{e}");
         // not exact, and a service the wallet has no FSP for
-        assert!(a.select_fsp_handoff(&[(service(1), 3)]).is_err());
-        assert!(a.select_fsp_handoff(&[(service(9), 2)]).is_err());
+        let e = expect::not_enough(a.select_fsp_handoff(&[(service(1), 3)]));
+        assert!(
+            e.contains(&hex::encode(service(1).serialize())) && e.contains("exactly 3"),
+            "{e}"
+        );
+        let e = expect::not_enough(a.select_fsp_handoff(&[(service(9), 2)]));
+        assert!(
+            e.contains(&hex::encode(service(9).serialize())) && e.contains("exactly 2"),
+            "{e}"
+        );
         // a PSP note in an FSP handoff
         let psp = a.select_psp_handoff(1).unwrap();
         let e = a.export_fsp_handoff(&psp, &did()).unwrap_err().to_string();
         assert!(e.contains("carries FSP notes only"), "{e}");
         let fsp = a.select_fsp_handoff(&[(service(2), 2)]).unwrap();
         let mixed = [fsp[0].clone(), psp[0].clone()];
-        assert!(a.export_fsp_handoff(&mixed, &did()).is_err());
+        let e = expect::invalid(a.export_fsp_handoff(&mixed, &did()));
+        assert!(e.contains("carries FSP notes only"), "{e}");
         // an FSP note of an unknown service, and one whose mint was never seen
         let n = note(Kind::Fsp, 4, None);
         let nid = n.id();
@@ -2330,13 +2339,102 @@ mod tests {
     }
 
     #[test]
+    fn an_fsp_handoff_names_its_mint_by_the_services_did_and_nothing_else() {
+        let dir = scratch("fsp-mint-name");
+        let a = funded(&dir, "a.json");
+        let notes: Vec<PayloadNote> = a
+            .notes()
+            .iter()
+            .filter(|n| n.kind == Kind::Fsp)
+            .take(1)
+            .map(payload_note)
+            .collect();
+        let mut b = open_wallet(&dir.join("b.json")).unwrap();
+        let named = hex::encode(service(1).serialize());
+        // a URL (what a pre-release handoff carried), a name, another
+        // service's DID and the DID in capitals are all refused
+        for mint in [
+            "http://fsp.example:3200".to_string(),
+            "fsp-mint".to_string(),
+            hex::encode(service(2).serialize()),
+            named.to_uppercase(),
+        ] {
+            let (text, _) = FspPayload {
+                groups: vec![FspGroup {
+                    service: service(1),
+                    mint: mint.clone(),
+                    notes: notes.clone(),
+                }],
+                did_key: did(),
+            }
+            .encode()
+            .unwrap();
+            let e = b.import_fsp_handoff(&text, "").unwrap_err();
+            assert!(matches!(e, WalletError::Invalid(_)), "{e:?}");
+            let e = e.to_string();
+            assert!(e.contains(&format!("({named})")), "{e}");
+            assert!(e.contains(&format!("names {mint:?}")), "{e}");
+        }
+        assert!(b.notes().is_empty(), "nothing was added");
+        assert!(b.handoffs_in().is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_psp_handoff_names_the_psp_by_its_did_and_nothing_else() {
+        let dir = scratch("psp-mint-name");
+        let a = funded(&dir, "a.json");
+        let notes: Vec<PayloadNote> = a
+            .notes()
+            .iter()
+            .filter(|n| n.kind == Kind::Psp)
+            .take(1)
+            .map(payload_note)
+            .collect();
+        let mut b = open_wallet(&dir.join("b.json")).unwrap();
+        let named = hex::encode(the_psp().serialize());
+        // a URL (what a pre-release handoff carried), a name, another DID and the
+        // PSP's DID in capitals are all refused, and nothing is added
+        for mint in [
+            "http://127.0.0.1:3000".to_string(),
+            "psp-mint".to_string(),
+            hex::encode(service(2).serialize()),
+            named.to_uppercase(),
+        ] {
+            let (text, _) = PspPayload {
+                mint: mint.clone(),
+                notes: notes.clone(),
+            }
+            .seal(&did().public_key())
+            .unwrap();
+            let e = b
+                .import_psp_handoff(&text, &did(), the_psp(), "")
+                .unwrap_err();
+            assert!(matches!(e, WalletError::Invalid(_)), "{e:?}");
+            let e = e.to_string();
+            assert!(e.contains(&format!("({named})")), "{e}");
+            assert!(e.contains(&format!("names {mint:?}")), "{e}");
+        }
+        assert!(b.notes().is_empty(), "nothing was added");
+        assert!(b.handoffs_in().is_empty());
+        assert!(b.pending_rollovers().is_empty());
+        // the PSP's DID in lowercase hex, as a control
+        let (text, _) = PspPayload { mint: named, notes }
+            .seal(&did().public_key())
+            .unwrap();
+        b.import_psp_handoff(&text, &did(), the_psp(), "").unwrap();
+        assert_eq!(b.handoffs_in().len(), 1);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn an_fsp_body_without_a_did_key_or_notes_is_refused() {
         let dir = scratch("fsp-body");
         let a = funded(&dir, "a.json");
         let payload = FspPayload {
             groups: vec![FspGroup {
                 service: service(1),
-                mint: FSP_MINT.into(),
+                mint: hex::encode(service(1).serialize()),
                 notes: a
                     .notes()
                     .iter()
@@ -2348,7 +2446,7 @@ mod tests {
             did_key: did(),
         };
         let body = payload.body().unwrap();
-        let mut b = Wallet::open(&dir.join("b.json")).unwrap();
+        let mut b = open_wallet(&dir.join("b.json")).unwrap();
         // the body less its DID key, with a good check: cut short
         let no_key = frame(FSP_PREFIX, &body[..body.len() - DID_KEY_BYTES]);
         let e = b.import_fsp_handoff(&no_key, "").unwrap_err().to_string();
@@ -2376,7 +2474,7 @@ mod tests {
         assert!(e.contains("holds nothing"), "{e}");
         // a PSP body under the FSP prefix
         let psp_body = PspPayload {
-            mint: PSP_URL.into(),
+            mint: psp_name(),
             notes: a
                 .notes()
                 .iter()
@@ -2406,21 +2504,30 @@ mod tests {
         let mut a = funded(&dir, "a.json");
         let psp = psp_out(&mut a, 3);
         let fsp = fsp_out(&mut a, &[(service(2), 2)]);
-        let mut b = Wallet::open(&dir.join("b.json")).unwrap();
-        // the PSP bytes under the FSP prefix, and the reverse
-        let as_fsp = format!("{FSP_PREFIX}{}", &psp.text[PSP_PREFIX.len()..]);
-        let as_psp = format!("{PSP_PREFIX}{}", &fsp.text[FSP_PREFIX.len()..]);
-        assert!(b.import_fsp_handoff(&as_fsp, "").is_err());
-        assert!(b.import_psp_handoff(&as_psp, &did(), "").is_err());
-        assert!(b.import_handoff(&as_fsp, None, "").is_err());
-        assert!(b.import_handoff(&as_psp, Some(&did()), "").is_err());
+        let mut b = open_wallet(&dir.join("b.json")).unwrap();
+        // the PSP body under the FSP prefix, and the FSP body under the PSP
+        // prefix, each with a good check
+        let (psp_payload, _) = PspPayload::open(&psp.text, &did()).unwrap();
+        let (fsp_payload, _) = FspPayload::decode(&fsp.text).unwrap();
+        let as_fsp = frame(FSP_PREFIX, &psp_payload.body().unwrap());
+        let as_psp = frame(PSP_PREFIX, &fsp_payload.body().unwrap());
+        for e in [
+            expect::invalid(b.import_fsp_handoff(&as_fsp, "")),
+            expect::invalid(b.import_handoff(&as_fsp, None, the_psp(), "")),
+        ] {
+            assert!(e.contains("this is not a FSP handoff inside"), "{e}");
+        }
+        // the FSP body is not sealed, so no DID key opens it
+        for e in [
+            expect::invalid(b.import_psp_handoff(&as_psp, &did(), the_psp(), "")),
+            expect::invalid(b.import_handoff(&as_psp, Some(&did()), the_psp(), "")),
+        ] {
+            assert!(e.contains("cannot be opened with this DID key"), "{e}");
+        }
         // each kind's import refuses the other kind's string, by name
-        let e = b.import_fsp_handoff(&psp.text, "").unwrap_err().to_string();
+        let e = expect::invalid(b.import_fsp_handoff(&psp.text, ""));
         assert!(e.contains("PSP handoff, not an FSP"), "{e}");
-        let e = b
-            .import_psp_handoff(&fsp.text, &did(), "")
-            .unwrap_err()
-            .to_string();
+        let e = expect::invalid(b.import_psp_handoff(&fsp.text, &did(), the_psp(), ""));
         assert!(e.contains("FSP handoff, not a PSP"), "{e}");
         assert!(b.notes().is_empty() && b.handoffs_in().is_empty());
         assert!(b.pending_rollovers().is_empty());
@@ -2428,9 +2535,21 @@ mod tests {
     }
 
     #[test]
-    fn the_kind_comes_from_the_prefix_and_the_old_prefix_is_refused() {
+    fn the_prefixes_are_distinct_and_the_kind_comes_from_the_prefix_and_the_old_prefix_is_refused()
+    {
         let dir = scratch("kind");
         let mut a = funded(&dir, "a.json");
+        // the prefixes are distinct, versioned and in the QR alphabet
+        assert_ne!(PSP_PREFIX, FSP_PREFIX);
+        assert_ne!(PSP_PREFIX, OLD_PREFIX);
+        assert_ne!(FSP_PREFIX, OLD_PREFIX);
+        for p in [PSP_PREFIX, FSP_PREFIX] {
+            assert!(
+                p.starts_with("SPH") && p.ends_with(&format!("{FORMAT_VERSION}:")),
+                "{p}"
+            );
+            assert!(p.bytes().all(|c| ALPHABET.contains(&c)));
+        }
         let psp = psp_out(&mut a, 1);
         let fsp = fsp_out(&mut a, &[(service(2), 2)]);
         assert_eq!(kind_of(&psp.text).unwrap(), HandoffKind::Psp);
@@ -2445,11 +2564,8 @@ mod tests {
             e.contains("old combined handoff") && e.contains("SPHP2:") && e.contains("SPHF2:"),
             "{e}"
         );
-        let mut b = Wallet::open(&dir.join("b.json")).unwrap();
-        let e = b
-            .import_handoff("sph1:abcdef", None, "")
-            .unwrap_err()
-            .to_string();
+        let mut b = open_wallet(&dir.join("b.json")).unwrap();
+        let e = expect::invalid(b.import_handoff("sph1:abcdef", None, the_psp(), ""));
         assert!(e.contains("old combined handoff"), "{e}");
         // another version of either kind (1 is the one before service IDs were
         // DIDs), and a digit this wallet does not know
@@ -2484,7 +2600,7 @@ mod tests {
         // notes, then the seal's 80 bytes and the 4-byte check
         let out = psp_out(&mut a, 7);
         assert_eq!(out.notes, 3);
-        let plain = 2 + (2 + PSP_URL.len()) + (1 + 8 * 2) + 2 + 3 * NOTE_BYTES;
+        let plain = 2 + (2 + 66) + (1 + 8 * 2) + 2 + 3 * NOTE_BYTES;
         let raw = plain + sp_wire::seal::OVERHEAD + CHECK_BYTES;
         assert_eq!(
             base44_decode(&out.text[PSP_PREFIX.len()..]).unwrap().len(),
@@ -2523,9 +2639,24 @@ mod tests {
                 .collect();
             format!("  {}  ", wrapped.to_lowercase())
         };
-        let mut b = Wallet::open(&dir.join("b.json")).unwrap();
-        b.import_psp_handoff(&wrap(&psp.text), &did(), "").unwrap();
+        let mut b = open_wallet(&dir.join("b.json")).unwrap();
+        b.import_psp_handoff(&wrap(&psp.text), &did(), the_psp(), "")
+            .unwrap();
         b.import_fsp_handoff(&wrap(&fsp.text), "").unwrap();
+        // a changed character is not forgiven, whatever the case and spacing
+        let mut c = open_wallet(&dir.join("c.json")).unwrap();
+        let e = expect::invalid(c.import_psp_handoff(
+            &wrap(&damaged(&psp.text, PSP_PREFIX.len() + 50)),
+            &did(),
+            the_psp(),
+            "",
+        ));
+        assert!(e.contains("damaged"), "{e}");
+        let e = expect::invalid(
+            c.import_fsp_handoff(&wrap(&damaged(&fsp.text, FSP_PREFIX.len() + 50)), ""),
+        );
+        assert!(e.contains("damaged"), "{e}");
+        assert!(c.notes().is_empty() && c.handoffs_in().is_empty());
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -2541,13 +2672,10 @@ mod tests {
         let mut a = funded(&dir, "a.json");
         let psp = psp_out(&mut a, 7);
         let fsp = fsp_out(&mut a, &[(service(1), 16)]);
-        let mut b = Wallet::open(&dir.join("b.json")).unwrap();
+        let mut b = open_wallet(&dir.join("b.json")).unwrap();
         let file_before = fs::read(b.path()).ok();
         let bad = |e: String, at: usize| {
-            assert!(
-                e.contains("damaged") || e.contains("cut short") || e.contains("not valid"),
-                "{at}: {e}"
-            );
+            assert!(e.contains("damaged"), "{at}: {e}");
         };
         for (text, prefix) in [(&psp.text, PSP_PREFIX), (&fsp.text, FSP_PREFIX)] {
             // one changed character anywhere after the prefix
@@ -2559,7 +2687,7 @@ mod tests {
             ] {
                 let t = damaged(text, at);
                 let e = if prefix == PSP_PREFIX {
-                    b.import_psp_handoff(&t, &did(), "")
+                    b.import_psp_handoff(&t, &did(), the_psp(), "")
                 } else {
                     b.import_fsp_handoff(&t, "")
                 }
@@ -2570,7 +2698,7 @@ mod tests {
             // cut short, and extra characters
             let cut = &text[..text.len() - 7];
             let e = if prefix == PSP_PREFIX {
-                b.import_psp_handoff(cut, &did(), "")
+                b.import_psp_handoff(cut, &did(), the_psp(), "")
             } else {
                 b.import_fsp_handoff(cut, "")
             }
@@ -2578,28 +2706,49 @@ mod tests {
             .to_string();
             bad(e, 0);
             let extra = format!("{text}AB");
-            assert!(
-                if prefix == PSP_PREFIX {
-                    b.import_psp_handoff(&extra, &did(), "")
-                } else {
-                    b.import_fsp_handoff(&extra, "")
-                }
-                .is_err()
-            );
+            let e = expect::invalid(if prefix == PSP_PREFIX {
+                b.import_psp_handoff(&extra, &did(), the_psp(), "")
+            } else {
+                b.import_fsp_handoff(&extra, "")
+            });
+            bad(e, 0);
         }
-        // not a handoff at all
-        for junk in [
-            "",
-            "hello",
-            "SPH",
-            "SPHP2",
-            "SPHP2:",
-            "SPHP2:!!!",
-            "SPHF2:",
-            "SPHF2:!!!",
-            "psp1abcd",
+        // not a handoff at all, or of another version: refused at the prefix, by
+        // the import and by `kind_of` alike
+        for (junk, says) in [
+            ("", "this is not a handoff"),
+            ("hello", "this is not a handoff"),
+            ("SPH", "this is not a handoff"),
+            ("SPHP2", "this is not a handoff"),
+            ("SPHP3:", "this handoff is version 3"),
+            ("SPHF3:", "this handoff is version 3"),
+            ("psp1abcd", "this is not a handoff"),
         ] {
-            assert!(b.import_handoff(junk, Some(&did()), "").is_err(), "{junk}");
+            let e = expect::invalid(b.import_handoff(junk, Some(&did()), the_psp(), ""));
+            assert!(e.contains(says), "{junk}: {e}");
+            let e = expect::invalid(kind_of(junk));
+            assert!(e.contains(says), "{junk}: {e}");
+        }
+        // the current prefixes (version 2) are recognised, so `kind_of` accepts
+        // them; what follows is then refused: nothing after the prefix is cut
+        // short, and `!` is not a character of the handoff alphabet
+        for (junk, kind, says) in [
+            ("SPHP2:", HandoffKind::Psp, "cut short or damaged"),
+            ("SPHF2:", HandoffKind::Fsp, "cut short or damaged"),
+            (
+                "SPHP2:!!!",
+                HandoffKind::Psp,
+                "character that does not belong in one: `!`",
+            ),
+            (
+                "SPHF2:!!!",
+                HandoffKind::Fsp,
+                "character that does not belong in one: `!`",
+            ),
+        ] {
+            assert_eq!(kind_of(junk).unwrap(), kind, "{junk}");
+            let e = expect::invalid(b.import_handoff(junk, Some(&did()), the_psp(), ""));
+            assert!(e.contains(says), "{junk}: {e}");
         }
         assert!(b.notes().is_empty());
         assert!(b.handoffs_in().is_empty() && b.pending_rollovers().is_empty());
@@ -2625,14 +2774,14 @@ mod tests {
         let payload = FspPayload {
             groups: vec![FspGroup {
                 service: service(1),
-                mint: FSP_MINT.into(),
+                mint: hex::encode(service(1).serialize()),
                 notes: fsp_notes,
             }],
             did_key: did(),
         };
         let mut body = payload.body().unwrap();
         body[0] = FORMAT_VERSION + 1;
-        let mut b = Wallet::open(&dir.join("b.json")).unwrap();
+        let mut b = open_wallet(&dir.join("b.json")).unwrap();
         let e = b
             .import_fsp_handoff(&frame(FSP_PREFIX, &body), "")
             .unwrap_err()
@@ -2643,7 +2792,7 @@ mod tests {
         );
         // the same inside a sealed PSP handoff
         let mut body = PspPayload {
-            mint: PSP_URL.into(),
+            mint: psp_name(),
             notes: a
                 .notes()
                 .iter()
@@ -2657,7 +2806,7 @@ mod tests {
         body[0] = FORMAT_VERSION + 1;
         let sealed = sp_wire::seal::encrypt(&did().public_key(), &body).unwrap();
         let e = b
-            .import_psp_handoff(&frame(PSP_PREFIX, &sealed), &did(), "")
+            .import_psp_handoff(&frame(PSP_PREFIX, &sealed), &did(), the_psp(), "")
             .unwrap_err()
             .to_string();
         assert!(
@@ -2679,22 +2828,22 @@ mod tests {
             .map(payload_note)
             .unwrap();
         forged.spend_secret = SecretKey::new(&mut rand::rngs::OsRng);
-        let mut b = Wallet::open(&dir.join("b.json")).unwrap();
+        let mut b = open_wallet(&dir.join("b.json")).unwrap();
         let (text, _) = PspPayload {
-            mint: PSP_URL.into(),
+            mint: psp_name(),
             notes: vec![forged.clone()],
         }
         .seal(&did().public_key())
         .unwrap();
         let e = b
-            .import_psp_handoff(&text, &did(), "")
+            .import_psp_handoff(&text, &did(), the_psp(), "")
             .unwrap_err()
             .to_string();
         assert!(e.contains("not the one for its nonce"), "{e}");
         let (text, _) = FspPayload {
             groups: vec![FspGroup {
                 service: service(1),
-                mint: FSP_MINT.into(),
+                mint: hex::encode(service(1).serialize()),
                 notes: vec![forged],
             }],
             did_key: did(),
@@ -2712,12 +2861,13 @@ mod tests {
         let mut a = funded(&dir, "a.json");
         let psp = psp_out(&mut a, 7);
         let fsp = fsp_out(&mut a, &[(service(1), 8)]);
-        let mut b = Wallet::open(&dir.join("b.json")).unwrap();
-        b.import_psp_handoff(&psp.text, &did(), "").unwrap();
+        let mut b = open_wallet(&dir.join("b.json")).unwrap();
+        b.import_psp_handoff(&psp.text, &did(), the_psp(), "")
+            .unwrap();
         b.import_fsp_handoff(&fsp.text, "").unwrap();
         let held = b.balance();
         let e = b
-            .import_psp_handoff(&psp.text, &did(), "")
+            .import_psp_handoff(&psp.text, &did(), the_psp(), "")
             .unwrap_err()
             .to_string();
         assert!(e.contains("imported already"), "{e}");
@@ -2734,7 +2884,7 @@ mod tests {
         .unwrap();
         assert!(b.import_fsp_handoff(&fsp.text, "").is_err());
         // another wallet that already holds one of the notes refuses too
-        let mut c = Wallet::open(&dir.join("c.json")).unwrap();
+        let mut c = open_wallet(&dir.join("c.json")).unwrap();
         let first = a
             .handoffs_out()
             .iter()
@@ -2754,7 +2904,7 @@ mod tests {
         let e = a.import_fsp_handoff(&fsp.text, "").unwrap_err().to_string();
         assert!(e.contains("made this handoff"), "{e}");
         let e = a
-            .import_psp_handoff(&psp.text, &did(), "")
+            .import_psp_handoff(&psp.text, &did(), the_psp(), "")
             .unwrap_err()
             .to_string();
         assert!(e.contains("made this handoff"), "{e}");
@@ -2769,7 +2919,7 @@ mod tests {
         let fsp = fsp_out(&mut a, &[(service(1), 16)]);
 
         // FSP: the receiver knows service 1's mint, whose live sets are not A or B
-        let mut b = Wallet::open(&dir.join("b.json")).unwrap();
+        let mut b = open_wallet(&dir.join("b.json")).unwrap();
         b.update(|d| {
             d.fsp_mints.insert(
                 hex::encode(service(1).serialize()),
@@ -2790,27 +2940,27 @@ mod tests {
         assert!(b.notes().is_empty());
 
         // PSP: the receiver knows the PSP mint's live sets
-        let mut c = Wallet::open(&dir.join("c.json")).unwrap();
+        let mut c = open_wallet(&dir.join("c.json")).unwrap();
         c.update(|d| {
             d.live_keysets.insert(
-                PSP_URL.into(),
+                psp_name(),
                 ("2222222222222222".into(), Some("3333333333333333".into())),
             );
             Ok(())
         })
         .unwrap();
         let e = c
-            .import_psp_handoff(&psp.text, &did(), "")
+            .import_psp_handoff(&psp.text, &did(), the_psp(), "")
             .unwrap_err()
             .to_string();
         assert!(e.contains("expired"), "{e}");
         assert!(c.pending_rollovers().is_empty());
 
         // with the right sets known it is accepted
-        let mut d = Wallet::open(&dir.join("d.json")).unwrap();
+        let mut d = open_wallet(&dir.join("d.json")).unwrap();
         d.update(|w| {
             w.live_keysets
-                .insert(PSP_URL.into(), (KS_A.into(), Some(KS_B.into())));
+                .insert(psp_name(), (KS_A.into(), Some(KS_B.into())));
             w.fsp_mints.insert(
                 hex::encode(service(1).serialize()),
                 crate::fsp::FspMint {
@@ -2822,7 +2972,8 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        d.import_psp_handoff(&psp.text, &did(), "").unwrap();
+        d.import_psp_handoff(&psp.text, &did(), the_psp(), "")
+            .unwrap();
         let got = d.import_fsp_handoff(&fsp.text, "").unwrap();
         assert_eq!(got.fsp_mints, vec![service(1)]);
         assert!(got.warnings.is_empty(), "{:?}", got.warnings);
@@ -2835,10 +2986,12 @@ mod tests {
         let mut a = funded(&dir, "a.json");
         let psp = psp_out(&mut a, 1);
         let fsp = fsp_out(&mut a, &[(service(2), 2)]);
-        let mut b = Wallet::open(&dir.join("b.json")).unwrap();
-        let got = b.import_psp_handoff(&psp.text, &did(), "").unwrap();
+        let mut b = open_wallet(&dir.join("b.json")).unwrap();
+        let got = b
+            .import_psp_handoff(&psp.text, &did(), the_psp(), "")
+            .unwrap();
         assert_eq!(got.warnings.len(), 1, "{:?}", got.warnings);
-        assert_eq!(got.psp_mints, vec![PSP_URL.to_string()]);
+        assert_eq!(got.psp_mints, vec![psp_name()]);
         assert!(got.fsp_mints.is_empty());
         let got = b.import_fsp_handoff(&fsp.text, "").unwrap();
         assert_eq!(got.warnings.len(), 1, "{:?}", got.warnings);
@@ -2892,31 +3045,19 @@ mod tests {
             spend_secret: n.spend_secret,
         }];
         let psp = PspPayload {
-            mint: PSP_URL.into(),
+            mint: psp_name(),
             notes: notes.clone(),
         };
         assert!(psp.seal(&did().public_key()).is_err());
         let fsp = FspPayload {
             groups: vec![FspGroup {
                 service: service(1),
-                mint: FSP_MINT.into(),
+                mint: hex::encode(service(1).serialize()),
                 notes,
             }],
             did_key: did(),
         };
         assert!(fsp.encode().is_err());
-    }
-
-    #[test]
-    fn records_from_wallet_0_4_0_still_read_as_combined() {
-        let old = r#"{"id":"ab","state":"pending","psp_units":3,"fsp_units":0,"note_count":1,"with_did_key":false,"notes":[]}"#;
-        let h: OutgoingHandoff = serde_json::from_str(old).unwrap();
-        assert_eq!(h.kind, HandoffKind::Combined);
-        let old =
-            r#"{"id":"ab","from":"x","psp_units":3,"fsp_units":0,"notes":[],"swapped":false}"#;
-        let h: IncomingHandoff = serde_json::from_str(old).unwrap();
-        assert_eq!(h.kind, HandoffKind::Combined);
-        assert_eq!(HandoffKind::Combined.label(), "combined (0.4.0)");
     }
 
     // ---- reclaim -------------------------------------------------------------
@@ -2934,7 +3075,7 @@ mod tests {
         let h = a.handoffs_out()[0].clone();
         assert_eq!(
             (h.mint.as_str(), h.reclaim.clone(), h.spent_elsewhere),
-            (PSP_URL, None, 0)
+            (psp_name().as_str(), None, 0)
         );
         assert_eq!(a.handoff_standing(&out.id).unwrap(), Standing::Pending);
         // none spent: nothing changes
@@ -2965,7 +3106,7 @@ mod tests {
             (HandoffState::Done, 0, 2)
         );
         // it survives a reopen, and a done handoff cannot be reclaimed
-        let mut again = Wallet::open(a.path()).unwrap();
+        let mut again = open_wallet(a.path()).unwrap();
         assert_eq!(again.handoff_standing(&out.id).unwrap(), Standing::Received);
         assert!(again.begin_reclaim(&out.id).is_err());
         fs::remove_dir_all(&dir).unwrap();
@@ -3033,33 +3174,19 @@ mod tests {
     }
 
     #[test]
-    fn an_fsp_handoff_and_a_record_from_0_4_0_cannot_be_asked_about_the_mint() {
+    fn an_fsp_handoff_cannot_be_asked_about_the_mint() {
         let dir = scratch("noreclaim");
         let mut a = funded(&dir, "a.json");
         let fsp = fsp_out(&mut a, &[(service(1), 8)]);
-        let e = a.begin_reclaim(&fsp.id).unwrap_err().to_string();
-        assert!(e.contains("FSP handoff"), "{e}");
-        assert!(a.handoff_standing(&fsp.id).is_err());
-        a.update(|d| {
-            d.handoffs_out.push(OutgoingHandoff {
-                id: "old".into(),
-                state: HandoffState::Pending,
-                kind: HandoffKind::Combined,
-                psp_units: 3,
-                fsp_units: 0,
-                note_count: 1,
-                with_did_key: false,
-                notes: vec![],
-                mint: String::new(),
-                reclaim: None,
-                spent_elsewhere: 0,
-            });
-            Ok(())
-        })
-        .unwrap();
-        let e = a.begin_reclaim("old").unwrap_err().to_string();
-        assert!(e.contains("0.4.0") && e.contains("handoff cancel"), "{e}");
-        assert!(a.begin_reclaim("nope").is_err());
+        let e = expect::invalid(a.begin_reclaim(&fsp.id));
+        assert!(
+            e.contains(&format!("handoff {} is an FSP handoff", fsp.id)),
+            "{e}"
+        );
+        let e = expect::invalid(a.handoff_standing(&fsp.id));
+        assert!(e.contains("is an FSP handoff"), "{e}");
+        let e = expect::unknown(a.begin_reclaim("nope"));
+        assert!(e.contains("no handoff nope"), "{e}");
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -3068,8 +3195,10 @@ mod tests {
         let dir = scratch("live");
         let mut a = funded(&dir, "a.json");
         let out = psp_out(&mut a, 7); // 4 + 2 + 1
-        let mut b = Wallet::open(&dir.join("b.json")).unwrap();
-        let got = b.import_psp_handoff(&out.text, &did(), "").unwrap();
+        let mut b = open_wallet(&dir.join("b.json")).unwrap();
+        let got = b
+            .import_psp_handoff(&out.text, &did(), the_psp(), "")
+            .unwrap();
         let id = got.psp_swaps[0].clone();
         assert_eq!(b.balance().psp, 7);
         // nothing changed: the same swap is sent
@@ -3077,7 +3206,7 @@ mod tests {
         // one note was spent here first (handed on): the swap is rebuilt for the rest
         let spent = b.select_psp_handoff(4).unwrap();
         let handed = b
-            .export_psp_handoff(&spent, PSP_URL, &did().public_key())
+            .export_psp_handoff(&spent, the_psp(), &did().public_key())
             .unwrap();
         assert_eq!(handed.psp_units, 4);
         assert_eq!(b.balance().psp, 3);
@@ -3090,7 +3219,7 @@ mod tests {
         assert_eq!(b.unswapped_psp(), 3);
         // all spent: the swap is dropped
         let rest = b.select_psp_handoff(3).unwrap();
-        b.export_psp_handoff(&rest, PSP_URL, &did().public_key())
+        b.export_psp_handoff(&rest, the_psp(), &did().public_key())
             .unwrap();
         assert_eq!(b.live_swap(&now).unwrap(), None);
         assert!(b.pending_rollovers().is_empty());
@@ -3103,8 +3232,10 @@ mod tests {
         let dir = scratch("found-spent");
         let mut a = funded(&dir, "a.json");
         let out = psp_out(&mut a, 7);
-        let mut b = Wallet::open(&dir.join("b.json")).unwrap();
-        let got = b.import_psp_handoff(&out.text, &did(), "").unwrap();
+        let mut b = open_wallet(&dir.join("b.json")).unwrap();
+        let got = b
+            .import_psp_handoff(&out.text, &did(), the_psp(), "")
+            .unwrap();
         let id = got.psp_swaps[0].clone();
         let order: Vec<String> = b.pending_rollovers()[0].inputs.clone();
         // the mint names the first note of the request
@@ -3122,48 +3253,6 @@ mod tests {
         assert_eq!((dropped, none), (0, None));
         assert!(b.pending_rollovers().is_empty());
         assert_eq!(b.notes().len(), 2, "the notes stay as they are");
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn records_from_send_psp_become_handoffs_when_the_file_is_opened() {
-        let dir = scratch("legacy");
-        let path = dir.join("old.json");
-        let n = note(Kind::Psp, 4, None);
-        let token = |id: &str, state: crate::legacy::SentState, notes: Vec<StoredNote>| {
-            crate::legacy::SentToken {
-                id: id.into(),
-                mint: PSP_URL.into(),
-                amount: 4,
-                notes,
-                state,
-            }
-        };
-        let mut data = WalletData::default();
-        data.keysets.insert(n.id(), KS_A.into());
-        data.sent = vec![
-            token(
-                "pending",
-                crate::legacy::SentState::Pending,
-                vec![n.clone()],
-            ),
-            token("received", crate::legacy::SentState::Received, vec![]),
-        ];
-        fs::write(&path, serde_json::to_vec(&data).unwrap()).unwrap();
-        let mut w = Wallet::open(&path).unwrap();
-        assert!(w.data().sent.is_empty());
-        let ids: Vec<&str> = w.handoffs_out().iter().map(|h| h.id.as_str()).collect();
-        assert_eq!(ids, vec!["pending", "received"]);
-        assert_eq!(w.handoff_standing("pending").unwrap(), Standing::Pending);
-        assert_eq!(w.handoff_standing("received").unwrap(), Standing::Received);
-        // and the pending one can be reclaimed like any PSP handoff
-        let r = w.begin_reclaim("pending").unwrap();
-        assert_eq!(w.pending_rollovers()[0].id, r);
-        // the file no longer has `sent` once it is saved
-        let text = fs::read_to_string(&path).unwrap();
-        assert!(!text.contains("\"sent\""), "{text}");
-        let again = Wallet::open(&path).unwrap();
-        assert_eq!(again.handoffs_out().len(), 2, "not migrated twice");
         fs::remove_dir_all(&dir).unwrap();
     }
 }

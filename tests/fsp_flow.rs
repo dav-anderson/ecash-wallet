@@ -12,175 +12,34 @@
 
 mod common;
 
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::path::Path;
+use std::sync::atomic::Ordering;
 
-use ecash_wallet::config::AirSettings;
+use ecash_wallet::air::Party;
+use ecash_wallet::config::{AirSettings, FspAir};
 use ecash_wallet::mint_info::{
     fsp_keys, fsp_rotation, fsp_sync, send_fsp_issue, send_fsp_spend, settle_fsp,
 };
-use ecash_wallet::store::{HandedNote, Handover};
 use ecash_wallet::{Kind, Wallet, WalletError};
-use esp_mint::exchange::{Burn, Psp};
-use esp_mint::responses::Responses;
-use esp_mint::server::EspState;
 use esp_mint::terms::Terms;
-use fsp_mint::issue::Issues;
-use fsp_mint::server::FspState;
-use fsp_mint::spend::Spender;
-use mint_types::{Amount, BlindNonce, MintInput, MintOutput, Nonce, Note};
 use rand::rngs::OsRng;
 use secp256k1::{Keypair, SECP256K1};
 use sp_wire::ServiceDid;
 
-use common::{EspAt, FspAt, service, service_keypair};
+use common::air::{Mints, NOW, service};
+use common::{open_wallet, scratch};
 
-const NOW: u64 = 1_791_571_184;
 const DAY: u64 = 86_400;
-
-fn scratch(name: &str) -> PathBuf {
-    static N: AtomicU64 = AtomicU64::new(0);
-    let d = std::env::temp_dir().join(format!(
-        "wallet-fsp-{}-{}-{name}",
-        std::process::id(),
-        N.fetch_add(1, Ordering::Relaxed)
-    ));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
-}
-
-struct NoPsp;
-impl Psp for NoPsp {
-    fn melt(&self, _: &[MintInput], _: &str) -> Result<Amount, String> {
-        Err("no psp".into())
-    }
-    fn burns(&self, _: &[Nonce]) -> Result<Vec<Burn>, String> {
-        Err("no psp".into())
-    }
-}
-
-struct Mints {
-    esp: Arc<EspState>,
-    /// The wallet's `[air]` settings: the `air.fsp` entry of the service.
-    air: AirSettings,
-    clock: Arc<AtomicU64>,
-    /// fsp-mint's AIR listener (and its state). It drops before the ESP mint's
-    /// listener and the turn on the shared AIR server, which are last.
-    fsp: FspAt,
-    esp_at: EspAt,
-}
 
 /// Both mints. The FSP mint first issued at `NOW`; rotation activates 120
 /// hours later, every 240 hours.
 fn start(dir: &Path) -> Mints {
-    start_with(dir, "20", "2", None)
-}
-
-/// [`start`], with the time one try of the FSP mint's calls to the ESP mint
-/// waits and the number of tries (a test with an ESP mint that is down does not
-/// wait long), and the longest memo the FSP mint takes.
-fn start_with(dir: &Path, wait_secs: &str, attempts: &str, memo_limit: Option<usize>) -> Mints {
-    let (logic, master) = esp_mint::mint::open(&dir.join("esp")).unwrap();
-    let responses = Responses::open(&dir.join("esp").join("responses.json")).unwrap();
-    let esp = Arc::new(EspState {
-        logic: Mutex::new(logic),
-        master,
-        psp: Box::new(NoPsp),
-        responses: Mutex::new(responses),
-        queue_path: dir.join("esp").join("queue.json"),
-        queue_lock: Mutex::new(()),
-        in_flight: Default::default(),
-        config: esp_mint::config::Handle::default(),
-        rotor: None,
-        rollovers: None,
-    });
-    // The listeners keep their state in folders of their own, outside `dir`.
-    let esp_at = EspAt::new(Arc::clone(&esp), &scratch("airstate"));
-    let mut cfg = fsp_mint::config::Config::default();
-    for (key, value) in esp_at.fsp_settings(wait_secs, attempts) {
-        cfg.set(key, &value).unwrap();
-    }
-    cfg.set("service.did", &service().to_string()).unwrap();
-    cfg.set("rotation.activation_hours", "120").unwrap();
-    cfg.set("rotation.period_hours", "240").unwrap();
-    cfg.validate().unwrap();
-    cfg.require_air().unwrap();
-    std::fs::create_dir_all(dir.join("fsp")).unwrap();
-    fsp_mint::keysets::record_first_issue(&dir.join("fsp"), NOW).unwrap();
-    let clock = Arc::new(AtomicU64::new(NOW));
-    let c = Arc::clone(&clock);
-    let mut spender = Spender::open(&dir.join("fsp"), cfg.rotation(), 1024, NOW).unwrap();
-    if let Some(limit) = memo_limit {
-        spender = spender.with_max_memo_bytes(limit);
-    }
-    let state = Arc::new(FspState {
-        spender,
-        issues: Mutex::new(Issues::open(&dir.join("fsp")).unwrap()),
-        issuer: Box::new(fsp_mint::esp_air::AirIssuer::new(&cfg).unwrap()),
-        service_keypair: Some(service_keypair()),
-        clock: Box::new(move || c.load(Ordering::SeqCst)),
-        config: cfg,
-    });
-    let fsp = FspAt::new(&esp_at.server, state, &scratch("airstate-fsp"));
-    // The wallet waits long enough for the FSP mint to be told by its ESP mint
-    // that it is not answering.
-    let air = fsp.air(60, 2);
-    Mints {
-        esp,
-        air,
-        clock,
-        fsp,
-        esp_at,
-    }
+    Mints::start(dir, "20", "2", None)
 }
 
 /// A wallet holding `units` ESP notes for the service (one note each).
 fn wallet_with_esp(dir: &Path, mints: &Mints, units: &[u64]) -> Wallet {
-    let day = Terms::new_at(service(), NOW).redeemable_after_day;
-    let terms = Terms {
-        service: service(),
-        redeemable_after_day: day,
-    };
-    let mut notes = Vec::new();
-    for &u in units {
-        let kp = Keypair::new(SECP256K1, &mut OsRng);
-        let nonce = Nonce(kp.public_key());
-        let (p, r) = bdhke::blind_message(&nonce.as_hash_preimage(), None);
-        let amount = Amount::from_units(u);
-        let sk = mints.esp.master.key_for(amount, &terms);
-        let sig = mints
-            .esp
-            .logic
-            .lock()
-            .unwrap()
-            .issue_with_key(
-                &sk,
-                &MintOutput {
-                    amount,
-                    blind_nonce: BlindNonce(p),
-                },
-            )
-            .unwrap();
-        notes.push(HandedNote {
-            amount: u,
-            note: Note {
-                nonce,
-                signature: bdhke::unblind_message(&sig.0, &r, &sk.public_key(SECP256K1)),
-            },
-            spend_secret: kp.secret_key(),
-            keyset: esp_mint::rotation::keyset_id(&mints.esp.master),
-        });
-    }
-    let mut w = Wallet::open(&dir.join("wallet.json")).unwrap();
-    w.receive_handover(&Handover {
-        service: service(),
-        redeemable_after_day: day,
-        notes,
-    })
-    .unwrap();
-    w
+    mints.wallet(dir, "wallet", units)
 }
 
 fn fsp_units(w: &Wallet) -> u128 {
@@ -264,13 +123,20 @@ fn a_crash_after_the_mint_answered_is_finished_from_the_stored_answer() {
     let mut w = wallet_with_esp(&dir, &m, &[16]);
     issue_all(&mut w, &m);
     m.clock.store(NOW + 6 * DAY, Ordering::SeqCst);
-    fsp_sync(&mut w, &m.air, service()).ok();
-    // ...the sync above already rolled over. Make another rotation-free crash:
-    // a payment sent, answered by the mint, and the wallet dies before saving.
+    // Past the rotation and its stagger, so this sync rolls the notes over at once.
+    let sync = fsp_sync(&mut w, &m.air, service()).unwrap();
+    assert!(
+        sync.log.iter().any(|l| l.contains("rolled over")),
+        "{:?}",
+        sync.log
+    );
+    assert_eq!(sync.lost, 0);
+    // Now a rotation-free crash: a payment sent, answered by the mint, and the
+    // wallet dies before saving.
     let req = w.build_fsp_spend(service(), 4, "").unwrap();
     send_fsp_spend(&mut w, &m.air, service(), &req).unwrap();
     drop(w);
-    let mut w = Wallet::open(&dir.join("wallet.json")).unwrap();
+    let mut w = open_wallet(&dir.join("wallet.json")).unwrap();
     assert_eq!(w.pending_fsp().len(), 1);
     let sync = fsp_sync(&mut w, &m.air, service()).unwrap();
     assert!(
@@ -287,7 +153,7 @@ fn a_crash_after_the_mint_answered_is_finished_from_the_stored_answer() {
     w.note_fsp_keys(service(), &keys).unwrap();
     assert!(w.build_fsp_rollover(service()).unwrap().is_some());
     drop(w);
-    let mut w = Wallet::open(&dir.join("wallet.json")).unwrap();
+    let mut w = open_wallet(&dir.join("wallet.json")).unwrap();
     fsp_sync(&mut w, &m.air, service()).unwrap();
     assert!(w.pending_fsp().is_empty());
     assert_eq!(keysets_of(&w), vec![keys.current.clone()]);
@@ -359,7 +225,7 @@ fn a_failed_rollover_is_logged_and_retried_on_the_next_connection() {
 fn a_refused_spend_cancels_the_request_and_frees_the_notes() {
     let dir = scratch("refused");
     // This FSP mint takes memos of at most 8 bytes.
-    let m = start_with(&dir, "20", "2", Some(8));
+    let m = Mints::start(&dir, "20", "2", Some(8));
     let mut w = wallet_with_esp(&dir, &m, &[8, 4]);
     issue_all(&mut w, &m);
     assert_eq!(fsp_units(&w), 12);
@@ -383,6 +249,54 @@ fn a_refused_spend_cancels_the_request_and_frees_the_notes() {
     assert_eq!(fsp_units(&w), 7);
 }
 
+/// A payment with notes the mint has already spent (the wallet lost track of
+/// that: here it sent a spend, dropped the reply and freed the notes): the mint
+/// names every spent note, and the wallet marks them spent and frees the rest
+/// instead of choosing the same notes again.
+#[test]
+fn a_payment_with_spent_notes_marks_them_spent_and_frees_the_rest() {
+    let dir = scratch("spent-elsewhere");
+    let m = start(&dir);
+    let mut w = wallet_with_esp(&dir, &m, &[8, 4, 1]);
+    issue_all(&mut w, &m);
+    assert_eq!(fsp_units(&w), 13);
+    // The mint spends the 8 and the 4; the wallet never hears and frees them.
+    let first = w.build_fsp_spend(service(), 12, "first").unwrap();
+    ecash_wallet::mint_info::send_fsp_spend(&mut w, &m.air, service(), &first).unwrap();
+    w.cancel_fsp(&first.hash()).unwrap();
+    assert_eq!(fsp_units(&w), 13, "the wallet still counts them");
+
+    // It tries all three: the 8 and the 4 (positions 0 and 1) are named.
+    let second = w.build_fsp_spend(service(), 13, "second").unwrap();
+    let e = settle_fsp(&mut w, &m.air, &second.hash()).unwrap_err();
+    match &e {
+        WalletError::SpentElsewhere { why, inputs } => {
+            assert_eq!(inputs, &vec![0, 1]);
+            assert!(why.contains("notes 0, 1 are already spent"), "{why}");
+            assert!(
+                why.contains(
+                    "2 note(s) are marked spent in the wallet, 1 other note(s) are free again"
+                ),
+                "{why}"
+            );
+        }
+        other => panic!("expected SpentElsewhere, got {other:?}"),
+    }
+    assert!(w.pending_fsp().is_empty());
+    let mut spent: Vec<u64> = w.spent_notes().iter().map(|n| n.amount).collect();
+    spent.sort_unstable();
+    assert_eq!(spent, vec![4, 8]);
+    assert_eq!(fsp_units(&w), 1, "only the 1 is left, and it is free");
+    assert_eq!(w.balance().spent_elsewhere, 2);
+    // The free note pays.
+    let last = w.build_fsp_spend(service(), 1, "last").unwrap();
+    assert_eq!(
+        settle_fsp(&mut w, &m.air, &last.hash()).unwrap(),
+        "paid 1 FSP"
+    );
+    assert_eq!(fsp_units(&w), 0);
+}
+
 /// An ESP mint that does not answer fsp-mint leaves the wallet's issue pending
 /// (the FSP mint says so in a signed reply, the `502` of the HTTP route); when the
 /// ESP mint is back, the retry finishes it, and the ESP is transferred once.
@@ -390,7 +304,7 @@ fn a_refused_spend_cancels_the_request_and_frees_the_notes() {
 fn an_esp_mint_that_does_not_answer_leaves_the_issue_pending_and_the_retry_finishes_it() {
     let dir = scratch("esp-silent");
     // One short try: an ESP mint that is down is found out quickly.
-    let m = start_with(&dir, "5", "1", None);
+    let m = Mints::start(&dir, "5", "1", None);
     let mut w = wallet_with_esp(&dir, &m, &[2, 4]);
     // A first issue reads and caches the ESP mint's keyset and transfers the 2.
     let first = w.build_fsp_issue(service(), Some(2), 0).unwrap();
@@ -469,6 +383,34 @@ fn a_service_with_no_air_fsp_entry_is_refused_naming_the_setting() {
     // With the entry it goes through.
     settle_fsp(&mut w, &m.air, &req.hash()).unwrap();
     assert_eq!(fsp_units(&w), 4);
+
+    // The settings themselves say the same. Even with the PSP's and the ESP's
+    // server set, there is no FSP address without the entry.
+    let e = none.fsp_for(service()).unwrap_err();
+    assert!(
+        e.contains("air.fsp") && e.contains("ECASH_AIR_FSP") && e.contains(&service().to_hex()),
+        "{e}"
+    );
+    let e = Party::Fsp(service()).address(&none).unwrap_err();
+    assert!(e.contains("air.fsp"), "{e}");
+    // The PSP and the ESP still go through air.server and air.host.
+    assert_eq!(
+        Party::Psp.address(&none).unwrap(),
+        (none.server.clone(), none.host.clone())
+    );
+    // With the entry, the FSP mint's address is the entry's, and its DID the
+    // service's.
+    let at = service().to_hex();
+    let mut entered = none.clone();
+    entered
+        .fsp
+        .push(FspAir::parse(&format!("{at}@{at}@10.0.0.9")).unwrap());
+    assert_eq!(
+        Party::Fsp(service()).address(&entered).unwrap(),
+        (at.clone(), "10.0.0.9".to_string())
+    );
+    assert_eq!(Party::Fsp(service()).did(&entered), service());
+    assert_eq!(Party::Fsp(service()).setting(), "air.fsp");
 }
 
 /// The command line says the same: no entry, a refusal that names `air.fsp`, and

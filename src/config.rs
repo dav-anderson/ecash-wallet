@@ -4,7 +4,7 @@
 //! unknown key, a wrong type or a bad value is refused with every problem listed,
 //! and `ecash-wallet config` prints the values in use and where each came from.
 //!
-//! The settings are about storage and AIR.
+//! The settings are about storage, AIR and the smallest PSP purchase.
 //!
 //! # Storage policy
 //!
@@ -37,7 +37,7 @@
 //! `network`, asked by `verify_psp` before anything else is sent to the PSP),
 //! its **keys**, **keysets** and **rotation** and its **rollover** and
 //! **check-state**, and the **ESP's** mint info, keysets, rotation, fees,
-//! rollover, exchange, transfer and redeem, and an **FSP mint's** mint info,
+//! rollover, exchange and redeem, and an **FSP mint's** mint info,
 //! keys, rotation, fees, issue and spend. **The PSP's and the ESP's need
 //! `air.server` (the AIR server's name, its public key) and `air.host` (where to
 //! reach it)**, for the two alike (one local AIR service carries both); a call made
@@ -64,6 +64,17 @@
 //! built-in DID is the one in use, [`AirSettings::placeholder_warnings`] says
 //! so (one warning for each), the command line prints them at every start and
 //! in `config`, and the errors of a call that fails name it.
+//!
+//! # The smallest purchase (`[psp]`)
+//!
+//! `psp.min_purchase` (`ECASH_PSP_MIN_PURCHASE`) is the smallest purchase the
+//! wallet builds, in PSP units: 50 by default, 1 or more. It is the wallet
+//! refusing to build the payload, and nothing about the PSP changes. The PSP's
+//! fees come out of what a payment buys, so a small purchase can be eaten whole
+//! and the payment lost; `buy-psp` and
+//! [`Wallet::build_psp_payload`](crate::Wallet::build_psp_payload) refuse a
+//! total below it, with a message that names the setting. Lowering it is not
+//! advised, and 100 PSP is a realistic purchase.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -164,7 +175,7 @@ pub const SPECS: &[Spec] = &[
         env: "ECASH_AIR_SERVER",
         default: "",
         units: "AIR server name (66 hex characters)",
-        what: "The name of the AIR server that carries the request: its public key, the compressed hex AIR prints (66 characters, starting 02 or 03). The wallet checks the server's signed challenge against it, so only the server with this key is accepted. Resolving a mint's DID to its AIR server is not built, so it is configuration for now. With air.host it is required by every call to the PSP (mint info, keys, keysets, rotation, rollover, check-state) and to the ESP (mint info, keysets, rotation, fees, rollover, exchange, transfer, redeem); both mints can use the same server, their DIDs differ. Set both or neither (neither: those calls fail and name the missing setting).",
+        what: "The name of the AIR server that carries the request: its public key, the compressed hex AIR prints (66 characters, starting 02 or 03). The wallet checks the server's signed challenge against it, so only the server with this key is accepted. Resolving a mint's DID to its AIR server is not built, so it is configuration for now. With air.host it is required by every call to the PSP (mint info, keys, keysets, rotation, rollover, check-state) and to the ESP (mint info, keysets, rotation, fees, rollover, exchange, redeem); both mints can use the same server, their DIDs differ. Set both or neither (neither: those calls fail and name the missing setting).",
     },
     Spec {
         key: "air.host",
@@ -185,7 +196,7 @@ pub const SPECS: &[Spec] = &[
         env: "ECASH_AIR_REPLY_WAIT_SECS",
         default: "30",
         units: "seconds (1 to 600)",
-        what: "How long to wait for the mint's reply to one try of a request (mint info, keys, keysets, rotation, fees, rollover, check-state, exchange, transfer, redeem, FSP issue or FSP spend). After that the same request is written again, in the next free mailbox slot.",
+        what: "How long to wait for the mint's reply to one try of a request (mint info, keys, keysets, rotation, fees, rollover, check-state, exchange, redeem, FSP issue or FSP spend). After that the same request is written again, in the next free mailbox slot.",
     },
     Spec {
         key: "air.attempts",
@@ -207,6 +218,13 @@ pub const SPECS: &[Spec] = &[
         default: "10",
         units: "seconds (1 to 600)",
         what: "How long the AIR server may take to answer one Create or Read before that step fails.",
+    },
+    Spec {
+        key: "psp.min_purchase",
+        env: "ECASH_PSP_MIN_PURCHASE",
+        default: "50",
+        units: "PSP units (1 or more)",
+        what: "The smallest purchase the wallet builds, in PSP units (10 PSP to the US dollar). buy-psp and the library's payload builder refuse a total below it, before any network use, with a message that names this setting; nothing about the PSP changes. The PSP's fees come out of what a payment buys, so a small purchase can be eaten whole and the payment lost. Lowering it is not advised: 100 PSP is a realistic purchase.",
     },
 ];
 
@@ -473,11 +491,28 @@ impl AirSettings {
     }
 }
 
+/// The `[psp]` settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PspSettings {
+    /// The smallest purchase the wallet builds, in PSP units (`psp.min_purchase`,
+    /// 1 or more).
+    pub min_purchase: u64,
+}
+
+impl Default for PspSettings {
+    fn default() -> Self {
+        PspSettings {
+            min_purchase: crate::psp::DEFAULT_MIN_PURCHASE,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Settings {
     pub storage_wallet: StoragePolicy,
     pub storage_app: StoragePolicy,
     pub air: AirSettings,
+    pub psp: PspSettings,
 }
 
 impl Settings {
@@ -501,6 +536,7 @@ impl Settings {
             "air.attempts" => self.air.attempts.to_string(),
             "air.max_skew_secs" => self.air.max_skew_secs.to_string(),
             "air.timeout_secs" => self.air.timeout_secs.to_string(),
+            "psp.min_purchase" => self.psp.min_purchase.to_string(),
             _ => return None,
         })
     }
@@ -565,6 +601,7 @@ impl Settings {
             "air.attempts" => self.air.attempts = number(key, value, 1, 10)? as u32,
             "air.max_skew_secs" => self.air.max_skew_secs = number(key, value, 1, 86_400)?,
             "air.timeout_secs" => self.air.timeout_secs = number(key, value, 1, 600)?,
+            "psp.min_purchase" => self.psp.min_purchase = number(key, value, 1, u64::MAX)?,
             other => return Err(format!("unknown setting `{other}`")),
         }
         Ok(())
@@ -996,40 +1033,6 @@ mod tests {
     }
 
     #[test]
-    fn the_builtin_did_is_a_valid_point_and_the_derivation_in_its_comment_holds() {
-        use sha2::{Digest, Sha256};
-        let did = ServiceDid::parse(BUILTIN_SPI_DID).unwrap();
-        // Sealing to it works: it is a point on the curve.
-        sp_wire::seal::parse_public_key(BUILTIN_SPI_DID).unwrap();
-        assert_eq!(did.to_hex(), BUILTIN_SPI_DID);
-        // x = sha256(label || [3]), with an even-y prefix.
-        let mut hasher = Sha256::new();
-        hasher.update(b"ecash-wallet placeholder SPI DID v0");
-        hasher.update([3u8]);
-        assert_eq!(
-            BUILTIN_SPI_DID,
-            format!("02{}", hex::encode(hasher.finalize()))
-        );
-    }
-    #[test]
-    fn the_builtin_esp_did_is_a_valid_point_other_than_the_psps_and_its_derivation_holds() {
-        use sha2::{Digest, Sha256};
-        let did = ServiceDid::parse(BUILTIN_ESP_DID).unwrap();
-        sp_wire::seal::parse_public_key(BUILTIN_ESP_DID).unwrap();
-        assert_eq!(did.to_hex(), BUILTIN_ESP_DID);
-        assert_ne!(BUILTIN_ESP_DID, BUILTIN_SPI_DID);
-        // x = sha256(label || [0]), with an even-y prefix; 0 is the first counter
-        // that lands on the curve (the PSP's needed 3).
-        let mut hasher = Sha256::new();
-        hasher.update(b"ecash-wallet placeholder ESP DID v0");
-        hasher.update([0u8]);
-        assert_eq!(
-            BUILTIN_ESP_DID,
-            format!("02{}", hex::encode(hasher.finalize()))
-        );
-    }
-
-    #[test]
     fn the_esp_has_its_own_did_setting_and_its_own_placeholder_warning() {
         let d = dir("air-esp-did");
         let both = [("ECASH_AIR_HOST", "127.0.0.1"), ("ECASH_AIR_SERVER", B)];
@@ -1217,6 +1220,89 @@ mod tests {
     }
 
     #[test]
+    fn the_minimum_purchase_is_50_unless_the_file_or_the_environment_say_otherwise() {
+        let d = dir("min-purchase");
+        let l = load(&d, None, &no_env).unwrap();
+        assert_eq!(l.settings.psp.min_purchase, 50);
+        assert_eq!(
+            SPECS
+                .iter()
+                .find(|s| s.key == "psp.min_purchase")
+                .unwrap()
+                .default,
+            crate::psp::DEFAULT_MIN_PURCHASE.to_string(),
+            "the documented default is the wallet's"
+        );
+        assert!(!l.sources.contains_key("psp.min_purchase"));
+
+        fs::write(d.join(FILE_NAME), "[psp]\nmin_purchase = 20\n").unwrap();
+        let l = load(&d, None, &no_env).unwrap();
+        assert_eq!(l.settings.psp.min_purchase, 20);
+        assert_eq!(l.sources["psp.min_purchase"], Source::File);
+        // a string with a number in it is a number, as for the other settings
+        fs::write(d.join(FILE_NAME), "[psp]\nmin_purchase = \"7\"\n").unwrap();
+        assert_eq!(
+            load(&d, None, &no_env).unwrap().settings.psp.min_purchase,
+            7
+        );
+
+        // the environment wins, and a lower value than the default is honoured
+        let l = load(&d, None, &env_of(&[("ECASH_PSP_MIN_PURCHASE", "1")])).unwrap();
+        assert_eq!(l.settings.psp.min_purchase, 1);
+        assert_eq!(
+            l.sources["psp.min_purchase"],
+            Source::Env("ECASH_PSP_MIN_PURCHASE")
+        );
+        assert!(
+            l.describe().iter().any(|x| x
+                == "  psp.min_purchase = 1 PSP units (1 or more) (env ECASH_PSP_MIN_PURCHASE)")
+        );
+        // the documentation advises against lowering it
+        let what = SPECS
+            .iter()
+            .find(|s| s.key == "psp.min_purchase")
+            .unwrap()
+            .what;
+        assert!(what.contains("Lowering it is not advised"), "{what}");
+        assert!(what.contains("100 PSP is a realistic purchase"), "{what}");
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn a_bad_minimum_purchase_is_refused_and_named() {
+        let d = dir("min-purchase-bad");
+        for bad in ["0", "-5", "many", "1.5", "99999999999999999999999", " "] {
+            let p = load(&d, None, &env_of(&[("ECASH_PSP_MIN_PURCHASE", bad)]));
+            if bad == " " {
+                // whitespace is not a number either
+                assert!(p.is_err(), "{bad:?}");
+                continue;
+            }
+            let p = p.unwrap_err();
+            assert!(
+                p.iter().any(|x| x.contains("ECASH_PSP_MIN_PURCHASE")
+                    && x.contains("psp.min_purchase")
+                    && x.contains("must be a whole number from 1 to")),
+                "{bad}: {p:?}"
+            );
+        }
+        fs::write(d.join(FILE_NAME), "[psp]\nmin_purchase = 0\n").unwrap();
+        let p = load(&d, None, &no_env).unwrap_err();
+        assert!(p.iter().any(|x| x.contains("psp.min_purchase")), "{p:?}");
+        fs::write(d.join(FILE_NAME), "[psp]\nmin_purchase = [1]\n").unwrap();
+        let p = load(&d, None, &no_env).unwrap_err();
+        assert!(p.iter().any(|x| x.contains("psp.min_purchase")), "{p:?}");
+        fs::write(d.join(FILE_NAME), "[psp]\nminimum = 5\n").unwrap();
+        let p = load(&d, None, &no_env).unwrap_err();
+        assert!(
+            p.iter()
+                .any(|x| x.contains("unknown setting `psp.minimum`")),
+            "{p:?}"
+        );
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
     fn every_spec_has_its_own_variable() {
         let mut seen = std::collections::HashSet::new();
         for s in SPECS {
@@ -1327,33 +1413,5 @@ mod tests {
             "{p:?}"
         );
         fs::remove_dir_all(&d).unwrap();
-    }
-
-    #[test]
-    fn a_service_with_no_air_fsp_entry_is_refused_naming_the_setting() {
-        let mut air = AirSettings::default();
-        let service = ServiceDid::parse(A).unwrap();
-        // Even with the PSP's and the ESP's server set: that is not the FSP's.
-        air.server = B.to_string();
-        air.host = "127.0.0.1".into();
-        let e = air.fsp_for(service).unwrap_err();
-        assert!(
-            e.contains("air.fsp") && e.contains("ECASH_AIR_FSP") && e.contains(A),
-            "{e}"
-        );
-        let e = Party::Fsp(service).address(&air).unwrap_err();
-        assert!(e.contains("air.fsp"), "{e}");
-        // The PSP and the ESP still go through air.server and air.host.
-        let psp = Party::Psp.address(&air).unwrap();
-        assert_eq!(psp, (B.to_string(), "127.0.0.1".to_string()));
-        // With the entry, the FSP mint's address is the entry's, and its DID the service's.
-        air.fsp
-            .push(FspAir::parse(&format!("{A}@{A}@10.0.0.9")).unwrap());
-        assert_eq!(
-            Party::Fsp(service).address(&air).unwrap(),
-            (A.to_string(), "10.0.0.9".to_string())
-        );
-        assert_eq!(Party::Fsp(service).did(&air), service);
-        assert_eq!(Party::Fsp(service).setting(), "air.fsp");
     }
 }

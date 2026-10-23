@@ -10,6 +10,12 @@
 //! returns, so a payload or request is never handed out before its blinding
 //! factors are safely on disk. A missing file is an empty wallet. A file that
 //! cannot be read is an error and is never replaced.
+//!
+//! The file records the network it is for (`network`: `main`, `regtest`, `signet`
+//! or `testnet`), and [`Wallet::open`] takes the network it is opened for: a new
+//! file is made with it, a file of another network is refused, and so is a file
+//! that records none (written by a pre-release version; there is no
+//! compatibility for it).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
@@ -20,8 +26,8 @@ use mint_types::Note;
 use secp256k1::SecretKey;
 use serde::{Deserialize, Serialize};
 use sp_wire::ServiceDid;
+use sp_wire::air_request::delivery::ReconcileRules;
 use sp_wire::esp::exchange::ExchangeRequest;
-use sp_wire::esp::transfer::TransferRequest;
 
 use crate::blind::PendingOutput;
 use crate::error::WalletError;
@@ -93,16 +99,11 @@ pub struct PendingPurchase {
     /// made for this purchase alone (the PSP cannot link two purchases of one
     /// wallet), saved here before the payload is returned, and deleted when the
     /// purchase is fully reconciled (see `Wallet::apply_delivery`). It is never
-    /// part of a handoff: a purchase has no notes until it settles. `None` on a
-    /// purchase made before purchases had their own key: nothing can be
-    /// picked up for it.
-    #[serde(default)]
-    pub reply_secret: Option<String>,
+    /// part of a handoff: a purchase has no notes until it settles.
+    pub reply_secret: String,
     /// What the PSP delivers this purchase under, as hex: the hash of the
-    /// unsealed payload (`sp_wire::air_request::delivery::purchase_id`). `None`
-    /// exactly when `reply_secret` is.
-    #[serde(default)]
-    pub delivery_id: Option<String>,
+    /// unsealed payload (`sp_wire::air_request::delivery::purchase_id`).
+    pub delivery_id: String,
     /// Set when the PSP's record said the payment is held or was rejected: the
     /// purchase and its key stay until the PSP settles it or `open.open_until`
     /// passes ([`Wallet::close_expired`]). `None` while nothing has been
@@ -134,13 +135,75 @@ pub struct OpenPurchase {
     /// For a held payment: the units the purchase asked for, and how far the
     /// payment is from covering them, in basis points (negative: short). 0 for a
     /// rejection.
-    #[serde(default)]
     pub requested_units: u64,
-    #[serde(default)]
     pub over_under_bps: i64,
     /// Unix seconds. If the payment is not settled by then the PSP forfeits it
     /// and keeps the bitcoin; the wallet deletes the purchase and its key.
     pub open_until: u64,
+    /// The rules of the reconciliation, as the first record gave them and as the
+    /// PSP will check a request against them (never against its current
+    /// settings): what to send, the exact total it must carry, the deadline and
+    /// the most requests the PSP counts. A record that is held or rejected and
+    /// carries no rules is not stored (a mint error).
+    pub rules: ReconcileRules,
+    /// What the wallet has built and sent to settle it.
+    pub reconcile: ReconcileState,
+}
+
+impl OpenPurchase {
+    /// Whether `other` is the same record of the PSP: everything but what the
+    /// wallet has done since (`reconcile`).
+    pub(crate) fn same_record(&self, other: &OpenPurchase) -> bool {
+        self.kind == other.kind
+            && self.reason == other.reason
+            && self.paid_sats == other.paid_sats
+            && self.paid_cents == other.paid_cents
+            && self.requested_units == other.requested_units
+            && self.over_under_bps == other.over_under_bps
+            && self.open_until == other.open_until
+            && self.rules == other.rules
+    }
+}
+
+/// What the wallet has done to settle one open payment (a held or rejected
+/// purchase, or a credit): the request it built, how many it has built, and what
+/// the user has been told. It is part of the payment's record, so a payment
+/// that is closed (reconciled, or its window ended) takes it along, and a merge
+/// carries it with the payment (see `merge.rs`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReconcileState {
+    /// The request that was built, saved before it was first sent. `None` until
+    /// one is built (and for a payment with nothing due, which is never sent).
+    pub request: Option<SavedRequest>,
+    /// How many requests the wallet has built for this payment. The PSP counts a
+    /// request it refuses for its content, and accepts `rules.max_attempts` of
+    /// them, so the wallet builds a second only for the keyset-rotation race and
+    /// never more than the rules allow.
+    pub attempts: u32,
+    /// True when the last time the saved request was sent the PSP did not answer
+    /// (every try of `air.attempts` passed with no reply). Cleared when a new
+    /// request is built.
+    pub unanswered: bool,
+    /// True once the user was told that the payment is lost (nothing is due, or
+    /// the PSP did not accept the request), so it is said once.
+    pub told_lost: bool,
+}
+
+/// A reconciliation request as it was built and saved: the exact bytes that are
+/// sent (a resend is these bytes, never a rebuilt request) and the blinding
+/// factors of its outputs, which are the only copy.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedRequest {
+    /// The request body as sent: the JSON of `sp_wire::psp::ReconcileRequest`,
+    /// as hex.
+    pub body: String,
+    /// The request's hash (`ReconcileRequest::hash`): the key the PSP stores its
+    /// answer and its counted refusals under.
+    pub hash: String,
+    /// The keyset the request names for its outputs.
+    pub keyset: String,
+    /// The request's outputs, with what is needed to unblind them.
+    pub outputs: Vec<PendingOutput>,
 }
 
 /// How long the wallet keeps a purchase's key when the PSP's record names no
@@ -150,9 +213,10 @@ pub const OPEN_KEY_FALLBACK_SECS: u64 = 14 * 24 * 3600;
 
 /// The one-off key of a purchase that was claimed but may not be closed: the PSP
 /// owes the payer a credit, or part of the purchase was neither signed nor
-/// reported as dropped. The PSP will write a follow-up to the same key (its
-/// address and shape are not designed yet), so the key is kept until `open_until`
-/// ([`Wallet::close_expired`] deletes it then).
+/// reported as dropped. A credit is claimed with a reconciliation request (AIR
+/// kind 15) signed by this key, and the PSP's answer is sealed to it, so the key
+/// is kept until the credit is claimed or `open_until` ([`Wallet::close_expired`]
+/// deletes it then).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenReply {
     /// The purchase's id (`PendingPurchase::id`).
@@ -161,17 +225,21 @@ pub struct OpenReply {
     pub mint_did_pubkey: String,
     pub reply_secret: String,
     /// What the PSP said it owes, in USD cents.
-    #[serde(default)]
     pub credit_cents: u64,
     /// Requested units that were neither signed nor reported as dropped.
-    #[serde(default)]
     pub unaccounted_units: u64,
     /// Unix seconds: when the PSP's window for the credit closes (from its
     /// record), or, for outputs only unaccounted for, when the wallet gives up
-    /// ([`OPEN_KEY_FALLBACK_SECS`] after the record was applied). 0 in a file
-    /// from before: [`Wallet::close_expired`] gives it the fallback.
-    #[serde(default)]
+    /// ([`OPEN_KEY_FALLBACK_SECS`] after the record was applied).
     pub open_until: u64,
+    /// The rules of the credit claim, from the record that said a credit is owed.
+    /// `Some` for every credit (a record that owes one and carries no rules is
+    /// not stored). `None` for a key kept only because some outputs were neither
+    /// signed nor reported as dropped: the PSP gave no rules for it, so there is
+    /// nothing to send.
+    pub rules: Option<ReconcileRules>,
+    /// What the wallet has built and sent to claim it.
+    pub reconcile: ReconcileState,
 }
 
 /// An ESP exchange that has been built and has not been finished.
@@ -185,47 +253,17 @@ pub struct PendingExchange {
     /// Kept so that a retry sends exactly the same request.
     pub request: ExchangeRequest,
     /// ESP units among the outputs that are change (see `esp.rs`).
-    #[serde(default)]
     pub change_esp: u128,
 }
 
-/// An ESP transfer that has been built and has not been finished. The wallet
-/// that holds it is the service's.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct PendingTransfer {
-    /// The request hash, as the mint stores it.
-    pub id: String,
-    pub service: ServiceDid,
-    pub input_ids: Vec<String>,
-    pub outputs: Vec<PendingOutput>,
-    /// Kept so that a retry sends exactly the same request.
-    pub request: TransferRequest,
-}
-
-/// One ESP note given to a service, with its spend secret.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HandedNote {
-    pub amount: u64,
-    pub note: Note,
-    pub spend_secret: SecretKey,
-    /// The ESP keyset that signed it, so the receiver names it when it spends
-    /// the note. Empty in a hand-over made before keysets.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub keyset: String,
-}
-
 /// ESP notes handed to a service, with each note's spend secret, so whoever holds
-/// it holds the notes. The wallet makes one when `fsp issue` hands ESP to an FSP
-/// mint (the wallet keeps it in `handovers` as a record), and fsp-mint's
-/// `export-esp` writes the same shape to a file for the service's wallet to
-/// `receive` (see `transfer.rs`). The notes name the service, and only the service
-/// can ask the mint to move them or redeem them.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Handover {
-    pub service: ServiceDid,
-    pub redeemable_after_day: u64,
-    pub notes: Vec<HandedNote>,
-}
+/// it holds the notes. The type is sp-wire's (`sp_wire::esp::handover`), the one
+/// fsp-mint's `export-esp` writes and `Handover::read` parses; the wallet makes
+/// one when `fsp issue` hands ESP to an FSP mint (it keeps it in `handovers` as a
+/// record) and takes one in with `receive_handover` (see `transfer.rs`). The notes
+/// name the service, and only the service can ask the mint to move them or redeem
+/// them.
+pub use sp_wire::esp::handover::{HandedNote, Handover};
 
 /// A request sent over AIR and not yet answered (see `air.rs`). The
 /// wallet keeps the pair that can read the reply, `request_id` and the one-off
@@ -234,9 +272,7 @@ pub struct Handover {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingAirRequest {
     /// What was asked: the request kind byte (1 mint info, 2 keys, 3 keysets,
-    /// 4 rotation). A file from before the keys calls moved to AIR has none, and
-    /// every request in it is mint info.
-    #[serde(default = "mint_info_kind")]
+    /// 4 rotation).
     pub kind: u8,
     /// 32 random bytes, hex.
     pub request_id: String,
@@ -250,8 +286,7 @@ pub struct PendingAirRequest {
     pub created_at: u64,
     /// For a request with a body (5 rollover, 6 check-state): the SHA-256 of the
     /// body, hex, so that the same call resumes it and another call, with another
-    /// body, does not. Empty for the plain reads, and in a file from before.
-    #[serde(default)]
+    /// body, does not. Empty for the plain reads.
     pub body_hash: String,
 }
 
@@ -262,74 +297,51 @@ pub struct PendingAirRequest {
 /// which the mint answers the same way.
 pub const AIR_REQUEST_KEEP_SECS: u64 = 30 * 24 * 3600;
 
-fn mint_info_kind() -> u8 {
-    sp_wire::air_request::KIND_MINT_INFO
-}
-
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct WalletData {
-    #[serde(default)]
+    /// The network this wallet file is for: `main`, `regtest`, `signet` or
+    /// `testnet` (the names of the per-network folders). Required: a file
+    /// without it is refused when opened (see [`Wallet::open`]), and a snapshot of
+    /// another network is refused by a merge.
+    pub network: String,
     pub notes: Vec<StoredNote>,
-    #[serde(default)]
     pub pending_purchases: Vec<PendingPurchase>,
     /// The one-off keys of PSP purchases that were claimed but may still be open.
-    #[serde(default)]
     pub open_replies: Vec<OpenReply>,
-    #[serde(default)]
     pub pending_exchanges: Vec<PendingExchange>,
-    #[serde(default)]
-    pub pending_transfers: Vec<PendingTransfer>,
     /// What this wallet has handed to services, kept as a record. The notes in
     /// it are no longer in `notes`.
-    #[serde(default)]
     pub handovers: Vec<Handover>,
-    /// PSP tokens that `send-psp` exported (wallet 0.4.0 and earlier). Read
-    /// only, to be migrated: [`WalletData::migrate_legacy`] turns each into a
-    /// PSP handoff record when the file is opened, and nothing writes here any
-    /// more (see `legacy.rs`).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub sent: Vec<crate::legacy::SentToken>,
     /// PSP notes the ESP mint reported spent by a different request. They are
     /// no longer in `notes`, are not counted in the balance and cannot be spent.
     /// Kept as a record.
-    #[serde(default)]
     pub spent: Vec<StoredNote>,
     /// ESP redemptions that have been built and are not over (see `redeem.rs`).
-    #[serde(default)]
     pub pending_redemptions: Vec<crate::redeem::PendingRedemption>,
     /// Ids of notes the ESP mint rejected for a bad proof. They stay in `notes`
     /// and in the balance, but a redemption does not pick them.
-    #[serde(default)]
     pub bad_proof: Vec<String>,
     /// The keyset of each FSP note, by note id.
-    #[serde(default)]
     pub fsp_keysets: BTreeMap<String, String>,
     /// The FSP mints this wallet has used, by service (hex), as last seen.
-    #[serde(default)]
     pub fsp_mints: BTreeMap<String, crate::fsp::FspMint>,
     /// FSP requests sent or about to be sent and not settled.
-    #[serde(default)]
     pub pending_fsp: Vec<crate::fsp::PendingFsp>,
     /// FSP notes whose keyset the mint deleted. Not in any total.
-    #[serde(default)]
     pub lost_fsp: Vec<StoredNote>,
     /// The key-set epoch of each PSP and ESP note, by note id. A note with no
     /// entry is treated as on the oldest live set (see `rotate.rs`).
-    #[serde(default)]
     pub epochs: BTreeMap<String, u64>,
     /// The keyset ID of each PSP and ESP note, by note id: the keyset that
     /// signed it, from the keys it was unblinded with or the mint's reply.
     /// Every request that spends a note names this keyset.
-    #[serde(default)]
     pub keysets: BTreeMap<String, String>,
-    /// Each PSP and ESP mint's live keysets as last seen, by URL:
-    /// (current, previous). Refreshed on every connection.
-    #[serde(default)]
+    /// Each PSP and ESP mint's live keysets as last seen, by the service's DID
+    /// in lowercase hex: (current, previous). Refreshed on every connection.
     pub live_keysets: BTreeMap<String, (String, Option<String>)>,
-    /// The ESP mint's live keysets as last seen, by URL: (current, previous),
-    /// from `GET /keysets` or `/rotation`. Kept apart from `live_keysets` so
-    /// the PSP fallback there still sees one mint.
-    #[serde(default)]
+    /// The ESP mint's live keysets as last seen, by its DID in lowercase hex:
+    /// (current, previous), from the keysets and rotation calls. Kept apart from
+    /// `live_keysets` so the PSP fallback there still sees one mint.
     pub esp_live_keysets: BTreeMap<String, (String, Option<String>)>,
     /// The time each pending rollover may be sent, by
     /// `<kind>|<mint record>|<new keyset id>` (the record is the PSP's or the ESP's
@@ -337,61 +349,43 @@ pub struct WalletData {
     /// Removed in the same write that
     /// records the rolled-over notes, and when the old set retires. No
     /// history is kept.
-    #[serde(default)]
     pub swap_schedule: BTreeMap<String, u64>,
     /// PSP and ESP rollovers sent or about to be sent and not settled.
-    #[serde(default)]
     pub pending_rollovers: Vec<crate::rotate::PendingRollover>,
     /// PSP and ESP notes whose key set the mint deleted. Not in any total.
-    #[serde(default)]
     pub lost: Vec<StoredNote>,
     /// Counts the writes. It goes up by one every time the wallet saves, so of
     /// two copies of one wallet the one with the higher number has been written
     /// to more. [`crate::merge`] uses it for the merged copy's number only;
     /// what is kept comes from the ledgers below, not from this.
-    #[serde(default)]
     pub version: u64,
     /// For each note that has left `notes`, how many times it has (spent,
     /// swapped away, handed off, lost, ...). Kept so that a copy of the wallet
     /// retrieved from storage cannot bring back a note this copy has spent. A
     /// note that comes back (a cancelled handoff) is counted in `returned`.
     /// Maintained by `update`; nothing else writes it. About 70 bytes a note.
-    #[serde(default)]
     pub departed: BTreeMap<String, u32>,
     /// For each note that has come back into `notes` after leaving it, the
     /// number of times it had left when it came back. A note is spent, as far as
     /// the wallet knows, when `departed` is above `returned`.
-    #[serde(default)]
     pub returned: BTreeMap<String, u32>,
     /// Ids of requests that have ended (finished, cancelled or refused), so that
     /// a copy retrieved from storage cannot bring them back as pending.
-    #[serde(default)]
     pub finished: BTreeSet<String>,
     /// Notes this wallet has handed off to another wallet (see `handoff.rs`).
-    #[serde(default)]
     pub handoffs_out: Vec<crate::handoff::OutgoingHandoff>,
     /// Handoffs this wallet has imported, so that none is imported twice.
-    #[serde(default)]
     pub handoffs_in: Vec<crate::handoff::IncomingHandoff>,
     /// Requests over AIR that have not ended (see `air.rs`). Local to
     /// this copy of the wallet: a merge keeps this copy's.
-    #[serde(default)]
     pub air_requests: Vec<PendingAirRequest>,
-}
-
-impl WalletData {
-    /// Turn the records `send-psp` left in `sent` into PSP handoff records, so
-    /// that `handoff check` and `handoff reclaim` work on them (see
-    /// `legacy.rs` for the mapping). A record whose id is already a handoff is
-    /// dropped as a duplicate. Does nothing when `sent` is empty.
-    pub fn migrate_legacy(&mut self) {
-        for t in std::mem::take(&mut self.sent) {
-            if self.handoffs_out.iter().any(|h| h.id == t.id) {
-                continue;
-            }
-            self.handoffs_out.push(t.into_handoff());
-        }
-    }
+    /// Ids of PSP purchases whose reconciliation is done (the corrected request
+    /// or the credit claim was answered and its notes stored). A purchase that is
+    /// claimed with a credit owed is `finished` already while its key is kept, so
+    /// `finished` cannot say that the credit was claimed; this does, and a copy
+    /// retrieved from storage cannot bring back an open payment, or a credit,
+    /// that either copy has reconciled (see `merge.rs`).
+    pub reconciled: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -413,7 +407,6 @@ pub struct Balance {
     pub reserved: usize,
     pub pending_purchases: usize,
     pub pending_exchanges: usize,
-    pub pending_transfers: usize,
     /// Redemptions built and not over, including ones queued for payout.
     pub pending_redemptions: usize,
     /// Handovers this wallet has made.
@@ -426,15 +419,14 @@ pub struct Balance {
     pub bad_proof_esp: u128,
 }
 
-/// What the ESP mint accepts in one exchange or transfer (`exchange.max_items`
-/// and `transfer.max_items`), as its `GET /fees` says. The wallet does not
+/// What the ESP mint accepts in one exchange (`exchange.max_items`), as its
+/// fees reply says. The wallet does not
 /// keep a number of its own: until the limits are read (`mint_info::sync_esp_limits`)
 /// it checks nothing locally and the mint's own refusal decides. Not saved in
 /// the wallet file.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct EspLimits {
     pub exchange_max_items: Option<usize>,
-    pub transfer_max_items: Option<usize>,
 }
 
 pub struct Wallet {
@@ -443,25 +435,60 @@ pub struct Wallet {
     limits: EspLimits,
     /// The PSP's largest note size, once read from its `GET /keys`. Not saved.
     psp_top: Option<u64>,
+    /// The smallest purchase the wallet will build, in PSP units
+    /// (`psp.min_purchase`). Not saved: it is a setting, given by the caller.
+    psp_min: u64,
+}
+
+/// Read a wallet file's bytes (`what` names the file in messages). A file that
+/// records no network is refused with a message of its own, before anything else
+/// is read from it, because serde's missing-field message would say nothing
+/// about what to do.
+pub(crate) fn parse_wallet(bytes: &[u8], what: &str) -> Result<WalletData, WalletError> {
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|e| WalletError::Corrupt(format!("{what}: {e}")))?;
+    if value
+        .as_object()
+        .is_some_and(|o| !o.contains_key("network"))
+    {
+        return Err(WalletError::Corrupt(format!(
+            "{what}: it records no network. It was written by a pre-release version of the wallet, which this version cannot read (there is no compatibility for it). Start a new wallet file, or merge from a backup written by this version"
+        )));
+    }
+    serde_json::from_value(value).map_err(|e| WalletError::Corrupt(format!("{what}: {e}")))
 }
 
 impl Wallet {
-    /// Open the wallet at `path`. A missing file is an empty wallet.
-    pub fn open(path: &Path) -> Result<Self, WalletError> {
-        let mut data: WalletData = match fs::read(path) {
-            Ok(bytes) => serde_json::from_slice(&bytes)
-                .map_err(|e| WalletError::Corrupt(format!("{}: {e}", path.display())))?,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => WalletData::default(),
+    /// Open the wallet at `path`, for `network` (`main`, `regtest`, `signet` or
+    /// `testnet`). A missing file is an empty wallet of that network. The file
+    /// records its network and is refused if it is another one, or if it records
+    /// none (a file from a pre-release version): nothing is read into the wallet
+    /// and the file is not touched.
+    pub fn open(path: &Path, network: &str) -> Result<Self, WalletError> {
+        let data: WalletData = match fs::read(path) {
+            Ok(bytes) => {
+                let data = parse_wallet(&bytes, &path.display().to_string())?;
+                if data.network != network {
+                    return Err(WalletError::Invalid(format!(
+                        "{}: this wallet file is for the {} network, but it was opened for the {network} network. Nothing was changed. Use a wallet file made for the {network} network",
+                        path.display(),
+                        data.network
+                    )));
+                }
+                data
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => WalletData {
+                network: network.to_string(),
+                ..WalletData::default()
+            },
             Err(e) => return Err(e.into()),
         };
-        // Records of the removed `send-psp` become PSP handoff records. This is
-        // in memory; the file is rewritten without them at the next save.
-        data.migrate_legacy();
         Ok(Wallet {
             path: path.to_path_buf(),
             data,
             limits: EspLimits::default(),
             psp_top: None,
+            psp_min: crate::psp::DEFAULT_MIN_PURCHASE,
         })
     }
 
@@ -488,6 +515,26 @@ impl Wallet {
         self.psp_top = top;
     }
 
+    /// The smallest purchase this wallet will build, in PSP units: the default
+    /// ([`crate::psp::DEFAULT_MIN_PURCHASE`]) until [`Wallet::set_psp_min_purchase`].
+    pub fn psp_min_purchase(&self) -> u64 {
+        self.psp_min
+    }
+
+    /// Set the smallest purchase the wallet will build (`psp.min_purchase`), in
+    /// PSP units, 1 or more. This is the wallet refusing to build a payload that
+    /// the PSP's fees could eat whole; the PSP itself is unchanged. The setting
+    /// is not saved in the wallet file: the caller gives it every run.
+    pub fn set_psp_min_purchase(&mut self, units: u64) -> Result<(), WalletError> {
+        if units == 0 {
+            return Err(WalletError::Invalid(
+                "psp.min_purchase must be 1 or more PSP units".into(),
+            ));
+        }
+        self.psp_min = units;
+        Ok(())
+    }
+
     pub(crate) fn data(&self) -> &WalletData {
         &self.data
     }
@@ -511,10 +558,6 @@ impl Wallet {
 
     pub fn pending_exchanges(&self) -> &[PendingExchange] {
         &self.data.pending_exchanges
-    }
-
-    pub fn pending_transfers(&self) -> &[PendingTransfer] {
-        &self.data.pending_transfers
     }
 
     pub(crate) fn redemptions(&self) -> &[crate::redeem::PendingRedemption] {
@@ -640,7 +683,6 @@ impl Wallet {
         b.unswapped_psp = self.unswapped_psp();
         b.pending_purchases = self.data.pending_purchases.len();
         b.pending_exchanges = self.data.pending_exchanges.len();
-        b.pending_transfers = self.data.pending_transfers.len();
         b.pending_redemptions = self.data.pending_redemptions.len();
         b.handed_over = self.data.handovers.len();
         b.spent_elsewhere = self.data.spent.len();
@@ -662,7 +704,6 @@ fn pending_ids(d: &WalletData) -> BTreeSet<String> {
     let mut ids = BTreeSet::new();
     ids.extend(d.pending_purchases.iter().map(|p| p.id.clone()));
     ids.extend(d.pending_exchanges.iter().map(|p| p.id.clone()));
-    ids.extend(d.pending_transfers.iter().map(|p| p.id.clone()));
     ids.extend(d.pending_redemptions.iter().map(|p| p.id.clone()));
     ids.extend(d.pending_fsp.iter().map(|p| p.id.clone()));
     ids.extend(d.pending_rollovers.iter().map(|p| p.id.clone()));
@@ -704,13 +745,6 @@ fn track(before: &WalletData, after: &mut WalletData) {
 /// Whether the ledgers say the note has left the wallet and not come back.
 pub(crate) fn has_departed(d: &WalletData, id: &str) -> bool {
     d.departed.get(id).copied().unwrap_or(0) > d.returned.get(id).copied().unwrap_or(0)
-}
-
-pub fn parse_did(text: &str) -> Result<[u8; 33], WalletError> {
-    let bytes = hex::decode(text.trim())
-        .map_err(|_| WalletError::Invalid("a DID must be hex".to_string()))?;
-    <[u8; 33]>::try_from(bytes.as_slice())
-        .map_err(|_| WalletError::Invalid("a DID must be 33 bytes (66 hex characters)".to_string()))
 }
 
 fn write_atomic(path: &Path, data: &WalletData) -> Result<(), WalletError> {
@@ -755,6 +789,11 @@ mod tests {
     use crate::blind::PendingOutput;
     use secp256k1::SECP256K1;
 
+    /// Open a wallet file of the test network.
+    fn open_wallet(path: &std::path::Path) -> Result<crate::Wallet, crate::WalletError> {
+        crate::Wallet::open(path, "regtest")
+    }
+
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("ecash-wallet-{}-{name}", {
             static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -787,8 +826,9 @@ mod tests {
     fn a_missing_file_is_an_empty_wallet_and_changes_survive_a_reopen() {
         let dir = scratch("reopen");
         let path = dir.join("w").join("wallet.json");
-        let mut w = Wallet::open(&path).unwrap();
+        let mut w = open_wallet(&path).unwrap();
         assert!(w.notes().is_empty());
+        assert_eq!(w.snapshot().network, "regtest");
         let note = some_note(Kind::Psp, 4);
         let id = note.id();
         w.update(|d| {
@@ -796,9 +836,88 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        let again = Wallet::open(&path).unwrap();
+        let again = open_wallet(&path).unwrap();
         assert_eq!(again.notes().len(), 1);
         assert_eq!(again.notes()[0].id(), id);
+        assert_eq!(again.balance().psp, 4);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_file_with_no_network_is_refused_on_open_and_left_alone() {
+        let dir = scratch("no-network");
+        let path = dir.join("wallet.json");
+        // A real wallet file, as this version writes it, with the network taken
+        // out: what a pre-release version left.
+        let mut w = open_wallet(&path).unwrap();
+        w.update(|d| {
+            d.notes.push(some_note(Kind::Psp, 4));
+            Ok(())
+        })
+        .unwrap();
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("network")
+            .expect("the file records its network");
+        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let before = fs::read(&path).unwrap();
+
+        match open_wallet(&path) {
+            Err(WalletError::Corrupt(why)) => {
+                assert!(why.contains(&path.display().to_string()), "{why}");
+                assert!(why.contains("it records no network"), "{why}");
+                assert!(why.contains("pre-release version"), "{why}");
+                assert!(
+                    why.contains(
+                        "Start a new wallet file, or merge from a backup written by this version"
+                    ),
+                    "{why}"
+                );
+            }
+            other => panic!(
+                "expected the file to be refused, got {:?}",
+                other.map(|_| ())
+            ),
+        }
+        assert_eq!(fs::read(&path).unwrap(), before, "the file is left alone");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_file_of_another_network_is_refused_on_open_and_left_alone() {
+        let dir = scratch("other-network");
+        let path = dir.join("wallet.json");
+        let mut w = Wallet::open(&path, "signet").unwrap();
+        assert_eq!(w.snapshot().network, "signet", "a new file has the network");
+        w.update(|d| {
+            d.notes.push(some_note(Kind::Psp, 4));
+            Ok(())
+        })
+        .unwrap();
+        let before = fs::read(&path).unwrap();
+
+        match open_wallet(&path) {
+            Err(WalletError::Invalid(why)) => {
+                assert!(why.contains(&path.display().to_string()), "{why}");
+                assert!(
+                    why.contains(
+                        "this wallet file is for the signet network, but it was opened for the regtest network"
+                    ),
+                    "{why}"
+                );
+                assert!(why.contains("Nothing was changed"), "{why}");
+            }
+            other => panic!(
+                "expected the file to be refused, got {:?}",
+                other.map(|_| ())
+            ),
+        }
+        assert_eq!(fs::read(&path).unwrap(), before, "the file is left alone");
+        // Its own network opens it, with the note.
+        let again = Wallet::open(&path, "signet").unwrap();
         assert_eq!(again.balance().psp, 4);
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -808,7 +927,7 @@ mod tests {
         let dir = scratch("damaged");
         let path = dir.join("wallet.json");
         fs::write(&path, "not json").unwrap();
-        assert!(matches!(Wallet::open(&path), Err(WalletError::Corrupt(_))));
+        assert!(matches!(open_wallet(&path), Err(WalletError::Corrupt(_))));
         assert_eq!(fs::read_to_string(&path).unwrap(), "not json");
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -819,7 +938,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = scratch("mode");
         let path = dir.join("wallet.json");
-        let mut w = Wallet::open(&path).unwrap();
+        let mut w = open_wallet(&path).unwrap();
         w.update(|_| Ok(())).unwrap();
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
@@ -833,7 +952,7 @@ mod tests {
     fn a_failed_change_leaves_the_wallet_as_it_was() {
         let dir = scratch("failed");
         let path = dir.join("wallet.json");
-        let mut w = Wallet::open(&path).unwrap();
+        let mut w = open_wallet(&path).unwrap();
         let result: Result<(), WalletError> = w.update(|d| {
             d.notes.push(some_note(Kind::Psp, 1));
             Err(WalletError::Invalid("no".into()))
@@ -845,52 +964,9 @@ mod tests {
     }
 
     #[test]
-    fn a_wallet_file_from_before_one_off_purchase_keys_still_reads() {
-        let dir = scratch("old-purchase");
-        let path = dir.join("wallet.json");
-        // an old file: the shared `reply_did` field (now ignored) and a pending
-        // purchase with no key of its own
-        fs::write(
-            &path,
-            format!(
-                r#"{{"reply_did": "{did}", "pending_purchases": [{{"id": "aa", "reply_did": "{did}",
-                    "mint_did_pubkey": "{did}", "outputs": []}}]}}"#,
-                did = "02".repeat(33)
-            ),
-        )
-        .unwrap();
-        let mut w = Wallet::open(&path).unwrap();
-        let p = &w.pending_purchases()[0];
-        assert_eq!(
-            (p.id.as_str(), p.reply_secret.clone(), p.delivery_id.clone()),
-            ("aa", None, None)
-        );
-        assert!(w.open_replies().is_empty());
-        // and it saves, without the ignored field
-        w.update(|d| {
-            d.finished.insert("x".into());
-            Ok(())
-        })
-        .unwrap();
-        let saved: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-        assert!(saved.get("reply_did").is_none());
-        assert!(saved["pending_purchases"][0].get("reply_did").is_some());
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn parse_did_wants_exactly_33_bytes_of_hex() {
-        assert!(parse_did(&"02".repeat(33)).is_ok());
-        assert!(parse_did(&"02".repeat(32)).is_err());
-        assert!(parse_did(&"02".repeat(34)).is_err());
-        assert!(parse_did("zz").is_err());
-    }
-
-    #[test]
     fn the_balance_adds_up_by_kind_and_by_esp_terms() {
         let dir = scratch("balance");
-        let mut w = Wallet::open(&dir.join("wallet.json")).unwrap();
+        let mut w = open_wallet(&dir.join("wallet.json")).unwrap();
         let service =
             ServiceDid::parse("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
                 .unwrap();
@@ -923,7 +999,7 @@ mod tests {
     #[test]
     fn sums_do_not_overflow_at_the_u64_limit() {
         let dir = scratch("limit");
-        let mut w = Wallet::open(&dir.join("wallet.json")).unwrap();
+        let mut w = open_wallet(&dir.join("wallet.json")).unwrap();
         w.update(|d| {
             d.notes.push(some_note(Kind::Esp, u64::MAX));
             d.notes.push(some_note(Kind::Esp, u64::MAX));
@@ -931,6 +1007,43 @@ mod tests {
         })
         .unwrap();
         assert_eq!(w.balance().esp, 2 * u128::from(u64::MAX));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_snapshot_is_what_is_saved_and_a_copy() {
+        let dir = scratch("snapshot");
+        let path = dir.join("wallet.json");
+        let mut w = open_wallet(&path).unwrap();
+        w.update(|d| {
+            d.notes.push(some_note(Kind::Psp, 4));
+            d.notes.push(some_note(Kind::Fsp, 9));
+            Ok(())
+        })
+        .unwrap();
+        let json = |d: &WalletData| serde_json::to_value(d).unwrap();
+        let taken = w.snapshot();
+        // it is what is saved: the file read back as WalletData, and the wallet
+        // reopened from it
+        let saved: WalletData = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let reopened = open_wallet(&path).unwrap();
+        assert_eq!(json(&taken), json(&saved));
+        assert_eq!(json(&taken), json(&reopened.snapshot()));
+        // it is a copy: changing the wallet afterwards leaves it as it was
+        let frozen = json(&taken);
+        w.update(|d| {
+            d.notes.push(some_note(Kind::Psp, 2));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(json(&taken), frozen);
+        assert_eq!(taken.notes.len(), 2);
+        assert_eq!(w.snapshot().notes.len(), 3);
+        // merging it into a fresh wallet gives the same balance
+        let mut fresh = open_wallet(&dir.join("fresh.json")).unwrap();
+        fresh.merge_from(&taken).unwrap();
+        assert_eq!(fresh.balance(), reopened.balance());
+        assert_eq!((fresh.balance().psp, fresh.balance().fsp), (4, 9));
         fs::remove_dir_all(&dir).unwrap();
     }
 }

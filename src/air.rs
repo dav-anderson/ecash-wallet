@@ -5,8 +5,10 @@
 //! The PSP's calls are **mint info** (what the mint's health report says,
 //! `wire_version` and `network`, which `verify_mint` reads before anything else
 //! is sent to a mint), **keys**, **keysets** and **rotation** and **rollover**
-//! and **check-state**. The ESP's are mint info, **keysets**, **rotation**,
-//! **fees**, **rollover**, **exchange**, **transfer** and **redeem**; the ESP has
+//! and **check-state**, and the reconciliation request (**PSP_RECONCILE**, kind 15),
+//! which is sent with a reply key chosen by the caller ([`call_with_key`]) and
+//! whose body is saved before it is sent. The ESP's are mint info, **keysets**, **rotation**,
+//! **fees**, **rollover**, **exchange** and **redeem**; the ESP has
 //! no keys call (the keys arrive in the replies). An **FSP mint's** are mint info,
 //! **keys**, **rotation**, **fees** and its two POSTs, **FSP issue** and **FSP
 //! spend**. The reply bodies are JSON
@@ -32,9 +34,12 @@
 //!   the same request every time, each try in the next free mailbox slot. Then
 //!   "mint unreachable", and the request stays in the file; the next call of
 //!   the same kind resumes it. A read is kept once per mint and kind; a call
-//!   with a body (rollover, check-state, exchange, transfer, redeem) once per
+//!   with a body (rollover, check-state, exchange, redeem) once per
 //!   mint, kind and body (the SHA-256 of the body is kept with it), so a second
-//!   rollover is never mistaken for the first. The PSP and the ESP are two
+//!   rollover is never mistaken for the first. A reconciliation request is kept
+//!   with the purchase's reply key as its `r` and is sent again as the identical
+//!   body; not hearing back is [`Sent::NoReply`], not an error, because the PSP
+//!   answers an accepted request only. The PSP and the ESP are two
 //!   mints, so their requests never meet, even for the same kind.
 //! - **A request ends** when it is answered and checked (an answer or a signed
 //!   refusal), or when a reply comes that fails a check (a write-once cell
@@ -46,12 +51,12 @@
 //!   the mint now", and a reply from hours ago says nothing about now (above
 //!   all keys: an old reply is how a mint's retired keys would come back). For
 //!   a call with a body the new request has the same body, and the mint answers
-//!   it from its stored answer (rollovers, exchanges, transfers and redemptions
+//!   it from its stored answer (rollovers, exchanges and redemptions
 //!   are idempotent by request hash), so nothing is applied twice.
 //! - **Refusals map as the HTTP statuses do.** A signed `refused` reply is the
 //!   route's `4xx` JSON. A `400` has the body as it is, and the wallet reads it
 //!   as it reads the HTTP `400` ([`crate::error::mint_refusal`], or for the
-//!   ESP's exchange, transfer and redeem the refusal readers of
+//!   ESP's exchange and redeem the refusal readers of
 //!   [`crate::esp_replies`]): the notes were not accepted, and a pending
 //!   exchange may be cancelled. **Any other `4xx` carries `"http_status": N`**
 //!   (`404` for the ESP's rotation on a mint that does not rotate, `409
@@ -81,9 +86,10 @@ use sp_wire::air_request::ask::{AskConfig, AskError, InFlight, Verified, ask};
 use sp_wire::air_request::client::{self, ServerRef, block_on_new_runtime};
 use sp_wire::air_request::{
     KIND_CHECK_STATE, KIND_EXCHANGE, KIND_FEES, KIND_FSP_ISSUE, KIND_FSP_SPEND, KIND_KEYS,
-    KIND_KEYSETS, KIND_MINT_INFO, KIND_REDEEM, KIND_ROLLOVER, KIND_ROTATION, KIND_TRANSFER,
+    KIND_KEYSETS, KIND_MINT_INFO, KIND_PSP_RECONCILE, KIND_REDEEM, KIND_ROLLOVER, KIND_ROTATION,
     STATUS_UNAVAILABLE, VerifyError, addr, check_mint_info,
 };
+use sp_wire::seal::SecretKey;
 use sp_wire::version::WireMismatch;
 
 use crate::Wallet;
@@ -99,6 +105,9 @@ enum Ended {
     /// The reply was too old to be a statement about now (only a kept request
     /// can be): the request is dropped and a new one is made.
     Stale,
+    /// Every try passed with no reply. The request stays in the wallet file.
+    /// This is the message of the error [`call_with_body`] gives for it.
+    NoReply(String),
 }
 
 /// What a kind of request is called in messages.
@@ -112,10 +121,10 @@ fn what(kind: u8) -> &'static str {
         KIND_CHECK_STATE => "check-state",
         KIND_FEES => "fees",
         KIND_EXCHANGE => "exchange",
-        KIND_TRANSFER => "transfer",
         KIND_REDEEM => "redemption",
         KIND_FSP_ISSUE => "FSP issue",
         KIND_FSP_SPEND => "FSP spend",
+        KIND_PSP_RECONCILE => "PSP reconciliation",
         _ => "a request",
     }
 }
@@ -127,10 +136,10 @@ fn changes_state(kind: u8) -> bool {
         kind,
         KIND_ROLLOVER
             | KIND_EXCHANGE
-            | KIND_TRANSFER
             | KIND_REDEEM
             | KIND_FSP_ISSUE
             | KIND_FSP_SPEND
+            | KIND_PSP_RECONCILE
     )
 }
 
@@ -150,8 +159,8 @@ fn mint_label(party: Party, mint_hex: &str) -> String {
 }
 
 /// The SHA-256 of a request body, hex; empty for no body, so the plain reads
-/// (and a wallet file from before there were bodies) match each other.
-fn body_hash(body: &[u8]) -> String {
+/// match each other.
+pub(crate) fn body_hash(body: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     if body.is_empty() {
         String::new()
@@ -257,7 +266,7 @@ fn run_request(
             wallet.end_air_request(&request_id)?;
             Ok(Ended::Stale)
         }
-        Err(AskError::Unreachable { attempts, secs }) => Err(WalletError::Mint(format!(
+        Err(AskError::Unreachable { attempts, secs }) => Ok(Ended::NoReply(format!(
             "the {} {} did not answer {what} over AIR: no reply after {attempts} tries of {secs} s. The request is kept in the wallet file, and the next call carries on with it",
             party.name(),
             mint_label(party, &cfg.mint.to_hex())
@@ -340,7 +349,7 @@ pub fn call(
 }
 
 /// [`call`] for a request with a body (`KIND_ROLLOVER`, `KIND_CHECK_STATE`, and
-/// the ESP's `KIND_EXCHANGE`, `KIND_TRANSFER`, `KIND_REDEEM`): resumes a kept
+/// the ESP's `KIND_EXCHANGE`, `KIND_REDEEM`): resumes a kept
 /// request of this kind **and this body** for this mint if there is one, so the
 /// same call made again carries on with the same request id and key (and a
 /// different call never takes its place). A reply that is a signed refusal is
@@ -364,13 +373,78 @@ pub fn call_with_body(
         let flight = flight_of(&pending, body)?;
         match run_request(wallet, &cfg, party, flight, pending.created_at, true)? {
             Ended::Verified(v) => return Ok(v),
+            Ended::NoReply(message) => return Err(WalletError::Mint(message)),
             Ended::Stale => {} // fall through to a new request
         }
     }
     let flight = InFlight::with_body(kind, body.to_vec());
     match run_request(wallet, &cfg, party, flight, addr::now_secs(), false)? {
         Ended::Verified(v) => Ok(v),
+        Ended::NoReply(message) => Err(WalletError::Mint(message)),
         // Only a kept request is ever dropped as stale.
+        Ended::Stale => Err(WalletError::Mint(format!(
+            "{} over AIR: the reply was dated too far from now",
+            what(kind)
+        ))),
+    }
+}
+
+/// What a call with a key of its own came to.
+pub enum Sent {
+    /// The mint answered, and the reply passed the checks.
+    Answered(Verified),
+    /// Every try passed with no reply (the message says how many). The request is
+    /// kept in the wallet file. For a PSP reconciliation this is how a refused
+    /// request looks: the PSP answers an accepted request only.
+    NoReply(String),
+}
+
+/// [`call_with_body`] for a request whose one-off key `R` is given, not made: a
+/// PSP reconciliation is answered under the purchase's reply key, so the key a
+/// request is saved with before it is first sent is that key. The body is never
+/// changed.
+///
+/// A kept request of this kind and body for this mint is resumed when it was made
+/// with `r` (the same request id and key, the next free mailbox slot); a kept
+/// request that is not (it has another key) is left alone and a new request is
+/// made. A reply that has gone stale is dropped as in [`call_with_body`], and the
+/// same body is sent as a new request with the same key. Not hearing back is not
+/// an error here: it is [`Sent::NoReply`].
+pub fn call_with_key(
+    wallet: &mut Wallet,
+    air: &AirSettings,
+    party: Party,
+    kind: u8,
+    body: &[u8],
+    r: &SecretKey,
+) -> Result<Sent, WalletError> {
+    let cfg = ask_config(air, party)?;
+    let mint = cfg.mint.to_hex();
+    let hash = body_hash(body);
+    let key_hex = addr::secret_to_hex(r);
+    let kept = wallet
+        .air_requests()
+        .iter()
+        .find(|p| p.mint == mint && p.kind == kind && p.body_hash == hash && p.r == key_hex)
+        .cloned();
+    if let Some(pending) = kept {
+        let flight = flight_of(&pending, body)?;
+        match run_request(wallet, &cfg, party, flight, pending.created_at, true)? {
+            Ended::Verified(v) => return Ok(Sent::Answered(v)),
+            Ended::NoReply(message) => return Ok(Sent::NoReply(message)),
+            Ended::Stale => {} // fall through to a new request
+        }
+    }
+    let flight = InFlight {
+        kind,
+        request_id: addr::random_id(),
+        r: r.clone(),
+        slots: Vec::new(),
+        body: body.to_vec(),
+    };
+    match run_request(wallet, &cfg, party, flight, addr::now_secs(), false)? {
+        Ended::Verified(v) => Ok(Sent::Answered(v)),
+        Ended::NoReply(message) => Ok(Sent::NoReply(message)),
         Ended::Stale => Err(WalletError::Mint(format!(
             "{} over AIR: the reply was dated too far from now",
             what(kind)
@@ -530,10 +604,10 @@ pub fn fetch_text(
     Ok(answered.text())
 }
 
-/// The ESP's exchange, transfer and redemption over AIR: `body` is the request
+/// The ESP's exchange and redemption over AIR: `body` is the request
 /// (JSON, or for the redemption the canonical binary encoding), and the result is
 /// the answer read as `R`. A refusal whose HTTP status is in
-/// `refusal_statuses` (the `400` of the exchange and the transfer; the `400` and
+/// `refusal_statuses` (the `400` of the exchange; the `400` and
 /// the `413` of the redemption) is read by `refusal` from the body's text, into a
 /// [`WalletError`]; any other refusal (`409 in_progress`, say) is a
 /// plain mint error with its status, never a refusal of the notes.

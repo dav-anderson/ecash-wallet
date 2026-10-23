@@ -31,9 +31,7 @@ use crate::error::WalletError;
 use crate::store::{HandedNote, Handover, Kind, StoredNote, StoredTerms, Wallet};
 
 /// What the wallet last saw of a service's FSP mint (its keys, over AIR). The mint
-/// is found by its service, so no address is kept; a wallet file from before
-/// this one has the `url` the mint was then reached at, which is ignored when
-/// the file is read and not written again.
+/// is found by its service, so no address is kept.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FspMint {
     pub current: String,
@@ -59,6 +57,18 @@ pub enum FspOp {
     },
 }
 
+impl FspOp {
+    /// The ids of the notes the request spends, in the order the mint counts
+    /// them when it names some by position: a spend's inputs, or an issue's ESP
+    /// notes counted across the groups.
+    pub(crate) fn note_ids(&self) -> Vec<String> {
+        match self {
+            FspOp::Spend { inputs, .. } => inputs.clone(),
+            FspOp::Issue { notes, .. } => notes.iter().flatten().cloned().collect(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PendingFsp {
     pub id: String,
@@ -66,9 +76,11 @@ pub struct PendingFsp {
     pub op: FspOp,
 }
 
-/// A service's FSP mint in the wallet's records (`fsp_mints`, the swap schedule):
-/// the service's DID in hex. It is never dialled; the mint is reached through the
-/// service's `air.fsp` entry.
+/// A service's mint in the wallet's records (`fsp_mints`, the swap schedule, the
+/// live keysets, the mint a handoff names): the service's DID in lowercase hex.
+/// The same name is used for the PSP and the ESP. It is never dialled; an FSP
+/// mint is reached through the service's `air.fsp` entry, the PSP and the ESP
+/// through `air.server` and `air.host`.
 pub fn record_of(service: ServiceDid) -> String {
     hex::encode(service.serialize())
 }
@@ -189,59 +201,12 @@ impl Wallet {
     }
 
     /// The FSP notes whose service is not known, and their units. They are not
-    /// spent, handed off or counted under a service until it is known (see
-    /// [`Wallet::fill_fsp_services`]).
+    /// spent, handed off or counted under a service until it is known.
     pub fn fsp_unknown_service(&self) -> (usize, u128) {
         self.notes()
             .iter()
             .filter(|n| n.kind == Kind::Fsp && n.terms.is_none())
             .fold((0, 0), |(c, u), n| (c + 1, u + u128::from(n.amount)))
-    }
-
-    /// Fill in the service of FSP notes that have none, from the FSP mints this
-    /// wallet has seen: a note whose key set is the current or previous one of
-    /// exactly one known mint belongs to that mint's service. Anything else is
-    /// left unknown, not guessed. Returns how many notes were filled in. Run at
-    /// startup (a wallet file from before the service was kept) and whenever a
-    /// mint's keys are read.
-    pub fn fill_fsp_services(&mut self) -> Result<usize, WalletError> {
-        let mut owner: BTreeMap<String, Option<ServiceDid>> = BTreeMap::new();
-        for (svc, m) in &self.data().fsp_mints {
-            let Ok(key) = ServiceDid::parse(svc) else {
-                continue;
-            };
-            for ks in std::iter::once(&m.current).chain(m.previous.iter()) {
-                // a key set that two mints both claim belongs to neither
-                owner
-                    .entry(ks.clone())
-                    .and_modify(|o| *o = None)
-                    .or_insert(Some(key));
-            }
-        }
-        let wanted: Vec<(String, ServiceDid)> = self
-            .notes()
-            .iter()
-            .filter(|n| n.kind == Kind::Fsp && n.terms.is_none())
-            .filter_map(|n| {
-                let ks = self.data().fsp_keysets.get(&n.id())?;
-                let service = (*owner.get(ks)?)?;
-                Some((n.id(), service))
-            })
-            .collect();
-        if wanted.is_empty() {
-            return Ok(0);
-        }
-        self.update(|d| {
-            for n in d.notes.iter_mut().filter(|n| n.kind == Kind::Fsp) {
-                if let Some((_, service)) = wanted.iter().find(|(id, _)| *id == n.id()) {
-                    n.terms = Some(StoredTerms {
-                        service: *service,
-                        redeemable_after_day: 0,
-                    });
-                }
-            }
-            Ok(wanted.len())
-        })
     }
 
     /// Record what an FSP mint's keys said, and move FSP on keysets it no
@@ -510,6 +475,39 @@ impl Wallet {
         })
     }
 
+    /// The mint refused a pending FSP request because some of its inputs are
+    /// already spent (`note_spent_elsewhere`), and named them by `positions` in
+    /// the request: the notes of a spend in its input order, or the ESP notes of
+    /// an issue counted across the groups in order. Nothing happened at the mint.
+    /// The named notes go to the spent record and leave the balance, the request's
+    /// other notes are free again, and the request is dropped.
+    pub fn mark_spent_in_fsp(
+        &mut self,
+        id: &str,
+        positions: &[usize],
+    ) -> Result<crate::esp::SpentReport, WalletError> {
+        self.update(|d| {
+            let pending = d
+                .pending_fsp
+                .iter()
+                .find(|p| p.id == id)
+                .ok_or_else(|| WalletError::Unknown(format!("no pending FSP request {id}")))?;
+            let ids = pending.op.note_ids();
+            if positions.is_empty() || positions.iter().any(|&i| i >= ids.len()) {
+                return Err(WalletError::Invalid(format!(
+                    "the mint named notes {positions:?}, but the request has {} notes",
+                    ids.len()
+                )));
+            }
+            let spent_ids: Vec<String> = positions.iter().map(|&i| ids[i].clone()).collect();
+            d.pending_fsp.retain(|q| q.id != id);
+            for spent in &spent_ids {
+                d.fsp_keysets.remove(spent);
+            }
+            Ok(Wallet::retire_reserved(d, id, &spent_ids))
+        })
+    }
+
     pub(crate) fn build_swap(
         &mut self,
         service: ServiceDid,
@@ -704,7 +702,13 @@ impl Wallet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::expect;
     use crate::store::WalletData;
+
+    /// Open a wallet file of the test network.
+    fn open_wallet(path: &std::path::Path) -> Result<crate::Wallet, crate::WalletError> {
+        crate::Wallet::open(path, "regtest")
+    }
 
     #[test]
     fn splits_and_outputs() {
@@ -726,8 +730,8 @@ mod tests {
         )
     }
 
-    /// An FSP note of `amount` with no service recorded (as an older wallet
-    /// file has it), on key set `keyset` unless that is empty.
+    /// An FSP note of `amount` with no service recorded, on key set `keyset`
+    /// unless that is empty.
     fn bare_note(seed: u8, amount: u64) -> StoredNote {
         let sk = secp256k1::SecretKey::from_slice(&[seed; 32]).unwrap();
         let pk = sk.public_key(secp256k1::SECP256K1);
@@ -751,116 +755,94 @@ mod tests {
         d.join("wallet.json")
     }
 
-    fn fsp_mint(current: &str, previous: Option<&str>) -> FspMint {
-        FspMint {
-            current: current.into(),
-            previous: previous.map(String::from),
-            next_rotation: None,
-        }
-    }
-
     #[test]
-    fn an_fsp_mint_record_with_the_old_url_still_reads_and_is_written_without_it() {
-        // A wallet file from before the FSP's calls were over AIR kept the URL
-        // the mint was reached at. It is ignored on reading, in a whole wallet
-        // file too, and not written again.
-        let old = serde_json::json!({
-            "url": "http://127.0.0.1:3200",
-            "current": "k1",
-            "previous": "k0",
-            "next_rotation": 5
-        });
-        let m: FspMint = serde_json::from_value(old.clone()).unwrap();
-        assert_eq!(
-            m,
-            FspMint {
-                current: "k1".into(),
-                previous: Some("k0".into()),
-                next_rotation: Some(5),
-            }
-        );
-        assert!(serde_json::to_value(&m).unwrap().get("url").is_none());
-
-        let svc = service_of(7);
-        let mut data = crate::store::WalletData::default();
-        data.fsp_mints
-            .insert(record_of(svc), fsp_mint("k9", Some("k8")));
-        let mut file = serde_json::to_value(&data).unwrap();
-        file["fsp_mints"][record_of(svc)] = old;
-        let path = scratch_file("old-url");
-        std::fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
-        let w = Wallet::open(&path).unwrap();
-        assert_eq!(w.fsp_mints()[&record_of(svc)].current, "k1");
-    }
-
-    #[test]
-    fn the_service_of_an_old_note_is_filled_from_the_one_mint_that_has_its_keyset() {
-        let (s1, s2) = (service_of(41), service_of(42));
-        // k0 is only service 1's previous set and k2 only service 2's current
-        // set; k1 is claimed by both mints, so it belongs to neither.
-        let notes = [
-            (bare_note(1, 8), "k0"),
-            (bare_note(2, 4), "k2"),
-            (bare_note(3, 2), "k1"),
-            (bare_note(4, 1), "kz"),
-        ];
-        let mut with_terms = bare_note(5, 16);
-        with_terms.terms = Some(StoredTerms {
-            service: s2,
-            redeemable_after_day: 0,
-        });
-        let mut data = WalletData::default();
-        for (n, ks) in &notes {
-            data.fsp_keysets.insert(n.id(), ks.to_string());
-        }
-        data.fsp_keysets.insert(with_terms.id(), "k0".into());
-        data.notes = notes.iter().map(|(n, _)| n.clone()).collect();
-        data.notes.push(with_terms.clone());
-        data.fsp_mints
-            .insert(hex::encode(s1.serialize()), fsp_mint("k1", Some("k0")));
-        data.fsp_mints
-            .insert(hex::encode(s2.serialize()), fsp_mint("k2", Some("k1")));
-        let path = scratch_file("fill");
-        std::fs::write(&path, serde_json::to_vec(&data).unwrap()).unwrap();
-
-        let mut w = Wallet::open(&path).unwrap();
-        assert_eq!(
-            w.fsp_unknown_service(),
-            (4, 15),
-            "four notes have no service"
-        );
-        assert_eq!(w.fill_fsp_services().unwrap(), 2);
-        let svc = |seed: u8| {
-            w.notes()
-                .iter()
-                .find(|n| n.id() == bare_note(seed, 1).id())
-                .unwrap()
-                .fsp_service()
+    fn fsp_calls_with_bad_input_are_refused_and_change_nothing() {
+        let (s, other) = (service_of(44), service_of(45));
+        let mut data = WalletData {
+            network: "regtest".into(),
+            ..Default::default()
         };
-        assert_eq!(svc(1), Some(s1));
-        assert_eq!(svc(2), Some(s2));
-        assert_eq!(svc(3), None, "a keyset two mints claim is not guessed");
-        assert_eq!(svc(4), None, "a keyset no mint has is not guessed");
-        assert_eq!(svc(5), Some(s2), "a recorded service is never changed");
-        assert_eq!(w.fsp_unknown_service(), (2, 3));
+        for (seed, amount) in [(10, 8), (11, 4)] {
+            let mut n = bare_note(seed, amount);
+            n.terms = Some(StoredTerms {
+                service: s,
+                redeemable_after_day: 0,
+            });
+            data.fsp_keysets.insert(n.id(), "k1".into());
+            data.notes.push(n);
+        }
+        let path = scratch_file("bad-input");
+        std::fs::write(&path, serde_json::to_vec(&data).unwrap()).unwrap();
+        let mut w = open_wallet(&path).unwrap();
+        let state = |w: &Wallet| {
+            (
+                serde_json::to_value(w.snapshot()).unwrap(),
+                std::fs::read(&path).unwrap(),
+            )
+        };
+        let before = state(&w);
 
-        // Grouped by service in the balance and by keyset.
-        let by = w.balance().fsp_by_service;
-        assert_eq!(by[&hex::encode(s1.serialize())], 8);
-        assert_eq!(by[&hex::encode(s2.serialize())], 4 + 16);
-        assert_eq!(by[crate::store::UNKNOWN_SERVICE], 3);
-        assert_eq!(w.balance().fsp, 8 + 4 + 2 + 1 + 16);
-        let ks = w.fsp_by_keyset();
-        assert_eq!(ks[&(hex::encode(s1.serialize()), "k0".to_string())], 8);
-        assert_eq!(
-            ks[&(crate::store::UNKNOWN_SERVICE.to_string(), "k1".to_string())],
-            2
+        let e = expect::invalid(w.build_fsp_spend(s, 0, ""));
+        assert!(e.contains("pay at least 1 FSP unit"), "{e}");
+        let e = expect::not_enough(w.build_fsp_spend(s, 13, ""));
+        assert!(
+            e.contains("holds 12 free FSP units for that service, less than 13"),
+            "{e}"
         );
+        let e = expect::not_enough(w.build_fsp_spend(other, 1, ""));
+        assert!(
+            e.contains("holds 0 free FSP units for that service, less than 1"),
+            "{e}"
+        );
+        let issue = IssueResponse {
+            groups: vec![],
+            fee_per_byte: 0,
+        };
+        let e = expect::unknown(w.finish_fsp_issue("nope", &issue));
+        assert!(e.contains("no pending FSP request nope"), "{e}");
+        let spend = SpendResponse {
+            keyset: "k1".into(),
+            signatures: vec![],
+            keys: vec![],
+            paid: 0,
+        };
+        let e = expect::unknown(w.finish_fsp_spend("nope", &spend));
+        assert!(e.contains("no pending FSP request nope"), "{e}");
+        let e = expect::unknown(w.cancel_fsp("nope"));
+        assert!(e.contains("no pending FSP request nope"), "{e}");
+        assert_eq!(state(&w), before, "no refused call changed the wallet");
 
-        // It is saved, and a second run has nothing left to do.
-        assert_eq!(w.fill_fsp_services().unwrap(), 0);
-        let again = Wallet::open(&path).unwrap();
-        assert_eq!(again.fsp_unknown_service(), (2, 3));
+        // a reply that does not fit the request: paying 5 of the 8 leaves
+        // change of 3, which is two notes
+        w.build_fsp_spend(s, 5, "memo").unwrap();
+        let id = w.pending_fsp()[0].id.clone();
+        let built = state(&w);
+        let key = bare_note(12, 1).note.nonce.0;
+        for (signatures, keys) in [
+            (vec![], vec![]),
+            (vec![key, key], vec![key]),
+            (vec![key], vec![key, key]),
+        ] {
+            let reply = SpendResponse {
+                keyset: "k1".into(),
+                signatures,
+                keys,
+                paid: 5,
+            };
+            match w.finish_fsp_spend(&id, &reply) {
+                Err(WalletError::Mint(m)) => {
+                    assert!(m.contains("does not fit the request"), "{m}");
+                }
+                other => panic!("expected WalletError::Mint, got {other:?}"),
+            }
+            assert_eq!(state(&w), built, "the pending spend is untouched");
+        }
+        // and a spend id is not an issue
+        match w.finish_fsp_issue(&id, &issue) {
+            Err(WalletError::Invalid(m)) => assert!(m.contains("is not an issue"), "{m}"),
+            other => panic!("expected WalletError::Invalid, got {other:?}"),
+        }
+        assert_eq!(state(&w), built);
     }
 
     #[test]
@@ -873,18 +855,304 @@ mod tests {
         });
         let unknown = bare_note(8, 4);
         let data = WalletData {
+            network: "regtest".into(),
             notes: vec![known.clone(), unknown],
             ..Default::default()
         };
         let path = scratch_file("pick");
         std::fs::write(&path, serde_json::to_vec(&data).unwrap()).unwrap();
-        let w = Wallet::open(&path).unwrap();
+        let w = open_wallet(&path).unwrap();
         assert_eq!(known.fsp_service(), Some(s));
         assert!(
             w.select_fsp_handoff(&[(s, 8)]).is_err(),
             "only 4 is the service's"
         );
         assert_eq!(w.select_fsp_handoff(&[(s, 4)]).unwrap().len(), 1);
+    }
+
+    /// A wallet holding FSP notes of `amounts` for a service, all on keyset
+    /// `old`, in that order. With `rotating`, the wallet's record of the mint
+    /// names `old` as the previous keyset, so a rollover has notes to move.
+    fn wallet_with_fsp(name: &str, amounts: &[u64], rotating: bool) -> (Wallet, ServiceDid) {
+        let s = service_of(44);
+        let mut data = WalletData {
+            network: "regtest".into(),
+            ..Default::default()
+        };
+        for (i, &amount) in amounts.iter().enumerate() {
+            let mut n = bare_note(10 + i as u8, amount);
+            n.terms = Some(StoredTerms {
+                service: s,
+                redeemable_after_day: 0,
+            });
+            data.fsp_keysets.insert(n.id(), "old".into());
+            data.notes.push(n);
+        }
+        if rotating {
+            data.fsp_mints.insert(
+                record_of(s),
+                FspMint {
+                    current: "new".into(),
+                    previous: Some("old".into()),
+                    next_rotation: None,
+                },
+            );
+        }
+        let path = scratch_file(name);
+        std::fs::write(&path, serde_json::to_vec(&data).unwrap()).unwrap();
+        (open_wallet(&path).unwrap(), s)
+    }
+
+    /// The mint's refusal of a request whose inputs `at` are already spent.
+    fn spent_refusal(at: &[usize]) -> Result<crate::mint_info::FspReply, WalletError> {
+        Err(WalletError::SpentElsewhere {
+            why: "the mint's text".into(),
+            inputs: at.to_vec(),
+        })
+    }
+
+    fn amounts(notes: &[StoredNote]) -> Vec<u64> {
+        let mut v: Vec<u64> = notes.iter().map(|n| n.amount).collect();
+        v.sort_unstable();
+        v
+    }
+
+    #[test]
+    fn a_refused_payment_marks_the_spent_notes_spent_and_frees_the_rest() {
+        let (mut w, s) = wallet_with_fsp("pay-spent", &[8, 4, 2, 1], false);
+        // 15 takes all four notes, largest first: 8, 4, 2, 1
+        let id = w.build_fsp_spend(s, 15, "memo").unwrap().hash();
+        assert_eq!(w.pending_fsp().len(), 1);
+        assert_eq!(w.balance().fsp, 15);
+
+        // the mint says the notes at positions 1 and 2 (the 4 and the 2) are spent
+        let e =
+            crate::mint_info::settle_fsp_with(&mut w, &id, &mut |_, _, _| spent_refusal(&[1, 2]))
+                .unwrap_err();
+        match e {
+            WalletError::SpentElsewhere { why, inputs } => {
+                assert_eq!(inputs, vec![1, 2]);
+                assert_eq!(
+                    why,
+                    "the mint's text. 2 note(s) are marked spent in the wallet, 2 other note(s) are free again"
+                );
+            }
+            other => panic!("expected SpentElsewhere, got {other:?}"),
+        }
+        // the request is gone, the two spent notes left the balance, the others are free
+        assert!(w.pending_fsp().is_empty());
+        assert_eq!(amounts(w.spent_notes()), vec![2, 4]);
+        let b = w.balance();
+        assert_eq!((b.fsp, b.spent_elsewhere), (9, 2));
+        assert!(w.notes().iter().all(|n| n.reserved_by.is_none()));
+        // so a later payment can use the free ones, and cannot use the spent ones
+        assert!(w.build_fsp_spend(s, 9, "memo").is_ok());
+        let (mut w2, s2) = wallet_with_fsp("pay-spent-2", &[8, 4, 2, 1], false);
+        let id = w2.build_fsp_spend(s2, 15, "memo").unwrap().hash();
+        crate::mint_info::settle_fsp_with(&mut w2, &id, &mut |_, _, _| spent_refusal(&[1, 2]))
+            .unwrap_err();
+        assert!(matches!(
+            w2.build_fsp_spend(s2, 10, "memo"),
+            Err(WalletError::NotEnough(_))
+        ));
+        // and it is all on disk
+        let again = open_wallet(w2.path()).unwrap();
+        assert_eq!(amounts(again.spent_notes()), vec![2, 4]);
+        assert_eq!(again.balance().fsp, 9);
+        assert!(again.pending_fsp().is_empty());
+    }
+
+    #[test]
+    fn a_refused_rollover_marks_the_spent_notes_spent_and_the_next_one_leaves_them_out() {
+        let (mut w, s) = wallet_with_fsp("roll-spent", &[8, 4, 2, 1], true);
+        let request = w.build_fsp_rollover(s).unwrap().unwrap();
+        assert_eq!(request.pay, 0);
+        assert_eq!(request.inputs.len(), 4);
+
+        // the first and the last (the 8 and the 1) are spent: a rollover is nobody's
+        // request, so this is a line for the log and not an error
+        let text = crate::mint_info::settle_fsp_with(&mut w, &request.hash(), &mut |_, _, _| {
+            spent_refusal(&[0, 3])
+        })
+        .unwrap();
+        assert_eq!(
+            text,
+            "rollover refused (the mint's text): 2 note(s) marked spent, 2 freed"
+        );
+        assert!(w.pending_fsp().is_empty());
+        assert_eq!(amounts(w.spent_notes()), vec![1, 8]);
+        assert_eq!(w.balance().fsp, 6);
+
+        // the next rollover is of the two notes that are left
+        let next = w.build_fsp_rollover(s).unwrap().unwrap();
+        let mut left: Vec<u64> = next.inputs.iter().map(|i| i.input.amount.units).collect();
+        left.sort_unstable();
+        assert_eq!(left, vec![2, 4]);
+    }
+
+    /// A wallet holding free ESP notes for a service on two days: day 1 a 2 and a
+    /// 1, day 2 an 8 and a 4.
+    fn wallet_with_esp_on_two_days(name: &str) -> (Wallet, ServiceDid) {
+        let s = service_of(44);
+        let mut data = WalletData {
+            network: "regtest".into(),
+            ..Default::default()
+        };
+        for (i, (amount, day)) in [(2u64, 1u64), (1, 1), (8, 2), (4, 2)]
+            .into_iter()
+            .enumerate()
+        {
+            let mut n = bare_note(20 + i as u8, amount);
+            n.kind = Kind::Esp;
+            n.terms = Some(StoredTerms {
+                service: s,
+                redeemable_after_day: day,
+            });
+            data.keysets.insert(n.id(), "esp-keyset".into());
+            data.notes.push(n);
+        }
+        let path = scratch_file(name);
+        std::fs::write(&path, serde_json::to_vec(&data).unwrap()).unwrap();
+        (open_wallet(&path).unwrap(), s)
+    }
+
+    #[test]
+    fn a_refused_issue_marks_the_spent_esp_notes_spent_counted_across_the_groups() {
+        let (mut w, s) = wallet_with_esp_on_two_days("issue-spent");
+        let request = w.build_fsp_issue(s, None, 0).unwrap();
+        // the groups are by day, and each holds its notes largest first: 2, 1 | 8, 4
+        assert_eq!(request.groups.len(), 2);
+
+        // positions 1 and 2 counted across the groups are the 1 and the 8
+        let e = crate::mint_info::settle_fsp_with(&mut w, &request.hash(), &mut |_, _, _| {
+            spent_refusal(&[1, 2])
+        })
+        .unwrap_err();
+        assert!(matches!(e, WalletError::SpentElsewhere { .. }), "{e:?}");
+        assert!(w.pending_fsp().is_empty());
+        assert_eq!(amounts(w.spent_notes()), vec![1, 8]);
+        assert!(w.notes().iter().all(|n| n.reserved_by.is_none()));
+        assert_eq!(amounts(w.notes()), vec![2, 4]);
+    }
+
+    #[test]
+    fn a_bad_answer_from_the_mint_marks_nothing() {
+        // A refusal that names no note, or a position the request does not have,
+        // is a mint error: the request is cancelled, nothing is marked spent and
+        // the notes are free. Through `settle_fsp_with`, for a payment, a rollover
+        // and an issue.
+        let expect = |positions: &str, notes: usize| {
+            format!(
+                "the mint named a note the request did not have: it named positions {positions} of a request of {notes} note(s) (the mint's text). The request is cancelled, nothing is marked spent, and its notes are free again"
+            )
+        };
+        let check = |w: &Wallet, free: Vec<u64>| {
+            assert!(w.pending_fsp().is_empty(), "the request is still pending");
+            assert!(w.spent_notes().is_empty(), "a note was marked spent");
+            assert!(
+                w.notes().iter().all(|n| n.reserved_by.is_none()),
+                "a note is still held"
+            );
+            assert_eq!(amounts(w.notes()), free);
+            // and it is all on disk
+            let again = open_wallet(w.path()).unwrap();
+            assert!(again.pending_fsp().is_empty());
+            assert!(again.spent_notes().is_empty());
+            assert!(again.notes().iter().all(|n| n.reserved_by.is_none()));
+        };
+        let settle =
+            |w: &mut Wallet, id: &str, at: &[usize]| match crate::mint_info::settle_fsp_with(
+                w,
+                id,
+                &mut |_, _, _| spent_refusal(at),
+            ) {
+                Err(WalletError::Mint(why)) => why,
+                other => panic!("expected a Mint error, got {other:?}"),
+            };
+
+        // a payment of two notes: a position past the end
+        let (mut w, s) = wallet_with_fsp("bad-pay", &[8, 4], false);
+        let id = w.build_fsp_spend(s, 12, "memo").unwrap().hash();
+        assert_eq!(w.pending_fsp().len(), 1);
+        assert_eq!(settle(&mut w, &id, &[0, 2]), expect("[0, 2]", 2));
+        check(&w, vec![4, 8]);
+        assert_eq!(w.balance().fsp, 12);
+
+        // the same payment, the mint naming no note at all
+        let id = w.build_fsp_spend(s, 12, "memo").unwrap().hash();
+        assert_eq!(settle(&mut w, &id, &[]), expect("[]", 2));
+        check(&w, vec![4, 8]);
+
+        // a rollover of four notes: position 4 is the fifth
+        let (mut w, s) = wallet_with_fsp("bad-roll", &[8, 4, 2, 1], true);
+        let id = w.build_fsp_rollover(s).unwrap().unwrap().hash();
+        assert_eq!(settle(&mut w, &id, &[4]), expect("[4]", 4));
+        check(&w, vec![1, 2, 4, 8]);
+        // so the next rollover is built from all four again, and is not stuck
+        assert_eq!(w.build_fsp_rollover(s).unwrap().unwrap().inputs.len(), 4);
+
+        // an issue of four ESP notes in two groups: position 4 is the fifth
+        let (mut w, s) = wallet_with_esp_on_two_days("bad-issue");
+        let id = w.build_fsp_issue(s, None, 0).unwrap().hash();
+        assert_eq!(settle(&mut w, &id, &[1, 4]), expect("[1, 4]", 4));
+        check(&w, vec![1, 2, 4, 8]);
+    }
+
+    #[test]
+    fn mark_spent_in_fsp_refuses_a_bad_position_and_an_unknown_request_and_changes_nothing() {
+        // `mark_spent_in_fsp` is public, so the library call refuses what
+        // `settle_fsp_with` never hands it: no position at all, a position the
+        // request does not have, and a request that is not pending.
+        let (mut w, s) = wallet_with_fsp("bad-direct", &[8, 4], false);
+        let id = w.build_fsp_spend(s, 12, "memo").unwrap().hash();
+        let before = serde_json::to_value(w.snapshot()).unwrap();
+        for (positions, text) in [
+            (
+                &[][..],
+                "the mint named notes [], but the request has 2 notes",
+            ),
+            (
+                &[0, 2][..],
+                "the mint named notes [0, 2], but the request has 2 notes",
+            ),
+        ] {
+            match w.mark_spent_in_fsp(&id, positions) {
+                Err(WalletError::Invalid(why)) => assert_eq!(why, text),
+                other => panic!("expected an Invalid refusal, got {other:?}"),
+            }
+        }
+        match w.mark_spent_in_fsp("nope", &[0]) {
+            Err(WalletError::Unknown(why)) => assert_eq!(why, "no pending FSP request nope"),
+            other => panic!("expected an Unknown refusal, got {other:?}"),
+        }
+        assert_eq!(serde_json::to_value(w.snapshot()).unwrap(), before);
+    }
+
+    #[test]
+    fn a_request_the_wallet_cancelled_is_logged_as_cancelled_and_one_still_pending_as_retried() {
+        let (mut w, s) = wallet_with_fsp("wording", &[8, 4], false);
+        let id = w.build_fsp_spend(s, 12, "memo").unwrap().hash();
+        // the mint did not answer: the request is kept and sent again
+        let down = WalletError::Mint("cannot answer now".into());
+        assert_eq!(
+            crate::mint_info::fsp_failure(&w, "pending", "not finished", &id, &down),
+            format!("pending {id} not finished, retried on the next connection: cannot answer now")
+        );
+        // the mint named a position the request does not have: the wallet cancels
+        // the request, and the next connection does not send it again
+        let why = match crate::mint_info::settle_fsp_with(&mut w, &id, &mut |_, _, _| {
+            spent_refusal(&[0, 2])
+        }) {
+            Err(e) => e,
+            other => panic!("expected an error, got {other:?}"),
+        };
+        assert!(w.pending_fsp().is_empty());
+        assert_eq!(
+            crate::mint_info::fsp_failure(&w, "pending", "not finished", &id, &why),
+            format!(
+                "pending {id} cancelled, not retried: the mint named a note the request did not have: it named positions [0, 2] of a request of 2 note(s) (the mint's text). The request is cancelled, nothing is marked spent, and its notes are free again"
+            )
+        );
     }
 
     #[test]

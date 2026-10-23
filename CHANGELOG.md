@@ -2,6 +2,10 @@
 
 ecash-wallet 0.1.2 builds on `sp-wire` 0.2.0 (wire version 2) and the 0.1.2 mints. 0.1.1 moved the types to `sp-wire`, added the wire-version check and removed the mint crates from the library. 0.1.0 is the first release. Nothing was recorded per version before this file; the section below is everything the README said about what was built and when.
 
+## 0.6.0 (2026-10-22): sp-wire v0.5.0 and the mints from GitHub
+
+**Builds from GitHub with no local patch.** `Cargo.toml` names `sp-wire` at tag `v0.5.0` (it named `v0.4.0`, which has no `air-client`) and the dev-dependencies `psp-mint` at `v0.5.0`, `esp-mint` at `v0.7.0` and `fsp-mint` at `v0.6.0` (they named `v0.3.0`, `v0.5.0` and `v0.4.0`, which have no AIR listener), and the committed `Cargo.lock` follows. sp-wire 0.5.0 pins AIR at `eae5133` (3.0.0 plus the `SecretKey` export) and air_server at `v1.0.1`, which takes `air` from crates.io, so `Cargo.toml` adds `[patch.crates-io] air` at that AIR commit; the commented local patches for AIR and air_server are gone, and the README's "Setup" and "Tests" say this. No code change. Tests: 282, unchanged.
+
 ## 0.6.0, the wallet side of PSP reconciliation (AIR kind 15) (unreleased)
 
 The wallet settles a held payment, a rejected purchase with a readable payload and a credit by itself, against psp-mint's `reconcile`. Built and tested against psp-mint's real settlement and listener; not yet run on regtest.

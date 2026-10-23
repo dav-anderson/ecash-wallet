@@ -23,6 +23,11 @@
 //! [`crate::mint_info::complete_import`], and the sender's questions to the mint are
 //! asked by [`crate::mint_info::check_handoff`] and [`crate::mint_info::reclaim_handoff`].
 //!
+//! A third way in is not a handoff between wallets: the SPI's own wallet takes in the
+//! PSP its PSP mint reissued from the file the mint wrote ([`Wallet::import_psp_file`],
+//! `receive-psp FILE`). It is imported and swapped like a PSP handoff, with the file in
+//! place of the sealed string.
+//!
 //! # PSP handoff
 //!
 //! Made by a developer's service for an app's user, whose DID public key the
@@ -185,6 +190,7 @@ use secp256k1::{Keypair, PublicKey, SECP256K1, SecretKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sp_wire::ServiceDid;
+use sp_wire::psp::PspHandover;
 use sp_wire::seal::{PublicKey as DidPublicKey, SealError, SecretKey as DidSecretKey};
 
 use crate::blind::PendingOutput;
@@ -1087,6 +1093,10 @@ impl Wallet {
     }
 
     /// Record an export and take its notes out, in one write.
+    // Eight arguments, all of them different facts about one export; a struct
+    // built only to be taken apart on the next line would add a type and no
+    // clarity. It has two callers, one for each kind of export.
+    #[allow(clippy::too_many_arguments)]
     fn record_out(
         &mut self,
         kind: HandoffKind,
@@ -1499,6 +1509,54 @@ impl Wallet {
         self.import_groups(id, HandoffKind::Psp, vec![group], None, from)
     }
 
+    /// Take in the file psp-mint writes for the SPI's own wallet (a
+    /// [`sp_wire::psp::PspHandover`] in `revenue/`): the PSP a spend paid that
+    /// the mint reissued instead of burning. `bytes` are the file, `psp` this
+    /// wallet's PSP (the file names none: it is the PSP that wrote it, which the
+    /// SPI's wallet is configured for), `from` names where it came from for the
+    /// record.
+    ///
+    /// It goes the way a PSP handoff does ([`Wallet::import_psp_handoff`]): the
+    /// notes are not added as they are, a swap at the PSP mint is stored in the
+    /// same write as the import record, and the caller sends it
+    /// ([`crate::mint_info::complete_import`]). The file's secrets are known to
+    /// whoever has read it, so the swap is what makes the notes this wallet's
+    /// alone. Everything that can be refused is refused before anything is
+    /// written, and before any call to a mint: [`check_psp_file`]'s refusals,
+    /// a note on a key set the PSP no longer has live, a note already held.
+    ///
+    /// **Taking the same file in twice** adds nothing and is an error: the
+    /// import's id is the first 16 bytes of the SHA-256 of the file (so a copy
+    /// of the file is the same import), and a second import of an id this wallet
+    /// has recorded is refused with "was imported already; nothing was added".
+    /// A swap of the first import that was stored and not sent is not lost by
+    /// that: it is sent again at the next start.
+    pub fn import_psp_file(
+        &mut self,
+        bytes: &[u8],
+        psp: ServiceDid,
+        from: &str,
+    ) -> Result<Imported, WalletError> {
+        let file = check_psp_file(bytes)?;
+        let notes = file
+            .notes
+            .iter()
+            .map(|held| PayloadNote {
+                amount: held.amount,
+                keyset: held.keyset.clone(),
+                note: held.note,
+                spend_secret: held.spend_secret,
+            })
+            .collect();
+        let group = Group {
+            kind: Kind::Psp,
+            service: None,
+            mint: crate::fsp::record_of(psp),
+            notes,
+        };
+        self.import_groups(id_of(bytes), HandoffKind::Psp, vec![group], None, from)
+    }
+
     /// Take in an FSP handoff. Its FSP notes are added as they are (never
     /// swapped), and the DID secret key is in [`Imported::did_key`] for the
     /// caller to keep: the wallet does not.
@@ -1792,6 +1850,31 @@ pub(crate) fn swap_keyset(
         .unwrap_or_default()
 }
 
+/// Read the file psp-mint writes for the SPI's wallet and check what needs no
+/// wallet and no mint: it is a [`PspHandover`] (JSON of that shape, at least one
+/// note, a key set named on every note), each note's spend secret is the one for
+/// its nonce, and no note is in it twice. The error names the note (counting
+/// from 1). `receive-psp` calls this before anything else, so these mistakes are
+/// reported without a network.
+pub fn check_psp_file(bytes: &[u8]) -> Result<PspHandover, WalletError> {
+    let file = PspHandover::read(bytes).map_err(WalletError::Invalid)?;
+    let mut seen = BTreeSet::new();
+    for (at, held) in file.notes.iter().enumerate() {
+        let n = at + 1;
+        if held.spend_secret.public_key(SECP256K1) != held.note.nonce.0 {
+            return Err(WalletError::Invalid(format!(
+                "note {n} of the PSP hand-over file has a spend secret that is not the one for its nonce: the file is damaged or forged. Nothing was added"
+            )));
+        }
+        if !seen.insert(held.note.nonce.0.serialize()) {
+            return Err(WalletError::Invalid(format!(
+                "note {n} of the PSP hand-over file is the same note as an earlier one. Nothing was added"
+            )));
+        }
+    }
+    Ok(file)
+}
+
 /// Notes of one mint (and, for FSP, one service), as the import works on them.
 struct Group {
     kind: Kind,
@@ -1804,6 +1887,7 @@ struct Group {
 mod tests {
     use super::*;
     use crate::error::expect;
+    use sp_wire::psp::HandedPspNote;
     use std::fs;
     use std::path::{Path, PathBuf};
 
@@ -1837,9 +1921,9 @@ mod tests {
     fn psp_name() -> String {
         crate::fsp::record_of(the_psp())
     }
+
     /// What an FSP group's mint field holds in these tests: a name, never dialled
     /// (a handoff this wallet exports names the service's DID there).
-
     fn service(n: u8) -> ServiceDid {
         let sk = SecretKey::from_slice(&[n; 32]).unwrap();
         ServiceDid::from(sk.public_key(SECP256K1))
@@ -2183,7 +2267,7 @@ mod tests {
         let e = expect::invalid(a.export_psp_handoff(&twice, the_psp(), &to));
         assert!(e.contains("selected twice"), "{e}");
         let gone = "00".repeat(33);
-        let e = expect::unknown(a.export_psp_handoff(&[gone.clone()], the_psp(), &to));
+        let e = expect::unknown(a.export_psp_handoff(std::slice::from_ref(&gone), the_psp(), &to));
         assert!(
             e.contains(&format!("note {gone} is not in this wallet")),
             "{e}"
@@ -3253,6 +3337,153 @@ mod tests {
         assert_eq!((dropped, none), (0, None));
         assert!(b.pending_rollovers().is_empty());
         assert_eq!(b.notes().len(), 2, "the notes stay as they are");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// What psp-mint writes for the SPI's wallet: the PSP notes of `a`, as a
+    /// pretty-printed `PspHandover` (the way the mint writes it).
+    fn psp_file(a: &Wallet) -> Vec<u8> {
+        let notes = a
+            .notes()
+            .iter()
+            .filter(|n| n.kind == Kind::Psp)
+            .map(|n| HandedPspNote {
+                amount: n.amount,
+                note: n.note,
+                spend_secret: n.spend_secret,
+                keyset: KS_A.into(),
+            })
+            .collect();
+        serde_json::to_vec_pretty(&PspHandover { notes }).unwrap()
+    }
+
+    /// The wallet as it would be saved, as text, to compare before and after.
+    fn saved(w: &Wallet) -> String {
+        serde_json::to_string(&w.snapshot()).unwrap()
+    }
+
+    #[test]
+    fn a_psp_file_is_imported_and_swapped_the_way_a_psp_handoff_is() {
+        let dir = scratch("psp-file");
+        let a = funded(&dir, "a.json");
+        let bytes = psp_file(&a);
+        let mut b = open_wallet(&dir.join("b.json")).unwrap();
+        let got = b.import_psp_file(&bytes, the_psp(), "psp-mint").unwrap();
+        assert_eq!(got.kind, HandoffKind::Psp);
+        assert_eq!((got.psp_units, got.fsp_units, got.notes.len()), (7, 0, 3));
+        assert_eq!(got.psp_mints, vec![psp_name()]);
+        assert_eq!(got.psp_swaps.len(), 1);
+        // The notes are in the balance, unswapped, with one stored swap for
+        // all three, and the import is on record with where it came from.
+        let balance = b.balance();
+        assert_eq!((balance.psp, balance.unswapped_psp), (7, 7));
+        assert_eq!(b.pending_rollovers().len(), 1);
+        let record = &b.handoffs_in()[0];
+        assert_eq!(
+            (record.id.as_str(), record.from.as_str(), record.swapped),
+            (got.id.as_str(), "psp-mint", true)
+        );
+        // The id is the file's: 16 bytes of its SHA-256, in hex.
+        assert_eq!(got.id.len(), 32);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_psp_file_taken_in_twice_adds_nothing_the_second_time() {
+        let dir = scratch("psp-file-twice");
+        let a = funded(&dir, "a.json");
+        let bytes = psp_file(&a);
+        let mut b = open_wallet(&dir.join("b.json")).unwrap();
+        b.import_psp_file(&bytes, the_psp(), "psp-mint").unwrap();
+        let held = saved(&b);
+        // The same file again: the id is the file's.
+        let e = b
+            .import_psp_file(&bytes, the_psp(), "psp-mint")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("imported already; nothing was added"), "{e}");
+        assert_eq!(saved(&b), held);
+        // The same notes written another way (compact, not pretty) have another
+        // id, and the notes themselves are refused.
+        let file = PspHandover::read(&bytes).unwrap();
+        let compact = serde_json::to_vec(&file).unwrap();
+        assert_ne!(compact, bytes);
+        let e = b
+            .import_psp_file(&compact, the_psp(), "psp-mint")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("already in this wallet"), "{e}");
+        assert_eq!(saved(&b), held);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_bad_psp_file_is_refused_whole_before_anything_is_added() {
+        let dir = scratch("psp-file-bad");
+        let a = funded(&dir, "a.json");
+        let good = PspHandover::read(&psp_file(&a)).unwrap();
+        let mut b = open_wallet(&dir.join("b.json")).unwrap();
+        let before = saved(&b);
+        let refused = |b: &mut Wallet, file: &PspHandover| -> String {
+            let bytes = serde_json::to_vec(file).unwrap();
+            let e = b
+                .import_psp_file(&bytes, the_psp(), "psp-mint")
+                .unwrap_err()
+                .to_string();
+            assert_eq!(saved(b), before, "{e}");
+            e
+        };
+
+        // The second note's secret is not the one for its nonce.
+        let mut forged = good.clone();
+        forged.notes[1].spend_secret = SecretKey::new(&mut rand::rngs::OsRng);
+        let e = refused(&mut b, &forged);
+        assert!(
+            e.contains("note 2 of the PSP hand-over file has a spend secret that is not the one for its nonce"),
+            "{e}"
+        );
+        // The third note is the first one again.
+        let mut twice = good.clone();
+        twice.notes[2] = twice.notes[0].clone();
+        let e = refused(&mut b, &twice);
+        assert!(
+            e.contains("note 3 of the PSP hand-over file is the same note as an earlier one"),
+            "{e}"
+        );
+        // A note with no key set.
+        let mut bare = good.clone();
+        bare.notes[0].keyset = String::new();
+        let e = refused(&mut b, &bare);
+        assert!(
+            e.contains("note 1 of the PSP hand-over file names no keyset"),
+            "{e}"
+        );
+        // No notes, and something that is not the file.
+        let e = refused(&mut b, &PspHandover { notes: vec![] });
+        assert!(e.contains("holds no notes"), "{e}");
+        let e = b
+            .import_psp_file(b"[]", the_psp(), "psp-mint")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("not a PSP hand-over file"), "{e}");
+        assert_eq!(saved(&b), before);
+
+        // Notes on a key set the PSP no longer has live, once the wallet knows
+        // which are.
+        b.update(|d| {
+            d.live_keysets
+                .insert(psp_name(), ("1111111111111111".into(), None));
+            Ok(())
+        })
+        .unwrap();
+        let known = saved(&b);
+        let bytes = serde_json::to_vec(&good).unwrap();
+        let e = b
+            .import_psp_file(&bytes, the_psp(), "psp-mint")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("no longer has live"), "{e}");
+        assert_eq!(saved(&b), known);
         fs::remove_dir_all(&dir).unwrap();
     }
 }

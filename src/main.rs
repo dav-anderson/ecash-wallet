@@ -66,6 +66,20 @@ ecash-wallet [--wallet FILE] [--config FILE] [--regtest|--signet|--testnet] <com
       the same terms. ESP notes are powers of two: the wallet splits the amount
       (and the change) into the fewest of them. --amounts picks other sizes,
       each a power of two, adding up to the same total.
+  --version, -V
+      Print ecash-wallet's version, then the version of sp-wire, mint-core and
+      air that Cargo.lock locked for this build, one `name version` per line.
+      It reads no wallet and no settings and changes nothing.
+  receive-psp FILE
+      As the SPI's own wallet: take in the PSP that psp-mint reissued to it
+      instead of burning (`revenue/<request hash>.json` in the PSP mint's data
+      folder, a file with the notes' spend secrets). It is imported and
+      swapped at the PSP mint for notes only this wallet knows, the way a PSP
+      handoff is, so the file is worth nothing afterwards. The same file taken
+      in twice is refused (\"imported already\") and adds nothing. Prints
+      `received N PSP in M note(s)`, then the swap's result. Needs air.server
+      and air.host for the swap; if the PSP cannot be reached the PSP is in the
+      balance, unswapped, and the swap is sent again at the next start.
   receive FILE
       As the service: take the ESP that fsp-mint's `export-esp` wrote (a file
       per redeemable-after day, with the notes' spend secrets) into this wallet,
@@ -1059,10 +1073,10 @@ fn redeem(wallet: &mut Wallet, mut args: Args, start: Startup) -> Result<(), Wal
     }
     let mut first_error = None;
     for b in built {
-        if let Err(e) = send_redemption(wallet, Some(&key), b.id) {
-            if let Some(line) = later_failure_line(&mut first_error, e) {
-                eprintln!("{line}");
-            }
+        if let Err(e) = send_redemption(wallet, Some(&key), b.id)
+            && let Some(line) = later_failure_line(&mut first_error, e)
+        {
+            eprintln!("{line}");
         }
     }
     match first_error {
@@ -1369,12 +1383,12 @@ fn handoff_deliver(
 }
 
 fn check_out_file(out: &Option<String>) -> Result<(), WalletError> {
-    if let Some(path) = out {
-        if std::path::Path::new(path).exists() {
-            return Err(WalletError::Invalid(format!(
-                "{path} exists; not overwritten"
-            )));
-        }
+    if let Some(path) = out
+        && std::path::Path::new(path).exists()
+    {
+        return Err(WalletError::Invalid(format!(
+            "{path} exists; not overwritten"
+        )));
     }
     Ok(())
 }
@@ -1547,6 +1561,42 @@ fn handoff_import(wallet: &mut Wallet, mut args: Args, start: Startup) -> Result
         println!(
             "Next: fetch your wallet from the AIR, then run `merge FILE` on the copy you fetched."
         );
+    }
+    Ok(())
+}
+
+/// `receive-psp FILE`: take in the file psp-mint wrote for the SPI's own wallet.
+/// The file is read and checked as far as it can be without the wallet
+/// ([`ecash_wallet::handoff::check_psp_file`]) before the startup steps use the
+/// network; the import then checks it against the wallet and stores the swap
+/// ([`Wallet::import_psp_file`]), and the swap at the PSP is sent like a PSP
+/// handoff's. A file taken in before is refused and nothing changes.
+fn receive_psp(wallet: &mut Wallet, args: Args, start: Startup) -> Result<(), WalletError> {
+    let rest = args.rest();
+    let [path] = rest.as_slice() else {
+        return Err(takes("receive-psp", "one file"));
+    };
+    let bytes = std::fs::read(path)?;
+    let named = |e: WalletError| match e {
+        WalletError::Invalid(why) => WalletError::Invalid(format!("{path}: {why}")),
+        other => other,
+    };
+    ecash_wallet::handoff::check_psp_file(&bytes).map_err(named)?;
+    start.run(wallet);
+    let got = wallet
+        .import_psp_file(&bytes, air_settings().psp_did(), "psp-mint")
+        .map_err(named)?;
+    println!(
+        "received {} PSP in {} note(s) (handoff {}, swapping at the mint)",
+        got.psp_units,
+        got.notes.len(),
+        got.id
+    );
+    for w in &got.warnings {
+        eprintln!("warning: {w}");
+    }
+    for line in ecash_wallet::mint_info::complete_import(wallet, &air_settings(), &got) {
+        println!("{line}");
     }
     Ok(())
 }
@@ -1931,6 +1981,13 @@ fn config_command(loaded: &config::Loaded, args: Args) -> Result<(), WalletError
 }
 
 fn run(raw: Vec<String>) -> Result<(), WalletError> {
+    // `--version` reads no wallet and no settings and touches nothing.
+    if raw.iter().any(|a| a == "--version" || a == "-V") {
+        for line in ecash_wallet::version::lines() {
+            println!("{line}");
+        }
+        return Ok(());
+    }
     let mut args = Args(raw, String::new());
     let wallet_flag = args.flag("--wallet")?;
     let config_flag = args.flag("--config")?;
@@ -1968,7 +2025,8 @@ fn run(raw: Vec<String>) -> Result<(), WalletError> {
         "receive" => receive(&mut wallet, args, start),
         "redeem" => redeem(&mut wallet, args, start),
         "balance" => balance(&mut wallet, args, start),
-        "send-psp" | "receive-psp" | "sent" => Err(WalletError::Invalid(format!(
+        "receive-psp" => receive_psp(&mut wallet, args, start),
+        "send-psp" | "sent" => Err(WalletError::Invalid(format!(
             "`{command}` was removed. A PSP handoff replaces it: `handoff export-psp --to DID --psp N` to give PSP, `handoff import` to take it, `handoff check ID` and `handoff reclaim ID` for what `sent --check` and `sent --reclaim` did."
         ))),
         "handoff" => handoff(&mut wallet, args, start),

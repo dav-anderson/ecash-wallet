@@ -52,6 +52,7 @@ pub mod esp;
 pub mod esp_replies;
 pub mod fsp;
 pub mod handoff;
+pub mod lockfile;
 pub mod merge;
 pub mod mint_info;
 pub mod psp;
@@ -60,6 +61,7 @@ pub mod rotate;
 pub mod split;
 pub mod store;
 pub mod transfer;
+pub mod version;
 
 pub use error::WalletError;
 pub use store::{Balance, EspLimits, Kind, Wallet};

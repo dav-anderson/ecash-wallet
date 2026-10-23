@@ -100,8 +100,9 @@ use crate::store::PendingAirRequest;
 
 /// What one run of a request came to, when it did not fail.
 enum Ended {
-    /// Answered and checked.
-    Verified(Verified),
+    /// Answered and checked. Boxed: a verified reply is far larger than the other
+    /// variants.
+    Verified(Box<Verified>),
     /// The reply was too old to be a statement about now (only a kept request
     /// can be): the request is dropped and a new one is made.
     Stale,
@@ -260,7 +261,7 @@ fn run_request(
     match result {
         Ok(verified) => {
             wallet.end_air_request(&request_id)?;
-            Ok(Ended::Verified(verified))
+            Ok(Ended::Verified(Box::new(verified)))
         }
         Err(AskError::Verify(VerifyError::Stale { .. })) if resumed => {
             wallet.end_air_request(&request_id)?;
@@ -372,14 +373,14 @@ pub fn call_with_body(
     if let Some(pending) = kept {
         let flight = flight_of(&pending, body)?;
         match run_request(wallet, &cfg, party, flight, pending.created_at, true)? {
-            Ended::Verified(v) => return Ok(v),
+            Ended::Verified(v) => return Ok(*v),
             Ended::NoReply(message) => return Err(WalletError::Mint(message)),
             Ended::Stale => {} // fall through to a new request
         }
     }
     let flight = InFlight::with_body(kind, body.to_vec());
     match run_request(wallet, &cfg, party, flight, addr::now_secs(), false)? {
-        Ended::Verified(v) => Ok(v),
+        Ended::Verified(v) => Ok(*v),
         Ended::NoReply(message) => Err(WalletError::Mint(message)),
         // Only a kept request is ever dropped as stale.
         Ended::Stale => Err(WalletError::Mint(format!(
@@ -391,8 +392,9 @@ pub fn call_with_body(
 
 /// What a call with a key of its own came to.
 pub enum Sent {
-    /// The mint answered, and the reply passed the checks.
-    Answered(Verified),
+    /// The mint answered, and the reply passed the checks. Boxed: a verified reply
+    /// is far larger than the other variant.
+    Answered(Box<Verified>),
     /// Every try passed with no reply (the message says how many). The request is
     /// kept in the wallet file. For a PSP reconciliation this is how a refused
     /// request looks: the PSP answers an accepted request only.
@@ -438,7 +440,7 @@ pub fn call_with_key(
     let flight = InFlight {
         kind,
         request_id: addr::random_id(),
-        r: r.clone(),
+        r: *r,
         slots: Vec::new(),
         body: body.to_vec(),
     };

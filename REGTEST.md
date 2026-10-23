@@ -3,7 +3,7 @@
 The wallet's end-to-end runs against a real Bitcoin Core regtest node, with the PSP, ESP and FSP mints. Steps 0 to 49, in four parts:
 
 1. Purchase to ESP (steps 0 to 12): buy PSP, claim it, exchange it for ESP.
-2. Restart on the new build (step 13). Steps 14 to 20, the stand-alone hand-over, receive and transfer, were removed with those commands; the service now gets its ESP through FSP issue (step 26). Step numbers are not reused.
+2. Restart on the new build (step 13: a restart, which on an SPI is a brief downtime). Steps 14 to 20, the stand-alone hand-over, receive and transfer, were removed with those commands; the service now gets its ESP through FSP issue (step 26). Step numbers are not reused.
 3. Redemption and FSP (steps 21 to 37): the service's ESP through the FSP mint, redeem, decline, pay, the size ceiling, FSP issue and pay.
 4. Refusals, splitting, kept ESP and rotation (steps 38 to 49): spent notes, a request split over a small ceiling, key rotation on ESP and FSP, and the cleanup.
 
@@ -257,7 +257,7 @@ There is no change line, because the 1 PSP note is exactly the amount asked for.
 - If `exchange` times out, run it again with `--resume <id>` (the id was printed). It sends the same request and gets the same answer, and nothing is burned twice.
 - The PSP writes each payer's signatures to a record only that payer can find, so `claim-psp` reads its own purchases' records and no one else's. Any wallet command also picks up a delivery when it starts, so the line above may be printed by the command that ran first, and `claim-psp` then says there is nothing pending.
 - A payment the PSP holds (paid, but short beyond its reconciliation target) or rejects is delivered too, so the wallet shows `the PSP is holding the payment` or `the PSP rejected it`, with what was paid and the time it stays open until, and keeps the purchase and its key. The wallet settles it by itself at every start, right after the pickup, with a reconciliation request (AIR kind 15) built from the rules in the PSP's record, and prints what came of it (this was built after the runs in this file and has not been run on regtest). When the time passes with the payment still open, the PSP forfeits it and the next wallet command says `The PSP forfeited the payment: the funds are lost`, with the amount, and deletes the purchase and the key. `buy-psp` also prints `ONE-TIME USE`: pay a payload once. The PSP's window is `PSP_RECONCILIATION_WINDOW_DAYS` (14); set `1` on the PSP to see it close sooner.
-- Stop the servers with Ctrl-C in T2 and T3, and the node with `$CLI stop`.
+- Test teardown: stop the servers with Ctrl-C in T2 and T3, and the node with `$CLI stop`. (Stopping is for this regtest only; on an SPI a mint is stopped only for an upgrade or for a setting that needs a restart, each a brief downtime that `spi upgrade` or `spi restart` warns about and asks you to confirm.)
 
 ## Regtest, restart on the new build
 
@@ -265,7 +265,9 @@ This continues the run above, with the app wallet still holding 5 PSP of ESP (50
 
 The app wallet is `$ECASH_WALLET_FILE` (`/tmp/wallet-regtest.json`, exported in step 5 and used so far in T4). The service has its own wallet file, set per command with `ECASH_WALLET_FILE=...` in front.
 
-### 13. Restart both mints on the new build (T2, T3)
+### 13. Restart both mints on the new build (T2, T3) (test-only setup)
+
+**This step is test-only.** The mints here are run by hand with `cargo run`, and this step stops each one and starts the new build so the run shows a start on existing data. On an SPI the same restart is a **brief downtime**, done after a warning and a confirmation: a new build goes in with `spi upgrade`, and a setting that needs a restart is applied with `spi restart psp-mint` (or `esp-mint`). Either way the old process stops and only then does the new one start, because one process holds a mint's data (sled's exclusive lock). While the mint is down, the wallets' AIR requests wait in the AIR server's mailbox slots and are answered when it is back. A change to a setting that reloads live needs no restart (`kill -HUP` on the mint, or `systemctl reload`, or `spi reload`: psp-mint and esp-mint read their settings file again and keep serving); one that needs a restart (each mint's README marks every setting "reloads live" or "needs a restart") keeps its running value on a reload, and is named in the log, until the mint is restarted.
 
 The PSP now keeps the memo of each burn and has `POST /burns`, and the ESP mint has the transfer call and asks the PSP for the memo. Restart the PSP first, then the ESP mint. Their data in `~/.psp-mint` and `~/.esp-mint` is kept.
 
@@ -664,7 +666,7 @@ Expected: `esp held 400000000000`, `mature now 200000000000`, then a redemption 
 
 ### 44. ESP key rotation: make the mint rotate (T1, T3)
 
-The settings are `rotation.activation_hours` (from the first issue to the first rotation) and `rotation.period_hours`. Both are restart-only, with a minimum of 1 hour for the period. To see a rotation without waiting, give the mint a one-hour period and back-date its recorded first issue by 90 minutes. First make a test wallet from the year-out ESP exported in step 42, and keep a copy of it. These notes are signed by the key set that is current now (T4):
+**This step is test-only setup.** Backing the first issue up by 90 minutes and stopping the mint to do it is a fixture to see a rotation without waiting, not an operation; on an SPI nothing stops a mint for it. The settings are `rotation.activation_hours` (from the first issue to the first rotation) and `rotation.period_hours`. Both **need a restart** (on an SPI that is a brief downtime, applied with `spi restart` after a warning and a confirmation; `spi reload` names the change and waits), with a minimum of 1 hour for the period. To see a rotation without waiting, give the mint a one-hour period and back-date its recorded first issue by 90 minutes. First make a test wallet from the year-out ESP exported in step 42, and keep a copy of it. These notes are signed by the key set that is current now (T4):
 
 ```
 ECASH_WALLET_FILE=/tmp/wallet-rot.json cargo run -q -- --regtest receive /tmp/fsp-export/esp-21107-<time>.json

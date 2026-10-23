@@ -14,6 +14,7 @@ use mint_types::{Nonce, Note};
 use rand::rngs::OsRng;
 use secp256k1::{Keypair, SECP256K1};
 use sp_wire::ServiceDid;
+use sp_wire::psp::{HandedPspNote, PspHandover};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -153,7 +154,7 @@ fn the_removed_commands_say_what_replaced_them() {
     let dir = scratch("removed");
     let wallet = wallet_with_notes(&dir);
     let before = std::fs::read(&wallet).ok();
-    for command in ["send-psp", "receive-psp", "sent"] {
+    for command in ["send-psp", "sent"] {
         refused(
             &wallet,
             &before,
@@ -899,4 +900,94 @@ fn a_usage_error_is_said_first_with_nothing_asked_of_the_network_before_it() {
             "{args:?} changed the wallet"
         );
     }
+}
+
+/// A PSP hand-over file with one note of 4 PSP, as psp-mint writes it. The
+/// note's spend secret is its nonce's unless `forged`.
+fn psp_file(dir: &Path, name: &str, forged: bool) -> PathBuf {
+    let kp = Keypair::new(SECP256K1, &mut OsRng);
+    let file = PspHandover {
+        notes: vec![HandedPspNote {
+            amount: 4,
+            note: Note {
+                nonce: Nonce(kp.public_key()),
+                signature: Keypair::new(SECP256K1, &mut OsRng).public_key(),
+            },
+            spend_secret: if forged {
+                Keypair::new(SECP256K1, &mut OsRng).secret_key()
+            } else {
+                kp.secret_key()
+            },
+            keyset: "ab".repeat(8),
+        }],
+    };
+    let path = dir.join(name);
+    std::fs::write(&path, serde_json::to_vec_pretty(&file).unwrap()).unwrap();
+    path
+}
+
+#[test]
+fn receive_psp_refuses_a_missing_a_bad_and_a_forged_file_before_any_mint_is_asked() {
+    let dir = scratch("receive-psp");
+    let wallet = wallet_with_notes(&dir);
+    let before = std::fs::read(&wallet).ok();
+    refused(
+        &wallet,
+        &before,
+        &["receive-psp"],
+        &["receive-psp takes one file"],
+    );
+    let missing = dir.join("none.json");
+    refused(
+        &wallet,
+        &before,
+        &["receive-psp", missing.to_str().unwrap()],
+        &["No such file"],
+    );
+    let junk = dir.join("junk.json");
+    std::fs::write(&junk, "{}").unwrap();
+    refused(
+        &wallet,
+        &before,
+        &["receive-psp", junk.to_str().unwrap()],
+        &["junk.json: not a PSP hand-over file"],
+    );
+    let forged = psp_file(&dir, "forged.json", true);
+    refused(
+        &wallet,
+        &before,
+        &["receive-psp", forged.to_str().unwrap()],
+        &[
+            "forged.json: note 1 of the PSP hand-over file has a spend secret that is not the one for its nonce",
+            "Nothing was added",
+        ],
+    );
+}
+
+#[test]
+fn version_names_the_wallet_and_its_libraries_and_reads_and_writes_nothing() {
+    let dir = scratch("version");
+    let wallet = dir.join("wallet.json");
+    let long = run(&wallet, &["--version"]);
+    let short = run(&wallet, &["-V"]);
+    assert!(long.ok && short.ok, "{} {}", long.stderr, short.stderr);
+    assert_eq!(long.stdout, short.stdout);
+    assert_eq!(long.stderr, "");
+    let lines: Vec<&str> = long.stdout.lines().collect();
+    assert_eq!(
+        lines[0],
+        format!("ecash-wallet {}", env!("CARGO_PKG_VERSION"))
+    );
+    for line in &lines[1..] {
+        let (name, version) = line.split_once(' ').expect(line);
+        assert!(
+            !name.is_empty() && version.split('.').count() == 3,
+            "{line}"
+        );
+    }
+    assert!(
+        lines.iter().any(|l| l.starts_with("sp-wire ")),
+        "no sp-wire line in {lines:?}"
+    );
+    assert!(!wallet.exists(), "--version made a wallet file");
 }

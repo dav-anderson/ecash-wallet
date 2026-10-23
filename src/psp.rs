@@ -745,10 +745,7 @@ fn drop_air_request(d: &mut WalletData, reply_secret: &str) {
 pub(crate) struct ToSend {
     pub body: Vec<u8>,
     pub key: DidSecretKey,
-    pub psp: ServiceDid,
     pub keyset: String,
-    pub attempts: u32,
-    pub max_attempts: u32,
 }
 
 impl Wallet {
@@ -1241,13 +1238,13 @@ impl Wallet {
                 t.state.attempts, rules.max_attempts, MAX_BUILT_REQUESTS
             )));
         }
-        if let Some(saved) = &t.state.request {
-            if keyset_is_live(keysets, &saved.keyset) {
-                return Err(WalletError::Invalid(format!(
-                    "purchase {id}: the saved request names keyset {}, which is still live. It is sent again as it is, never rebuilt",
-                    saved.keyset
-                )));
-            }
+        if let Some(saved) = &t.state.request
+            && keyset_is_live(keysets, &saved.keyset)
+        {
+            return Err(WalletError::Invalid(format!(
+                "purchase {id}: the saved request names keyset {}, which is still live. It is sent again as it is, never rebuilt",
+                saved.keyset
+            )));
         }
         let keyset = keysets.current.clone();
         let keys = keys_of(&keyset, keysets)?;
@@ -1450,7 +1447,7 @@ impl Wallet {
     pub(crate) fn reconcile_to_send(&self, id: &str) -> Result<ToSend, WalletError> {
         let t = target_of(self.data(), id)
             .ok_or_else(|| WalletError::Unknown(format!("no open payment {id}")))?;
-        let (Some(rules), Some(saved)) = (t.rules.as_ref(), t.state.request.as_ref()) else {
+        let (Some(_), Some(saved)) = (t.rules.as_ref(), t.state.request.as_ref()) else {
             return Err(WalletError::Unknown(format!(
                 "no reconciliation request is saved for purchase {id}"
             )));
@@ -1458,15 +1455,17 @@ impl Wallet {
         let corrupt = |what: &str| {
             WalletError::Corrupt(format!("the saved request of purchase {id} has {what}"))
         };
+        let body = hex::decode(&saved.body).map_err(|_| corrupt("a body that is not hex"))?;
+        let key = addr::secret_from_hex(&t.reply_secret)
+            .map_err(|_| corrupt("a key that is not valid"))?;
+        // The PSP key is not sent with the request, but a purchase sealed to a
+        // key that does not parse is still refused here, as it always was.
+        ServiceDid::parse(&t.mint_did_pubkey)
+            .map_err(|_| corrupt("a PSP key that is not valid"))?;
         Ok(ToSend {
-            body: hex::decode(&saved.body).map_err(|_| corrupt("a body that is not hex"))?,
-            key: addr::secret_from_hex(&t.reply_secret)
-                .map_err(|_| corrupt("a key that is not valid"))?,
-            psp: ServiceDid::parse(&t.mint_did_pubkey)
-                .map_err(|_| corrupt("a PSP key that is not valid"))?,
+            body,
+            key,
             keyset: saved.keyset.clone(),
-            attempts: t.state.attempts,
-            max_attempts: rules.max_attempts,
         })
     }
 

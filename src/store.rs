@@ -726,10 +726,10 @@ fn track(before: &WalletData, after: &mut WalletData) {
         *after.departed.entry(id.clone()).or_default() += 1;
     }
     for id in is.difference(&was) {
-        if let Some(&left) = after.departed.get(id) {
-            if after.returned.get(id).copied().unwrap_or(0) < left {
-                after.returned.insert(id.clone(), left);
-            }
+        if let Some(&left) = after.departed.get(id)
+            && after.returned.get(id).copied().unwrap_or(0) < left
+        {
+            after.returned.insert(id.clone(), left);
         }
     }
     let was = pending_ids(before);
@@ -748,10 +748,10 @@ pub(crate) fn has_departed(d: &WalletData, id: &str) -> bool {
 }
 
 fn write_atomic(path: &Path, data: &WalletData) -> Result<(), WalletError> {
-    if let Some(dir) = path.parent() {
-        if !dir.as_os_str().is_empty() {
-            fs::create_dir_all(dir)?;
-        }
+    if let Some(dir) = path.parent()
+        && !dir.as_os_str().is_empty()
+    {
+        fs::create_dir_all(dir)?;
     }
     let tmp = path.with_extension("json.tmp");
     let text = serde_json::to_string_pretty(data)

@@ -220,7 +220,7 @@ pub fn psp_pickup(
         .address(air)
         .map_err(WalletError::Invalid)?;
     let server = ServerRef { name, host };
-    let addresses: Vec<_> = jobs.iter().map(|j| j.address.clone()).collect();
+    let addresses: Vec<_> = jobs.iter().map(|j| j.address).collect();
     let read_secs = air.timeout_secs;
     let found = block_on_new_runtime(|| async {
         let client = client::connect(&server).await.map_err(|e| e.0)?;

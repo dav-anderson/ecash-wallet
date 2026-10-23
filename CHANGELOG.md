@@ -2,6 +2,14 @@
 
 ecash-wallet 0.1.2 builds on `sp-wire` 0.2.0 (wire version 2) and the 0.1.2 mints. 0.1.1 moved the types to `sp-wire`, added the wire-version check and removed the mint crates from the library. 0.1.0 is the first release. Nothing was recorded per version before this file; the section below is everything the README said about what was built and when.
 
+## 0.6.1 (unreleased): the SPI's own wallet (SPI gaps, ROADMAP item 20)
+
+- **New: `receive-psp FILE`** (`handoff::check_psp_file` and `Wallet::import_psp_file` in `src/handoff.rs`; `receive_psp` in `src/main.rs`). Takes in the file psp-mint writes for the SPI's wallet when it reissues paid PSP instead of burning it. It reuses the PSP handoff import: the notes are swapped at the PSP (`air.psp_did`) for notes only this wallet knows, the id of the import is the first 16 bytes of the file's SHA-256, and a second import of the same file is refused and changes nothing. The file is read and its secrets are checked before the startup steps use the network. The name was `receive-psp` of the removed `psp1` token before; it is now this command and is no longer in the removed-commands message.
+- **New: `--version` / `-V`**: the wallet's version and the sp-wire, mint-core and air versions in `Cargo.lock` (`build.rs`, `src/lockfile.rs`, `src/version.rs`). It reads no wallet and no settings.
+- **Changed: `sp-wire` is `v0.5.1`** (it has `PspHandover`). `Cargo.lock` needs `cargo update -p sp-wire`. `Cargo.toml` is 0.6.1.
+- **Docs:** REGTEST.md labels the stop-and-start steps (13, 44) as test-only setup and names the reload and `spi upgrade` as what an SPI does.
+- **Tests (none run: no cargo where this was written):** in `src/handoff.rs`, `a_psp_file_is_imported_and_swapped_the_way_a_psp_handoff_is`, `a_psp_file_taken_in_twice_adds_nothing_the_second_time`, `a_bad_psp_file_is_refused_whole_before_anything_is_added`; in `tests/cli.rs`, `receive_psp_refuses_a_missing_a_bad_and_a_forged_file_before_any_mint_is_asked` and `version_names_the_wallet_and_its_libraries_and_reads_and_writes_nothing`; the lockfile reader's test in `src/lockfile.rs`. `the_removed_commands_say_what_replaced_them` no longer lists `receive-psp`.
+
 ## 0.6.0 (2026-10-22): sp-wire v0.5.0 and the mints from GitHub
 
 **Builds from GitHub with no local patch.** `Cargo.toml` names `sp-wire` at tag `v0.5.0` (it named `v0.4.0`, which has no `air-client`) and the dev-dependencies `psp-mint` at `v0.5.0`, `esp-mint` at `v0.7.0` and `fsp-mint` at `v0.6.0` (they named `v0.3.0`, `v0.5.0` and `v0.4.0`, which have no AIR listener), and the committed `Cargo.lock` follows. sp-wire 0.5.0 pins AIR at `eae5133` (3.0.0 plus the `SecretKey` export) and air_server at `v1.0.1`, which takes `air` from crates.io, so `Cargo.toml` adds `[patch.crates-io] air` at that AIR commit; the commented local patches for AIR and air_server are gone, and the README's "Setup" and "Tests" say this. No code change. Tests: 282, unchanged.

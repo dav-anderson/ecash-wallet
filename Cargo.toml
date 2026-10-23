@@ -1,8 +1,8 @@
 [package]
 name = "ecash-wallet"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.93"
 license = "MIT"
 description = "Wallet library for PSP, ESP and FSP Service Points, with a thin command line"
 
@@ -23,7 +23,7 @@ secp256k1 = { version = "0.30", default-features = false, features = ["global-co
 # `air-client`, the PSP's and the ESP's calls over AIR. `air-client` needs
 # `air_server` (see the [patch.crates-io] at the end).
 # The wallet does not depend on the mint crates.
-sp-wire = { git = "https://github.com/dav-anderson/sp-wire.git", tag = "v0.5.0", features = ["seal", "air-request", "air-client"] }
+sp-wire = { git = "https://github.com/dav-anderson/sp-wire.git", tag = "v0.5.1", features = ["seal", "air-request", "air-client"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # The settings file (config.toml).

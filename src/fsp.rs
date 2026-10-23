@@ -585,7 +585,7 @@ impl Wallet {
             return Err(WalletError::Invalid("pay at least 1 FSP unit".into()));
         }
         let mut free = self.free_fsp(&service);
-        free.sort_by(|a, b| b.amount.cmp(&a.amount));
+        free.sort_by_key(|n| std::cmp::Reverse(n.amount));
         let mut chosen = Vec::new();
         let mut sum = 0u128;
         for n in free {
@@ -686,10 +686,10 @@ impl Wallet {
             if t.redeemable_after_day <= today {
                 s.mature_now += units;
             }
-            if let Some((d, sum)) = s.by.as_mut() {
-                if t.redeemable_after_day <= *d {
-                    *sum += units;
-                }
+            if let Some((d, sum)) = s.by.as_mut()
+                && t.redeemable_after_day <= *d
+            {
+                *sum += units;
             }
             *s.months
                 .entry(month_of(t.redeemable_after_day))

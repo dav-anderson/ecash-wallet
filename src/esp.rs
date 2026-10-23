@@ -122,6 +122,9 @@ fn pick_cover(amounts: &[u64], need: u64) -> Option<Vec<usize>> {
     }
     let mut budget = SEARCH_BUDGET;
     let mut current = Vec::new();
+    // The state of one recursive search: eight values that change together at
+    // every call. A struct would have to be rebuilt at each of the calls.
+    #[allow(clippy::too_many_arguments)]
     fn walk(
         amounts: &[u64],
         suffix: &[u128],
@@ -206,12 +209,12 @@ impl Wallet {
                         "an exchange needs at least one ESP note".into(),
                     ));
                 }
-                if let Some(max) = limit {
-                    if list.len() > max {
-                        return Err(WalletError::Invalid(format!(
-                            "the mint takes at most {max} ESP notes in one exchange (its exchange.max_items)"
-                        )));
-                    }
+                if let Some(max) = limit
+                    && list.len() > max
+                {
+                    return Err(WalletError::Invalid(format!(
+                        "the mint takes at most {max} ESP notes in one exchange (its exchange.max_items)"
+                    )));
                 }
                 if list.contains(&0) {
                     return Err(WalletError::Invalid("an ESP note cannot be zero".into()));
@@ -254,12 +257,12 @@ impl Wallet {
         // terms, split into powers of two like the rest.
         let change_esp = u128::from(psp_spent - psp_units) * u128::from(ESP_PER_PSP);
         amounts.extend(crate::split::split(change_esp)?);
-        if let Some(max) = limit {
-            if chosen.len() > max || amounts.len() > max {
-                return Err(WalletError::Invalid(format!(
-                    "that would take more than the {max} PSP notes or ESP notes the mint takes in one exchange (its exchange.max_items)"
-                )));
-            }
+        if let Some(max) = limit
+            && (chosen.len() > max || amounts.len() > max)
+        {
+            return Err(WalletError::Invalid(format!(
+                "that would take more than the {max} PSP notes or ESP notes the mint takes in one exchange (its exchange.max_items)"
+            )));
         }
 
         let outputs: Vec<PendingOutput> = amounts.iter().map(|&a| PendingOutput::new(a)).collect();

@@ -46,9 +46,8 @@ use esp_mint::psp_client::HttpPsp;
 use esp_mint::queue::Queue;
 use mint_core::MintLogic;
 use mint_core::keygen;
+use mint_core::state::AppState;
 use mint_core::store::Store;
-use mint_server::api::{MeltRequest, MeltResponse};
-use mint_server::state::AppState;
 use mint_types::{Amount, BlindNonce, MintOutput, Nonce, Note, gen_denominations};
 use rand::rngs::OsRng;
 use secp256k1::{Keypair, SECP256K1, SecretKey};
@@ -56,6 +55,7 @@ use sp_wire::air_request::addr::{self, reply_secret, seal_to, shared_wallet};
 use sp_wire::air_request::client::{self, ServerRef, block_on_new_runtime};
 use sp_wire::air_request::envelope::{STATUS_ANSWERED, WireRequest, build_reply};
 use sp_wire::air_request::{KIND_EXCHANGE, KIND_FEES, KIND_MINT_INFO, MintInfo, Served};
+use sp_wire::melt::{MeltRequest, MeltResponse};
 use sp_wire::seal::SecretKey as DidKey;
 use sp_wire::{ServiceDid, WIRE_VERSION};
 
@@ -293,7 +293,6 @@ fn start_esp(dir: &Path, config: Config, psp_url: Option<&str>) -> Esp {
     let psp_logic = MintLogic::new(cfg, Store::open(&dir.join("psp-db")).unwrap());
     let psp = Arc::new(AppState {
         logic: Mutex::new(psp_logic),
-        admin_token: String::new(),
     });
     let memos: Memos = Arc::new(Mutex::new(BTreeMap::new()));
     let psp_app = Router::new()

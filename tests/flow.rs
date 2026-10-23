@@ -19,7 +19,7 @@ use ecash_wallet::{Kind, WalletError};
 use esp_mint::config::Config as EspConfig;
 use esp_mint::exchange::{Burn, Psp};
 use esp_mint::terms::Terms;
-use mint_server::state::AppState;
+use mint_core::state::AppState;
 use mint_types::{Amount, MintInput, Nonce};
 use psp_mint::scan::Received;
 use psp_mint::settle::Settlement;

@@ -38,7 +38,7 @@ use esp_mint::ledger::Movements;
 use esp_mint::responses::Entry;
 use esp_mint::server::EspState;
 use esp_mint::terms::Terms;
-use mint_server::state::AppState;
+use mint_core::state::AppState;
 use mint_types::{Amount, BlindNonce, MintInput, MintOutput, Nonce, Note};
 use psp_mint::records::{Records, SharedRecords};
 use psp_mint::rotation::{Rollovers, Rotor};

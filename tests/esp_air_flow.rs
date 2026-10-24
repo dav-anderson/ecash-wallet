@@ -130,7 +130,7 @@ fn start_serving(server: &ServerRef, key: &DidKey, dir: &Path, serve: Arc<Serve>
         timeout_secs: 10,
         state_dir: dir.to_path_buf(),
     };
-    let key = key.clone();
+    let key = *key;
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let thread = thread::Builder::new()
         .name("test-air-listener".into())

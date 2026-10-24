@@ -19,7 +19,7 @@
 
 mod common;
 
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
@@ -70,7 +70,7 @@ fn air_settings(server: &ServerRef, did: &ServiceDid, wait: u64, attempts: u32) 
 type Info = Arc<dyn Fn() -> MintInfo + Send + Sync>;
 
 /// A PSP mint (the shared fixture), in `dir`.
-fn psp(dir: &PathBuf) -> PspMint {
+fn psp(dir: &Path) -> PspMint {
     PspMint::open(dir)
 }
 
@@ -86,7 +86,7 @@ struct Listener {
     thread: Option<JoinHandle<Result<(), String>>>,
 }
 
-fn start_listener(server: &ServerRef, key: &SecretKey, dir: &PathBuf, info: Info) -> Listener {
+fn start_listener(server: &ServerRef, key: &SecretKey, dir: &Path, info: Info) -> Listener {
     start_serving(
         server,
         key,
@@ -95,19 +95,14 @@ fn start_listener(server: &ServerRef, key: &SecretKey, dir: &PathBuf, info: Info
     )
 }
 
-fn start_serving(
-    server: &ServerRef,
-    key: &SecretKey,
-    dir: &PathBuf,
-    serve: Arc<Serve>,
-) -> Listener {
+fn start_serving(server: &ServerRef, key: &SecretKey, dir: &Path, serve: Arc<Serve>) -> Listener {
     let settings = Settings {
         server: server.clone(),
         held_reads: 16,
         timeout_secs: 10,
-        state_dir: dir.clone(),
+        state_dir: dir.to_path_buf(),
     };
-    let key = key.clone();
+    let key = *key;
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let thread = thread::Builder::new()
         .name("test-air-listener".into())
@@ -157,7 +152,7 @@ impl Drop for Listener {
     }
 }
 
-fn wait_for_next(dir: &PathBuf, want: u32) {
+fn wait_for_next(dir: &Path, want: u32) {
     let until = Instant::now() + Duration::from_secs(10);
     loop {
         let now = air_listener::read_next(dir).unwrap();
@@ -181,14 +176,14 @@ fn put(server: &ServerRef, key: &SecretKey, bytes: Vec<u8>) {
     assert!(matches!(put, client::Put::Created(_)));
 }
 
-fn open_wallet(dir: &PathBuf) -> Wallet {
+fn open_wallet(dir: &Path) -> Wallet {
     common::open_wallet(&dir.join("wallet.json")).unwrap()
 }
 
 /// A wallet file that already holds a request in flight for `did`, as if an
 /// earlier run had written it and then been stopped.
 fn wallet_with_request(
-    dir: &PathBuf,
+    dir: &Path,
     did: &ServiceDid,
     slots: Vec<u32>,
 ) -> (Wallet, PendingAirRequest) {
@@ -197,7 +192,7 @@ fn wallet_with_request(
 
 /// The same, for a request of another kind.
 fn wallet_with_kind(
-    dir: &PathBuf,
+    dir: &Path,
     did: &ServiceDid,
     slots: Vec<u32>,
     kind: u8,
@@ -504,11 +499,11 @@ fn without_air_server_and_host_no_call_to_the_psp_is_made_and_the_error_names_th
 /// A real rotating PSP (a manual clock, so the rotation window does not move
 /// between two calls), answering through `air_served_with`, the `serve` psp-mint
 /// runs.
-fn real_psp(dir: &PathBuf) -> PspMint {
+fn real_psp(dir: &Path) -> PspMint {
     PspMint::open_at(&dir.join("psp"), T)
 }
 
-fn real_psp_with(dir: &PathBuf, limits: Limits) -> PspMint {
+fn real_psp_with(dir: &Path, limits: Limits) -> PspMint {
     PspMint::open_with(&dir.join("psp"), T, limits)
 }
 
@@ -848,8 +843,8 @@ fn a_rollover_resent_over_air_is_the_same_answer_and_a_kept_request_is_found_by_
     let b = psp.note(2);
     let mut w = psp.wallet(&dir, "w", vec![a.clone(), b.clone()]);
     let current = psp.keyset();
-    let roll = rollover_body(&[a.clone()], &current);
-    let check = check_body(&[b.clone()]);
+    let roll = rollover_body(std::slice::from_ref(&a), &current);
+    let check = check_body(std::slice::from_ref(&b));
 
     // The PSP is not listening: both calls write their request and wait in vain.
     // They are kept apart, each with the hash of its own body.
@@ -902,7 +897,7 @@ fn a_rollover_resent_over_air_is_the_same_answer_and_a_kept_request_is_found_by_
     listener.stop().unwrap();
 }
 
-fn open_wallet_at(dir: &PathBuf, name: &str) -> Wallet {
+fn open_wallet_at(dir: &Path, name: &str) -> Wallet {
     common::open_wallet(&dir.join(format!("{name}.json"))).unwrap()
 }
 
@@ -933,13 +928,13 @@ fn refusals_over_air_are_the_wallets_errors() {
     }
 
     // A note that is spent already: `SpentElsewhere`, with the position.
-    let first = rollover_body(&[a.clone()], &current);
+    let first = rollover_body(std::slice::from_ref(&a), &current);
     psp_post(&mut w, &air, "rollover", &first).unwrap();
     match psp_post(
         &mut w,
         &air,
         "rollover",
-        &rollover_body(&[a.clone()], &current),
+        &rollover_body(std::slice::from_ref(&a), &current),
     ) {
         Err(WalletError::SpentElsewhere { inputs, .. }) => assert_eq!(inputs, vec![0]),
         other => panic!("expected SpentElsewhere, got {other:?}"),

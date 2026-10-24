@@ -5,8 +5,8 @@
 //! again.
 //!
 //! One test starts from fsp-mint instead of from notes the fixture signs: the ESP
-//! that fsp-mint kept is written by its `export_esp`, taken in by a service's
-//! wallet and redeemed.
+//! that fsp-mint kept is written by its `export_kept` and `deliver`, taken in
+//! by a service's wallet and redeemed.
 //!
 //! A redemption never calls the PSP, so the PSP stand-in refuses every call.
 //! These are plain tests with their own runtime, because the operator's calls
@@ -31,7 +31,7 @@ use esp_mint::queue::Queue;
 use esp_mint::redeem::{self, Reason};
 use esp_mint::server::EspState;
 use esp_mint::terms::Terms;
-use fsp_mint::export::export_esp;
+use fsp_mint::export;
 use fsp_mint::issue::Issues;
 use mint_types::{Amount, Note};
 use secp256k1::{Keypair, SECP256K1, SecretKey};
@@ -572,9 +572,12 @@ fn esp_that_fsp_mint_kept_is_exported_received_and_redeemed_once_mature() {
     assert_eq!(on(PAST).count() + on(FUTURE).count(), kept.len());
     assert!(kept.iter().all(|k| !k.exported));
 
-    // `export_esp` writes one file for each day: nothing here is made by hand.
+    // `export_kept` writes one file for each day and `deliver` moves them to
+    // `out`, as `export-esp` does: nothing here is made by hand.
     let out = scratch("export-esp-out");
-    let written = export_esp(&data, &out, service, 1_234).unwrap();
+    let mut issues = Issues::open(&data).unwrap();
+    export::export_kept(&mut issues, &export::folder(&data), service, 1_234).unwrap();
+    let written = export::deliver(&export::folder(&data), &out).unwrap();
     let (past_file, future_file) = (
         out.join(format!("esp-{PAST}-1234.json")),
         out.join(format!("esp-{FUTURE}-1234.json")),

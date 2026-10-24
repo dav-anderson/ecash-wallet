@@ -575,7 +575,7 @@ dependencies = [
 
 [[package]]
 name = "ecash-wallet"
-version = "0.6.1"
+version = "0.7.0"
 dependencies = [
  "axum",
  "bdhke",
@@ -696,8 +696,8 @@ dependencies = [
 
 [[package]]
 name = "fsp-mint"
-version = "0.7.0"
-source = "git+https://github.com/dav-anderson/fsp-mint.git?tag=v0.7.0#330718b4e21928a8c01404931e998436cdc25914"
+version = "0.8.0"
+source = "git+https://github.com/dav-anderson/fsp-mint.git?tag=v0.8.0#ee54e319b3cb2089fe8c65c2a58311bfce06ba5e"
 dependencies = [
  "axum",
  "bdhke",

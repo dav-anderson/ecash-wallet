@@ -265,9 +265,9 @@ This continues the run above, with the app wallet still holding 5 PSP of ESP (50
 
 The app wallet is `$ECASH_WALLET_FILE` (`/tmp/wallet-regtest.json`, exported in step 5 and used so far in T4). The service has its own wallet file, set per command with `ECASH_WALLET_FILE=...` in front.
 
-### 13. Restart both mints on the new build (T2, T3) (test-only setup)
+### 13. Upgrade both mints to the new build (T2, T3)
 
-**This step is test-only.** The mints here are run by hand with `cargo run`, and this step stops each one and starts the new build so the run shows a start on existing data. On an SPI the same restart is a **brief downtime**, done after a warning and a confirmation: a new build goes in with `spi upgrade`, and a setting that needs a restart is applied with `spi restart psp-mint` (or `esp-mint`). Either way the old process stops and only then does the new one start, because one process holds a mint's data (sled's exclusive lock). While the mint is down, the wallets' AIR requests wait in the AIR server's mailbox slots and are answered when it is back. A change to a setting that reloads live needs no restart (`kill -HUP` on the mint, or `systemctl reload`, or `spi reload`: psp-mint and esp-mint read their settings file again and keep serving); one that needs a restart (each mint's README marks every setting "reloads live" or "needs a restart") keeps its running value on a reload, and is named in the log, until the mint is restarted.
+**This step is the upgrade step, and the only stop in this walkthrough that is not test setup.** The mints here are run by hand with `cargo run`, so the step does by hand what `spi upgrade` does: it stops each old mint and starts the new build, which shows a start on existing data. On an SPI the same change is a **brief downtime**, done after a warning and a confirmation: a new build goes in with `spi upgrade`, and a setting that needs a restart is applied with `spi restart psp-mint` (or `esp-mint`). Either way the old process stops and only then does the new one start, because one process holds a mint's data (sled's exclusive lock). While the mint is down, the wallets' AIR requests wait in the AIR server's mailbox slots and are answered when it is back. A change to a setting that reloads live needs no restart (`kill -HUP` on the mint, or `systemctl reload`, or `spi reload`: psp-mint and esp-mint read their settings file again and keep serving); one that needs a restart (each mint's README marks every setting "reloads live" or "needs a restart") keeps its running value on a reload, and is named in the log, until the mint is restarted.
 
 The PSP now keeps the memo of each burn and has `POST /burns`, and the ESP mint has the transfer call and asks the PSP for the memo. Restart the PSP first, then the ESP mint. Their data in `~/.psp-mint` and `~/.esp-mint` is kept.
 
@@ -310,7 +310,7 @@ These were the wallet's stand-alone `hand-over --out FILE`, `receive` and `trans
 
 This continues the two runs above (purchase to ESP, then the restart), with the same four terminals, the Bitcoin node, the PSP mint (T2) and the ESP mint (T3) running, and one more terminal, T5, for the FSP mint. It was run end to end on 2026-10-16 (macOS, Apple Silicon) from a clean start (step 1 moved the old data aside) **before the hand-over and transfer commands were removed; steps 26 to 28, 31, 33 and 35 to 37 were rewritten for that and are not run** (see the note at the top). Elsewhere every output below is what that run printed, apart from values that differ each run (ids, transaction ids, keys, the price, the day numbers). Today's day number in that run was 20742, so notes issued after step 22 are "redeemable after day 20742" and the year-out notes are day 21107. Use your own: the day is the number of days since 1970-01-01, and the first run's notes carry today plus 365.
 
-The app wallet is `/tmp/wallet-regtest.json`, the `ECASH_WALLET_FILE` exported in step 5 and still set in T4 (the default wallet, `~/.ecash-wallet/regtest/wallet.json`, is used only when that variable is not set). The service has its own wallet file, set per command with `ECASH_WALLET_FILE=/tmp/wallet-service.json`, which overrides the exported one for that command. `$SERVICE` is the generator point `0279be…1798` and `$KEY` its secret key `000…01` (see "Regtest, restart on the new build"). `$CLI`, `$PAYER`, `$HEX` and `$TXID` are shell variables in T4.
+The app wallet is `/tmp/wallet-regtest.json`, the `ECASH_WALLET_FILE` exported in step 5 and still set in T4 (the default wallet, `~/.ecash-wallet/regtest/wallet.json`, is used only when that variable is not set). The service has its own wallet file, set per command with `ECASH_WALLET_FILE=/tmp/wallet-service.json`, which overrides the exported one for that command. `$SERVICE` is the generator point `0279be…1798` and `$KEYFILE` is `~/.fsp-mint/regtest/service_key.hex`, the file that holds its secret key `000…01` (written owner-only in step 26; `redeem` refuses a key file that group or others can read). `$CLI`, `$PAYER`, `$HEX` and `$TXID` are shell variables in T4.
 
 ### 21. The ESP mint's rates (no command)
 
@@ -384,6 +384,7 @@ The FSP mint holds the service's DID key, `service_key.hex`. For this run it hol
 mkdir -p ~/.fsp-mint/regtest
 umask 077
 echo 0000000000000000000000000000000000000000000000000000000000000001 > ~/.fsp-mint/regtest/service_key.hex
+export KEYFILE=~/.fsp-mint/regtest/service_key.hex
 cd ~/fsp-mint
 FSP_NETWORK=regtest cargo run -q -- service-key
 ```
@@ -414,7 +415,7 @@ curl -s http://127.0.0.1:3100/audit; echo
 
 Expected: `issue <id>: 2 group(s)` (one for each day: N group(s) in general) and `issued 200000000000 FSP (fee 0)`, and the audit `{"issued":900000000000,"outstanding":700000000000,"redeemed":200000000000}`: the FSP mint swapped the note at the ESP mint, so issued and redeemed each rose by 2×10^11 and outstanding did not change. The app's `balance` now shows `fsp  200000000000`, a line `handed over N time(s); the hand-overs are kept in the wallet file`, and less ESP at both days (how much of each depends on the notes taken; **not rerun**).
 
-`export-esp` needs the FSP mint stopped (its README says so). Ctrl-C in T5, then in T1:
+`export-esp` works while the FSP mint serves: with the mint running it asks it, and the mint writes the files between two issues (its README says so). Leave T5 running. In T1:
 
 ```
 mkdir -p /tmp/fsp-esp-1
@@ -431,14 +432,14 @@ ECASH_WALLET_FILE=/tmp/wallet-service.json cargo run -q -- --regtest balance
 
 Expected: for each file, `received N ESP in N note(s) for <service>, redeemable after day D`, and a service balance of the sum of the files, the day-20742 part mature today and the other year-out (**not rerun**: the figures here were for one note).
 
-Steps 38, 40 and 43 repeat this round (steps 23 to 25 to get a fresh note, then the issue, the export and the `receive`, with the next export folder, `/tmp/fsp-esp-2` and so on). The FSP mint is stopped now; step 35 starts it again.
+Steps 38, 40 and 43 repeat this round (steps 23 to 25 to get a fresh note, then the issue, the export and the `receive`, with the next export folder, `/tmp/fsp-esp-2` and so on). The FSP mint keeps serving in T5 throughout; nothing is stopped for an export.
 
 ### 27. Redeem (T4)
 
 The wallet redeems every mature free note for the service, here the one from step 26. The memo says where the payout goes.
 
 ```
-ECASH_WALLET_FILE=/tmp/wallet-service.json cargo run -q -- --regtest redeem --service-key $KEY --memo 'btc:bcrt1qwalkthrough'
+ECASH_WALLET_FILE=/tmp/wallet-service.json cargo run -q -- --regtest redeem --service-key-file $KEYFILE --memo 'btc:bcrt1qwalkthrough'
 ECASH_WALLET_FILE=/tmp/wallet-service.json cargo run -q -- --regtest balance
 ```
 
@@ -496,7 +497,7 @@ Expected: `payout declined: terms not met: service was offline. 15 note(s) worth
 ### 32. Redeem again and pay (T4, then T1)
 
 ```
-ECASH_WALLET_FILE=/tmp/wallet-service.json cargo run -q -- --regtest redeem --service-key $KEY --memo 'btc:bcrt1qsecondpayout'
+ECASH_WALLET_FILE=/tmp/wallet-service.json cargo run -q -- --regtest redeem --service-key-file $KEYFILE --memo 'btc:bcrt1qsecondpayout'
 ```
 
 Expected: 408 bytes (the memo is one byte longer), fee 408000000, payout queued `199185000000`. Then in T1, with the new id:
@@ -524,17 +525,9 @@ Expected: `payout completed, payment reference regtest-demo-payment-1`, an empty
 
 A request over the route's ceiling is refused before it is parsed. This was a `curl` of 1048577 bytes at the ESP's `POST /exchange`; that route is gone, and the same ceiling now applies to the sealed request the ESP's AIR listener opens: a request over it is answered with a signed refusal that carries `"http_status": 413` and the code `request_too_large`, which the wallet reads as a plain mint error and never as a refusal of the notes (README, "The ESP's calls over AIR"). It cannot be made with `curl`. It is covered by esp-mint's AIR tests and by `tests/esp_air_flow.rs` here. Nothing to run.
 
-### 35. The FSP mint again (T5)
+### 35. The FSP mint is still serving (T5)
 
-The FSP mint was set up in step 26 (its service key and `ECASH_AIR_FSP`) and stopped there for `export-esp`. Its data and key are kept. Start it again in T5 with the same command:
-
-```
-cd ~/fsp-mint
-ESP_DID=$(cd ~/esp-mint && ESP_NETWORK=regtest cargo run -q -- pubkey)
-FSP_AIR_ESP_DID=$ESP_DID FSP_AIR_ESP_SERVER=$AIR_SERVER FSP_AIR_ESP_HOST=127.0.0.1 FSP_AIR_SERVER=$AIR_SERVER FSP_AIR_HOST=127.0.0.1 FSP_NETWORK=regtest FSP_SERVICE_DID=0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798 cargo run -- serve
-```
-
-Expected: the same listening lines as in step 26. `ECASH_AIR_FSP` is still exported in T4.
+The FSP mint was set up in step 26 (its service key and `ECASH_AIR_FSP`) and was not stopped for `export-esp`, which works while it serves. There is nothing to start. T5 still shows the listening lines of step 26, and `ECASH_AIR_FSP` is still exported in T4. (If T5 was closed, start the mint again with the command of step 26: its data and key are kept.)
 
 ### 36. Issue FSP from ESP (T4)
 
@@ -564,7 +557,7 @@ Expected: `spend <id>` and `paid 50000000000 FSP`; the balance has `fsp  3500000
 
 ## Regtest, refusals, splitting, kept ESP and rotation
 
-This continues the run above, with the same terminals (T1 to T5), the node, the PSP mint (T2), the ESP mint (T3) and the FSP mint (T5). It was run end to end on 2026-10-16 (macOS, Apple Silicon), and every output below is what that run printed, apart from values that differ each run (ids, transaction ids, hashes, times). The service wallet is `ECASH_WALLET_FILE=/tmp/wallet-service.json`, and `$SERVICE`, `$KEY`, `$CLI` are as in the earlier sections. Today's day number was 20742. **Steps 38 to 48 were run before the `hand-over` and `transfer` commands were removed. Steps 38 to 41, 45 to 48 and the figures in them were rewritten for that and are not run** (see the note at the top).
+This continues the run above, with the same terminals (T1 to T5), the node, the PSP mint (T2), the ESP mint (T3) and the FSP mint (T5). It was run end to end on 2026-10-16 (macOS, Apple Silicon), and every output below is what that run printed, apart from values that differ each run (ids, transaction ids, hashes, times). The service wallet is `ECASH_WALLET_FILE=/tmp/wallet-service.json`, and `$SERVICE`, `$KEYFILE`, `$CLI` are as in the earlier sections. Today's day number was 20742. **Steps 38 to 48 were run before the `hand-over` and `transfer` commands were removed. Steps 38 to 41, 45 to 48 and the figures in them were rewritten for that and are not run** (see the note at the top).
 
 What the command line cannot reach: a note the mint calls `immature` (the wallet checks maturity on its own clock first and does not send such a note), a note for the `wrong_service` (the wallet only picks notes for the key it is given), and so a redemption that needs refund outputs. They are in the automated tests (`tests/redeem_flow.rs`).
 
@@ -574,10 +567,10 @@ A wallet restored from an old backup holds notes the mint has burned. This keeps
 
 ```
 cp /tmp/wallet-service.json /tmp/wallet-service.stale.json
-ECASH_WALLET_FILE=/tmp/wallet-service.json cargo run -q -- --regtest redeem --service-key $KEY --memo 'btc:bcrt1qrefusal'
+ECASH_WALLET_FILE=/tmp/wallet-service.json cargo run -q -- --regtest redeem --service-key-file $KEYFILE --memo 'btc:bcrt1qrefusal'
 cp /tmp/wallet-service.json /tmp/wallet-service.after.json
 cp /tmp/wallet-service.stale.json /tmp/wallet-service.json
-ECASH_WALLET_FILE=/tmp/wallet-service.json cargo run -q -- --regtest redeem --service-key $KEY --memo 'btc:bcrt1qreplay'
+ECASH_WALLET_FILE=/tmp/wallet-service.json cargo run -q -- --regtest redeem --service-key-file $KEYFILE --memo 'btc:bcrt1qreplay'
 ```
 
 Expected: the first redemption is accepted (`403 bytes`, fee 403000000, payout queued 199597000000). The second, built from the stale copy, is refused: `the mint refused the redemption (below_fee): the genuine, unspent notes are worth 0 ESP units, less than the fee of 402000000. Nothing was burned and no fee was taken`. The refusal is printed once (the 2026-10-22 run). The audit does not move. The refusal lists a reason for every note, and the wallet moves the notes the mint marks `already_spent` to its spent record: they leave the balance, `balance` prints `spent elsewhere N note(s)`, and the other notes are freed (the doc used to say the wallet could not tell; the wording of the refusal in this build was not captured, **not rerun**). Put the real wallet back with `cp /tmp/wallet-service.after.json /tmp/wallet-service.json`.
@@ -604,7 +597,7 @@ Expected: `payout declined: dev test: splitting next. 1 note(s) worth 1995970000
 `--max-bytes` lowers the ceiling on one request, so the wallet has to split. The split sizes each request for the worst case, the most decline and refund outputs a service and day can need (64 of each), so even one note counts as 10,803 bytes plus its memo, and a ceiling below that is refused. The service needs more mature notes than fit in one request: the reissued notes of step 39 and those of another round (steps 23 to 25, then the round of step 26 with `/tmp/fsp-esp-3`, then the FSP mint started again as in step 35).
 
 ```
-ECASH_WALLET_FILE=/tmp/wallet-service.json cargo run -q -- --regtest redeem --service-key $KEY --max-bytes 12000 --memo 'btc:bcrt1qsplit'
+ECASH_WALLET_FILE=/tmp/wallet-service.json cargo run -q -- --regtest redeem --service-key-file $KEYFILE --max-bytes 12000 --memo 'btc:bcrt1qsplit'
 ```
 
 Expected (**rewritten, not run**): first the summary, `fee rate 1000000 ESP units a byte; at most 12000 bytes a request (--max-bytes); N request(s)`, then a `not sent: …` line for each part that would owe nothing, then each request that is sent, with the actual size of its request (a few thousand bytes, not the worst case). A request holds up to 7 notes at this ceiling (`120 + 187 × 7 + 15 (the memo) + 128 × 82 = 11940` fits 12000, 8 notes (12127) do not); the notes go in order, oldest day first and the largest first. In the 2026-10-22 run the first request took 7 large notes (2592 bytes) and the later parts held small notes worth less than the fee (`not sent: … less than the fee of 1444000000`, and one of 448 ESP units, less than the fee of 696000000), so only one request was sent; the small notes stay in the wallet. With `--max-bytes 500`, as this step used to say, the command now stops: `error: --max-bytes 500 is too small for even one note: a request for one note can need <n> bytes` (it used to name the mint's ceiling); a ceiling that is the mint's own is named as `the mint's ceiling of N bytes`. Each request that is sent is its own entry at the mint.
@@ -621,7 +614,7 @@ This step needs two entries. In the 2026-10-22 run the split sent only one reque
 
 ### 42. ESP the FSP mint has kept, not yet mature (T1, then T4)
 
-`export-esp` writes the ESP the FSP mint kept for the service and has not written before, one file per redeemable-after day. Stop the FSP mint first (Ctrl-C in T5), as its README says.
+`export-esp` writes the ESP the FSP mint kept for the service and has not written before, one file per redeemable-after day. The FSP mint keeps serving; the command asks it, as its README says.
 
 ```
 mkdir -p /tmp/fsp-export
@@ -634,7 +627,7 @@ Expected: `wrote /tmp/fsp-export/esp-21107-<time>.json (2 notes)` (when the FSP 
 ```
 ECASH_WALLET_FILE=/tmp/wallet-service.json cargo run -q -- --regtest receive /tmp/fsp-export/esp-21107-<time>.json
 ECASH_WALLET_FILE=/tmp/wallet-service.json cargo run -q -- --regtest esp-schedule
-ECASH_WALLET_FILE=/tmp/wallet-service.json cargo run -q -- --regtest redeem --service-key $KEY --memo 'btc:bcrt1qkept'
+ECASH_WALLET_FILE=/tmp/wallet-service.json cargo run -q -- --regtest redeem --service-key-file $KEYFILE --memo 'btc:bcrt1qkept'
 ```
 
 Expected: `received 200000000000 ESP in 2 note(s) ... redeemable after day 21107`, a schedule with `esp held 200000000000`, `mature now 0` and `2027-10  200000000000`, and `error: this wallet holds no free ESP for that service whose redeemable-after day has come`. Nothing is sent to the mint.
@@ -647,7 +640,7 @@ Buy 3 PSP (a 2 and a 1), settle and exchange 2 (steps 23 to 25, with the ESP min
 cargo run -q -- --regtest fsp issue --service $SERVICE --esp 200000000000
 ```
 
-Expected: `issued 200000000000 FSP (fee 0)`. The audit's issued and redeemed each rise by 2×10^11 more (the ESP mint moves the note to a fresh one that only the service controls), and outstanding is unchanged. Stop the FSP mint (Ctrl-C in T5), then in T1:
+Expected: `issued 200000000000 FSP (fee 0)`. The audit's issued and redeemed each rise by 2×10^11 more (the ESP mint moves the note to a fresh one that only the service controls), and outstanding is unchanged. The FSP mint keeps serving. In T1:
 
 ```
 mkdir -p /tmp/fsp-export2
@@ -659,7 +652,7 @@ Expected: `wrote /tmp/fsp-export2/esp-20742-<time>.json (1 notes)`. In T4:
 
 ```
 ECASH_WALLET_FILE=/tmp/wallet-service.json cargo run -q -- --regtest receive /tmp/fsp-export2/esp-20742-<time>.json
-ECASH_WALLET_FILE=/tmp/wallet-service.json cargo run -q -- --regtest redeem --service-key $KEY --memo 'btc:bcrt1qkept'
+ECASH_WALLET_FILE=/tmp/wallet-service.json cargo run -q -- --regtest redeem --service-key-file $KEYFILE --memo 'btc:bcrt1qkept'
 ```
 
 Expected: `esp held 400000000000`, `mature now 200000000000`, then a redemption of 1 note worth 2×10^11, `400 bytes`, fee 400000000, payout queued 199600000000. In T1, `payouts` shows the entry and `pay $SERVICE regtest-kept-payment <id>` marks it completed; in T4, `redeem --collect` ends with `payout completed, payment reference regtest-kept-payment`. Run the `receive` and the `redeem` once. A second `receive` of the same file puts a burned note back in the wallet, and the next redemption is refused (`below_fee`, as in step 38); the mint's `transfer` route says it more clearly (`note 0 is already spent`).
@@ -723,7 +716,7 @@ Expected: the mint now has epoch 2 as current, `5e81c980bed405b1` (epoch 1) as p
 
 ### 48. FSP key rotation (T1, T5, T4)
 
-The same method for the FSP mint (FSP_ROTATION_ACTIVATION_HOURS and FSP_ROTATION_PERIOD_HOURS, a period of 1 hour at least). Stop the FSP mint, then:
+The same method for the FSP mint (FSP_ROTATION_ACTIVATION_HOURS and FSP_ROTATION_PERIOD_HOURS, a period of 1 hour at least). **This is test-only setup, and the stop is part of the fixture.** Both settings **need a restart** (the FSP mint's README marks each setting: on an SPI that is a brief downtime, applied after a warning and a confirmation, and a reload names the change and waits), and backing `first_issue.json` up by 90 minutes is a hand edit of a file the mint reads when it starts. Stop the FSP mint (Ctrl-C in T5), then:
 
 ```
 cp -R ~/.fsp-mint ~/.fsp-mint.pre-rotation
@@ -738,7 +731,7 @@ A stale copy of the FSP wallet (one made before the rollover, as step 44 does fo
 
 ### 49. Put it away (T1)
 
-Both mints' data now belongs to the rotated key sets, and the app wallet's FSP notes are on the FSP mint's new key set, so the data folders must go together: restoring only one of them would leave notes the mint does not know. Stop the three mints (Ctrl-C) and the node (`bitcoin-cli stop`), then move everything aside under one dated name instead of deleting it:
+Both mints' data now belongs to the rotated key sets, and the app wallet's FSP notes are on the FSP mint's new key set, so the data folders must go together: restoring only one of them would leave notes the mint does not know. This is test teardown, not an operation (on an SPI nothing stops a mint to put data away): stop the three mints (Ctrl-C) and the node (`bitcoin-cli stop`), then move everything aside under one dated name instead of deleting it:
 
 ```
 for d in .psp-mint .esp-mint .fsp-mint; do mv ~/$d ~/$d.run-20261016; done

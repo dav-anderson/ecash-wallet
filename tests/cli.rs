@@ -99,6 +99,15 @@ fn refused_env(
     );
 }
 
+/// A service key file in `dir` holding `text`, with this Unix mode. Returns its path.
+fn key_file_in(dir: &Path, name: &str, text: &str, mode: u32) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join(name);
+    std::fs::write(&path, text).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+    path.to_str().unwrap().to_string()
+}
+
 /// A wallet file that holds two ESP notes (made by the library) for [`NETWORK`].
 fn wallet_with_notes(dir: &Path) -> PathBuf {
     let path = dir.join("wallet.json");
@@ -329,7 +338,8 @@ fn receive_balance_exchange_redeem_and_fsp_refuse_bad_arguments_before_any_netwo
     // anything. This wallet has no AIR settings, so a command that got as far as
     // the ESP would say "air.server and air.host are not set"; none of these does.
     let service = ServiceDid::from(Keypair::new(SECP256K1, &mut OsRng).public_key()).to_hex();
-    let key = "11".repeat(32);
+    let key_file = key_file_in(&dir, "service_key.hex", &"11".repeat(32), 0o600);
+    let key_file = key_file.as_str();
     refused(
         &wallet,
         &before,
@@ -381,18 +391,49 @@ fn receive_balance_exchange_redeem_and_fsp_refuse_bad_arguments_before_any_netwo
         &wallet,
         &before,
         &["redeem"],
-        &["--service-key HEX is required"],
+        &["--service-key-file FILE is required"],
+    );
+    // The old flag is gone: nothing reads a key typed on the command line.
+    refused(
+        &wallet,
+        &before,
+        &["redeem", "--service-key", &"11".repeat(32)],
+        &["--service-key-file FILE is required"],
+    );
+    let missing = dir.join("no-such-key.hex");
+    refused(
+        &wallet,
+        &before,
+        &["redeem", "--service-key-file", missing.to_str().unwrap()],
+        &["cannot read the service key file"],
+    );
+    let not_hex = key_file_in(&dir, "not-hex.hex", "zz", 0o600);
+    refused(
+        &wallet,
+        &before,
+        &["redeem", "--service-key-file", &not_hex],
+        &["must hold hex"],
+    );
+    let short = key_file_in(&dir, "short.hex", &"11".repeat(16), 0o600);
+    refused(
+        &wallet,
+        &before,
+        &["redeem", "--service-key-file", &short],
+        &["must hold a 32 byte secret key (64 hex characters)"],
+    );
+    // A key file that group or others can read is refused, and the message says
+    // why and how to fix it, even though the key in it is fine.
+    let open_file = key_file_in(&dir, "readable.hex", &"11".repeat(32), 0o644);
+    refused(
+        &wallet,
+        &before,
+        &["redeem", "--service-key-file", &open_file, "--memo", "m"],
+        &["can be read by group or others (mode 644)", "chmod 600"],
     );
     refused(
         &wallet,
         &before,
-        &["redeem", "--service-key", "zz"],
-        &["the service key must be hex"],
-    );
-    refused(
-        &wallet,
-        &before,
-        &["redeem", "--service-key", &key],
+        &["redeem", "--service-key-file", key_file],
         &["--memo TEXT (where the payout goes) is required"],
     );
     refused(
@@ -400,8 +441,8 @@ fn receive_balance_exchange_redeem_and_fsp_refuse_bad_arguments_before_any_netwo
         &before,
         &[
             "redeem",
-            "--service-key",
-            &key,
+            "--service-key-file",
+            key_file,
             "--memo",
             "m",
             "--max-bytes",
@@ -419,7 +460,7 @@ fn receive_balance_exchange_redeem_and_fsp_refuse_bad_arguments_before_any_netwo
     // settings it is the missing setting that is named.
     for args in [
         vec!["exchange", "--service", &service, "--psp", "4"],
-        vec!["redeem", "--service-key", &key, "--memo", "m"],
+        vec!["redeem", "--service-key-file", key_file, "--memo", "m"],
     ] {
         refused(
             &wallet,
@@ -521,6 +562,49 @@ fn handoff_refuses_a_missing_part_and_explains_the_old_export() {
         &before,
         &["handoff", "frobnicate"],
         &["unknown handoff command `frobnicate`"],
+    );
+}
+
+/// A DID key file that group or others can read is refused before it is read,
+/// as the service key file is, and before any network; an owner-only file is
+/// read (here it holds no key, which is the next refusal).
+#[test]
+fn a_did_key_file_others_can_read_is_refused_before_it_is_read() {
+    let dir = scratch("did-key-file");
+    let wallet = wallet_with_notes(&dir);
+    let before = std::fs::read(&wallet).ok();
+    let service = ServiceDid::from(Keypair::new(SECP256K1, &mut OsRng).public_key()).to_string();
+    let fsp = format!("{service}:1");
+    let open_file = key_file_in(&dir, "did-open.hex", &"11".repeat(32), 0o644);
+    refused(
+        &wallet,
+        &before,
+        &[
+            "handoff",
+            "export-fsp",
+            "--fsp",
+            &fsp,
+            "--did-key-file",
+            &open_file,
+        ],
+        &[
+            &format!("the DID key file {open_file} can be read by group or others (mode 644)"),
+            &format!("chmod 600 {open_file}"),
+        ],
+    );
+    let not_hex = key_file_in(&dir, "did-not-hex.hex", "not hex", 0o600);
+    refused(
+        &wallet,
+        &before,
+        &[
+            "handoff",
+            "export-fsp",
+            "--fsp",
+            &fsp,
+            "--did-key-file",
+            &not_hex,
+        ],
+        &[&format!("{not_hex}: a DID secret key is 64 hex characters")],
     );
 }
 
@@ -869,7 +953,7 @@ fn a_usage_error_is_said_first_with_nothing_asked_of_the_network_before_it() {
             vec!["exchange", "--service", &service, "--psp", "four"],
             "--psp must be a whole number, got `four`",
         ),
-        (vec!["redeem"], "--service-key HEX is required"),
+        (vec!["redeem"], "--service-key-file FILE is required"),
         (
             vec!["fsp", "pay", "--service", &service],
             "--units N is needed",

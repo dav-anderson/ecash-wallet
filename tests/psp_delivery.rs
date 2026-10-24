@@ -94,7 +94,7 @@ impl Env {
     }
 
     fn deliverer(&self, server: &ServerRef) -> Deliverer {
-        Deliverer::new(server.clone(), 3, self.mint_key.clone())
+        Deliverer::new(server.clone(), 3, self.mint_key)
     }
 
     /// The wallet looks for its records once.
@@ -122,7 +122,7 @@ fn identity(p: &PendingPurchase) -> (ServiceDid, [u8; 32]) {
 /// Write a record to a cell, as anyone who knew the cell could.
 fn plant(server: &ServerRef, cell: &DidKey, sealed: &[u8]) {
     let server = server.clone();
-    let cell = cell.clone();
+    let cell = *cell;
     let sealed = sealed.to_vec();
     let written = block_on_new_runtime(move || async move {
         let client = client::connect(&server).await.unwrap();
@@ -437,7 +437,7 @@ fn with_the_server_down_at_settlement_a_later_retry_delivers_exactly_one_record(
 
     // the AIR server cannot be reached when the payment settles: issuance stands,
     // nothing is delivered
-    let mut dead = Deliverer::new(down(&server), 2, e.mint_key.clone());
+    let mut dead = Deliverer::new(down(&server), 2, e.mint_key);
     let report = dead.pass_shared(&e.psp.records, Instant::now());
     assert_eq!((report.delivered, report.failed), (0, 1), "{report:?}");
     // the next scan is inside the wait: it is left alone

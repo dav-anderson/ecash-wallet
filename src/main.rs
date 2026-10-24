@@ -136,15 +136,17 @@ ecash-wallet [--wallet FILE] [--config FILE] [--regtest|--signet|--testnet] <com
       Merge a copy of this wallet retrieved from storage (a wallet file) into
       this one: notes united, anything spent in either copy stays spent,
       pending requests merged once each. Save this wallet back to storage.
-  redeem --service-key HEX --memo TEXT [--max-bytes N]
-      As the service (HEX is its 32 byte secret key): redeem every free ESP
+  redeem --service-key-file FILE --memo TEXT [--max-bytes N]
+      As the service (FILE holds its 32 byte secret key as 64 hex characters,
+      like fsp-mint's service_key.hex; a file that group or others can read is
+      refused, and the key is never typed on the command line): redeem every free ESP
       note for that service whose redeemable-after day has come, mixed days
       allowed, for a payout to TEXT (for example btc:ADDRESS). The fee rate and
       the ceiling on one request come from the mint's GET /fees (--max-bytes
       lowers the ceiling). A redemption over the ceiling is split into several
       requests, each with its own fee and payout entry. Shows the size and fee
       of each request before it is sent.
-  redeem --service-key HEX --resume ID
+  redeem --service-key-file FILE --resume ID
       Send a pending redemption again (after a lost reply or a fault).
   redeem --collect
       Ask the mint about every redemption queued for payout: completed ones end,
@@ -795,19 +797,45 @@ fn exchange(wallet: &mut Wallet, mut args: Args, start: Startup) -> Result<(), W
 
 /// A service as typed: its 33-byte AIR DID, 66 hex characters. The old 32-byte
 /// x-only form is refused, and the error says what to use instead. (Not to be
-/// confused with `--service-key`, a service's secret key, see `secret_key`.)
+/// confused with `--service-key-file`, a service's secret key, see
+/// `service_key_from_file`.)
 fn service_did(text: &str) -> Result<ServiceDid, WalletError> {
     ServiceDid::parse(text).map_err(|e| WalletError::Invalid(e.to_string()))
 }
 
-fn secret_key(text: &str) -> Result<SecretKey, WalletError> {
+/// The service's secret key from a file of 64 hex characters (as fsp-mint's
+/// `service_key.hex`). A file that group or others can read is refused: the key
+/// is the service's identity, and a key typed on a command line stays in the
+/// shell history and shows in the process list.
+fn service_key_from_file(path: &str) -> Result<SecretKey, WalletError> {
+    owner_only_key_file(path, "the service key file", "the service's secret key")?;
+    let text = std::fs::read_to_string(path).map_err(|e| {
+        WalletError::Invalid(format!("cannot read the service key file {path}: {e}"))
+    })?;
     let bytes = hex::decode(text.trim())
-        .map_err(|_| WalletError::Invalid("the service key must be hex".into()))?;
+        .map_err(|_| WalletError::Invalid(format!("the service key file {path} must hold hex")))?;
     SecretKey::from_slice(&bytes).map_err(|_| {
-        WalletError::Invalid(
-            "the service key must be a 32 byte secret key (64 hex characters)".into(),
-        )
+        WalletError::Invalid(format!(
+            "the service key file {path} must hold a 32 byte secret key (64 hex characters)"
+        ))
     })
+}
+
+/// Refuse a key file that group or others can read (any of mode `0o077`),
+/// before it is read: `what` names the file, `holds` what is in it.
+fn owner_only_key_file(path: &str, what: &str, holds: &str) -> Result<(), WalletError> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(path)
+        .map_err(|e| WalletError::Invalid(format!("cannot read {what} {path}: {e}")))?
+        .permissions()
+        .mode();
+    if mode & 0o077 != 0 {
+        return Err(WalletError::Invalid(format!(
+            "{what} {path} can be read by group or others (mode {:03o}): it holds {holds}. Make it owner-only: chmod 600 {path}",
+            mode & 0o777
+        )));
+    }
+    Ok(())
 }
 
 /// Write a file that holds secrets: new, and readable by the owner only.
@@ -985,7 +1013,7 @@ fn send_redemption(
             }
             Err(e) => {
                 eprintln!(
-                    "the outcome is unknown. Send the same request again with: redeem --service-key HEX --resume {id}"
+                    "the outcome is unknown. Send the same request again with: redeem --service-key-file FILE --resume {id}"
                 );
                 return Err(e);
             }
@@ -1024,8 +1052,8 @@ fn redeem(wallet: &mut Wallet, mut args: Args, start: Startup) -> Result<(), Wal
         }
         return Ok(());
     }
-    let key = match args.flag("--service-key")? {
-        Some(k) => Some(secret_key(&k)?),
+    let key = match args.flag("--service-key-file")? {
+        Some(file) => Some(service_key_from_file(&file)?),
         None => None,
     };
     if let Some(id) = args.flag("--resume")? {
@@ -1034,7 +1062,8 @@ fn redeem(wallet: &mut Wallet, mut args: Args, start: Startup) -> Result<(), Wal
         esp_base(wallet)?;
         return send_redemption(wallet, key.as_ref(), id);
     }
-    let key = key.ok_or_else(|| WalletError::Invalid("--service-key HEX is required".into()))?;
+    let key =
+        key.ok_or_else(|| WalletError::Invalid("--service-key-file FILE is required".into()))?;
     let memo = args.flag("--memo")?.ok_or_else(|| {
         WalletError::Invalid("--memo TEXT (where the payout goes) is required".into())
     })?;
@@ -1194,8 +1223,11 @@ fn balance(wallet: &mut Wallet, args: Args, start: Startup) -> Result<(), Wallet
     Ok(())
 }
 
-/// A DID secret key from a file of 64 hex characters.
+/// A DID secret key from a file of 64 hex characters. A file that group or
+/// others can read is refused, as the service key file is: the key is the DID,
+/// and the wallet writes it owner-only itself (`--did-key-out`).
 fn did_key_from_file(path: &str) -> Result<DidSecretKey, WalletError> {
+    owner_only_key_file(path, "the DID key file", "your DID's secret key")?;
     let text = std::fs::read_to_string(path)?;
     let bytes = hex::decode(text.trim()).map_err(|_| {
         WalletError::Invalid(format!("{path}: a DID secret key is 64 hex characters"))

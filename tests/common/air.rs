@@ -28,6 +28,7 @@ use ecash_wallet::Wallet;
 use ecash_wallet::config::{AirSettings, FspAir};
 use ecash_wallet::store::Handover;
 use esp_mint::server::EspState;
+use fsp_mint::config::ConfigCell;
 use fsp_mint::issue::Issues;
 use fsp_mint::server::FspState;
 use fsp_mint::spend::Spender;
@@ -182,7 +183,7 @@ impl EspAt {
             timeout_secs: 10,
             state_dir: self.data.clone(),
         };
-        let key = self.key.clone();
+        let key = self.key;
         let serve = esp_serve(&self.state);
         let listener = spawn(move |stopped| {
             runtime().block_on(esp_mint::air_listener::run(
@@ -282,7 +283,7 @@ impl PspAt {
     /// The key the PSP mint signs its records and replies with and opens payloads
     /// with: the key of [`PspAt::did`].
     pub fn key(&self) -> DidKey {
-        self.key.clone()
+        self.key
     }
 
     /// Start the listener (the PSP mint is answering).
@@ -293,7 +294,7 @@ impl PspAt {
             timeout_secs: 10,
             state_dir: self.data.clone(),
         };
-        let key = self.key.clone();
+        let key = self.key;
         let serve = Arc::clone(&self.serve);
         let listener = spawn(move |stopped| {
             runtime().block_on(psp_mint::air_listener::run(
@@ -523,7 +524,8 @@ impl Mints {
             issuer: Box::new(fsp_mint::esp_air::AirIssuer::new(&cfg).unwrap()),
             service_keypair: Some(service_keypair()),
             clock: Box::new(move || c.load(Ordering::SeqCst)),
-            config: cfg,
+            config: ConfigCell::new(cfg),
+            data_dir: dir.join("fsp"),
         });
         let fsp = FspAt::new(&esp_at.server, state, &scratch("airstate-fsp"));
         // The wallet waits long enough for the FSP mint to be told by its ESP mint

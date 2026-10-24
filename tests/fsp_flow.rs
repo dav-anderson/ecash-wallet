@@ -348,9 +348,11 @@ fn a_service_with_no_air_fsp_entry_is_refused_naming_the_setting() {
     let m = start(&dir);
     let mut w = wallet_with_esp(&dir, &m, &[4]);
     // No entry at all, and the PSP's and the ESP's server set: that is not the FSP's.
-    let mut none = AirSettings::default();
-    none.server = m.esp_at.server.name.clone();
-    none.host = m.esp_at.server.host.clone();
+    let none = AirSettings {
+        server: m.esp_at.server.name.clone(),
+        host: m.esp_at.server.host.clone(),
+        ..Default::default()
+    };
     for (what, e) in [
         ("keys", fsp_keys(&mut w, &none, service()).map(|_| ())),
         (

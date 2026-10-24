@@ -976,7 +976,7 @@ fn a_payment_whose_last_resend_cannot_be_sent_is_kept_and_one_for_another_psp_is
         matches!(settled, Settlement::PaidUnsettled(_)),
         "{settled:?}"
     );
-    let mut deliverer = Deliverer::new((*e.psp.at.server).clone(), 3, other_key.clone());
+    let mut deliverer = Deliverer::new((*e.psp.at.server).clone(), 3, other_key);
     let report = deliverer.pass_shared(&other.records, Instant::now());
     assert_eq!((report.delivered, report.failed), (1, 0), "{report:?}");
     let found = e.pickup();

@@ -2,6 +2,10 @@
 
 ecash-wallet 0.1.2 builds on `sp-wire` 0.2.0 (wire version 2) and the 0.1.2 mints. 0.1.1 moved the types to `sp-wire`, added the wire-version check and removed the mint crates from the library. 0.1.0 is the first release. Nothing was recorded per version before this file; the section below is everything the README said about what was built and when.
 
+## 0.7.1 (2026-10-25): the tests run against psp-mint v0.6.2, esp-mint v0.8.2 and fsp-mint v0.8.1 (ROADMAP item 31)
+
+**The mint dev-dependencies move to psp-mint `v0.6.2`, esp-mint `v0.8.2` and fsp-mint `v0.8.1`** (from `v0.6.0`, `v0.8.0` and `v0.8.0`), so the tests start mints with the item 31 fixes: a refused burn drops the pending exchange (P1-01), a burn proof serves only its own request and no output is signed twice (P2-01, P1-07). fsp-mint 0.8.1 only moves its own tests to esp-mint `v0.8.2`. The committed `Cargo.lock` follows; README's pins follow. The library and the command line link none of the mints: no code change. Tests: 201, and 289 with `--all-features`, unchanged.
+
 ## 0.7.0 (2026-10-23): service and DID key files, owner-only
 
 - **Changed: `redeem` takes `--service-key-file FILE` and not `--service-key HEX`** (`service_key_from_file` in `src/main.rs`). FILE holds the 32 byte key as 64 hex characters, as fsp-mint's `service_key.hex` does. A file that group or others can read (any of mode `0o077`) is refused with the reason and `chmod 600 FILE`, before the file is read. The old flag is gone, with no alias: a command line that still has it fails with `--service-key-file FILE is required`. The USAGE text, the "outcome is unknown" message that names `--resume`, README (the "development tool" note is gone) and REGTEST.md follow. Tests in `tests/cli.rs`: a missing flag, the old flag, a missing file, a file that is not hex, a short key, a mode 644 file, and a good 0600 file that reaches the ESP step.

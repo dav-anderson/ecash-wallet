@@ -360,7 +360,10 @@ impl Esp {
     /// (issued, redeemed) ESP units.
     fn totals(&self) -> (u64, u64) {
         let (issued, redeemed) = self.state.logic.lock().unwrap().audit_totals().unwrap();
-        (issued.units, redeemed.units)
+        (
+            u64::try_from(issued).unwrap(),
+            u64::try_from(redeemed).unwrap(),
+        )
     }
 
     fn queue_len(&self) -> usize {

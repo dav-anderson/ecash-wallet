@@ -2,6 +2,10 @@
 
 ecash-wallet 0.1.2 builds on `sp-wire` 0.2.0 (wire version 2) and the 0.1.2 mints. 0.1.1 moved the types to `sp-wire`, added the wire-version check and removed the mint crates from the library. 0.1.0 is the first release. Nothing was recorded per version before this file; the section below is everything the README said about what was built and when.
 
+## 0.7.2 (2026-10-25): the tests run against psp-mint v0.7.0, esp-mint v0.9.0 and fsp-mint v0.8.2 (ROADMAP item 31, P1-02)
+
+**Pins and one test.** mint-core, mint-types and bdhke are `v0.3.0`, `sp-wire` is `v0.5.2`, and the mint dev-dependencies are psp-mint `v0.7.0`, esp-mint `v0.9.0` and fsp-mint `v0.8.2` (the mints keep their issued and redeemed totals as `u128`, and `/audit` gives them as decimal strings). The library and the command line are unchanged. `tests/esp_air_flow.rs`: `audit_totals` returns `(u128, u128)`, so the helper `totals` converts them back to the `u64` the test compares with (`u64::try_from`; the expected values are unchanged). README names the new pins. No wire change.
+
 ## 0.7.1 (2026-10-25): the tests run against psp-mint v0.6.2, esp-mint v0.8.2 and fsp-mint v0.8.1 (ROADMAP item 31)
 
 **The mint dev-dependencies move to psp-mint `v0.6.2`, esp-mint `v0.8.2` and fsp-mint `v0.8.1`** (from `v0.6.0`, `v0.8.0` and `v0.8.0`), so the tests start mints with the item 31 fixes: a refused burn drops the pending exchange (P1-01), a burn proof serves only its own request and no output is signed twice (P2-01, P1-07). fsp-mint 0.8.1 only moves its own tests to esp-mint `v0.8.2`. The committed `Cargo.lock` follows; README's pins follow. The library and the command line link none of the mints: no code change. Tests: 201, and 289 with `--all-features`, unchanged.

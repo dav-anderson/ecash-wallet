@@ -235,16 +235,21 @@ impl EspAt {
 impl PspMint {
     /// What psp-mint's listener answers: the `serve` `psp-mint serve` runs, with
     /// the records shared with the scan side.
-    pub fn serve(&self) -> Arc<psp_mint::air_listener::Serve> {
-        let (state, rot, records, health, limits) = (
+    pub fn serve(&self, psp: ServiceDid) -> Arc<psp_mint::air_listener::Serve> {
+        let (state, rot, health, limits) = (
             Arc::clone(&self.state),
             Arc::clone(&self.rot),
-            Arc::clone(&self.records),
             Arc::clone(&self.health),
             self.limits,
         );
+        // The claims are checked against the records the scan side shares, and
+        // every claim's signature covers the DID of the mint it is sent to.
+        let desk = psp_mint::server::ClaimDesk {
+            records: Arc::clone(&self.records),
+            psp,
+        };
         Arc::new(move |kind: u8, body: &[u8]| {
-            psp_mint::server::air_served_with(&state, &rot, &records, &health, &limits, kind, body)
+            psp_mint::server::air_served_with(&state, &rot, &desk, &health, &limits, kind, body)
         })
     }
 }
@@ -268,10 +273,11 @@ impl PspAt {
         let server = server();
         std::fs::create_dir_all(data).unwrap();
         let key = DidKey::new();
+        let did = addr::key_to_did(&key.public_key());
         let at = PspAt {
-            did: addr::key_to_did(&key.public_key()),
+            did,
             key,
-            serve: mint.serve(),
+            serve: mint.serve(did),
             data: data.to_path_buf(),
             listener: Mutex::new(None),
             server,
@@ -356,6 +362,18 @@ impl PspUp {
     /// The wallet's `[air]` settings for this PSP: ten seconds a try, three tries.
     pub fn air(&self) -> AirSettings {
         self.at.air(10, 3)
+    }
+}
+
+impl PspUp {
+    /// One pass of the PSP mint's deliverer: the owed record that is next for each
+    /// claim key is written to the AIR server, and its claim window opens now (the
+    /// wall clock, as the claims are checked against it). A claim key with
+    /// several records needs a pass for each.
+    pub fn deliver(&self) -> psp_mint::delivery::Report {
+        let mut deliverer =
+            psp_mint::delivery::Deliverer::new((*self.at.server).clone(), 3, self.at.key());
+        deliverer.pass_shared(&self.records, Instant::now(), addr::now_secs())
     }
 }
 

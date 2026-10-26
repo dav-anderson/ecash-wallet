@@ -26,7 +26,6 @@ use mint_types::Note;
 use secp256k1::SecretKey;
 use serde::{Deserialize, Serialize};
 use sp_wire::ServiceDid;
-use sp_wire::air_request::delivery::ReconcileRules;
 use sp_wire::esp::exchange::ExchangeRequest;
 
 use crate::blind::PendingOutput;
@@ -83,163 +82,117 @@ impl StoredNote {
     }
 }
 
-/// A PSP purchase whose payload has been made and whose signatures have not
-/// been claimed.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct PendingPurchase {
+/// The throwaway key of one PSP purchase, with everything the wallet knows about
+/// what the PSP mint owes for it. [`crate::psp`] explains the claim.
+///
+/// Each purchase gets a key of its own, made at random and never derived from or
+/// linked to the wallet's main DID, so the PSP mint cannot link two purchases of
+/// one wallet. Its public half is the whole payload of the payment. The secret
+/// is saved here before the payload is returned, opens the PSP mint's owed
+/// records and signs the claims, and is never logged. A claim key is not a
+/// request that ends: it is kept until the window of its last record has closed
+/// ([`crate::psp::Wallet::close_expired`]), so a second payment to the same
+/// payload can still be claimed. A key that still has no owed record
+/// `psp.unpaid_key_days` (90) days after it was made is dropped
+/// ([`crate::psp::Wallet::expire_unpaid`]).
+///
+/// It is part of the wallet file and of a backup, and is never part of a
+/// handoff: a handoff carries settled notes only.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimKey {
     /// SHA-256 of the sealed payload, as hex.
     pub id: String,
-    /// The purchase's reply DID, as hex: the public half of `reply_secret`. It
-    /// is in the payload, so the PSP knows it, and no other purchase has it.
-    pub reply_did: String,
-    pub mint_did_pubkey: String,
-    pub outputs: Vec<PendingOutput>,
-    /// The one-off secret key of the reply DID, as hex. The PSP seals the
-    /// purchase's delivery record to the reply DID, and only this opens it. It is
-    /// made for this purchase alone (the PSP cannot link two purchases of one
-    /// wallet), saved here before the payload is returned, and deleted when the
-    /// purchase is fully reconciled (see `Wallet::apply_delivery`). It is never
-    /// part of a handoff: a purchase has no notes until it settles.
-    pub reply_secret: String,
-    /// What the PSP delivers this purchase under, as hex: the hash of the
-    /// unsealed payload (`sp_wire::air_request::delivery::purchase_id`).
-    pub delivery_id: String,
-    /// Set when the PSP's record said the payment is held or was rejected: the
-    /// purchase and its key stay until the PSP settles it or `open.open_until`
-    /// passes ([`Wallet::close_expired`]). `None` while nothing has been
-    /// delivered.
-    #[serde(default)]
-    pub open: Option<OpenPurchase>,
+    /// The purchase's claim DID, as hex: the public half of `claim_secret`, and
+    /// the payload.
+    pub claim_did: String,
+    /// The secret key of the claim DID, as hex.
+    pub claim_secret: String,
+    /// The PSP mint's DID the payload was sealed to, as hex.
+    pub psp_did: String,
+    /// Unix seconds, this wallet's clock: when the key was made (`buy-psp`). A key
+    /// with no owed record expires `psp.unpaid_key_days` after this.
+    pub created_at: u64,
+    /// The index of the next owed record to read: the cells below it were read
+    /// (or skipped) already. Reading starts here and stops at the first cell that
+    /// is empty.
+    pub next_index: u32,
+    /// The owed records read so far, by index.
+    pub records: Vec<OwedClaim>,
 }
 
-/// Why a paid purchase is still open, from the PSP's record.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum OpenKind {
-    /// The payment is held: not settled yet (the amount paid does not match what
-    /// was asked for, say).
-    Held,
-    /// The purchase was rejected and nothing was signed.
-    Rejected,
-}
-
-/// What the PSP said about a purchase it did not sign (see [`OpenKind`]), and
-/// until when it keeps the payment open.
+/// One payment's owed record, as the wallet read it, and what the wallet has
+/// done to claim it. A claim key holds one for each payment made to its payload.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OpenPurchase {
-    pub kind: OpenKind,
-    /// The PSP's reason.
-    pub reason: String,
-    /// What the PSP received, in satoshis and in USD cents at its price.
-    pub paid_sats: u64,
-    pub paid_cents: u64,
-    /// For a held payment: the units the purchase asked for, and how far the
-    /// payment is from covering them, in basis points (negative: short). 0 for a
-    /// rejection.
-    pub requested_units: u64,
-    pub over_under_bps: i64,
-    /// Unix seconds. If the payment is not settled by then the PSP forfeits it
-    /// and keeps the bitcoin; the wallet deletes the purchase and its key.
-    pub open_until: u64,
-    /// The rules of the reconciliation, as the first record gave them and as the
-    /// PSP will check a request against them (never against its current
-    /// settings): what to send, the exact total it must carry, the deadline and
-    /// the most requests the PSP counts. A record that is held or rejected and
-    /// carries no rules is not stored (a mint error).
-    pub rules: ReconcileRules,
-    /// What the wallet has built and sent to settle it.
-    pub reconcile: ReconcileState,
+pub struct OwedClaim {
+    /// The record's index under the claim key (its cell is `(PSP mint, claim
+    /// DID, index)`).
+    pub index: u32,
+    /// The record's id, as hex: what a claim names.
+    pub record_id: String,
+    /// The transaction the record is for, as the PSP mint wrote it.
+    pub txid: String,
+    /// The exact total of the claim, in PSP units, from the record's terms.
+    pub due_units: u64,
+    /// How long the record stays claimable, in seconds, from the record's terms
+    /// (`sp_wire::psp::CLAIM_WINDOW_SECS`).
+    pub window_secs: u64,
+    /// Unix seconds, this wallet's clock: when the wallet first read the record.
+    /// The window is counted from the PSP mint's write, which the wallet cannot
+    /// see and which is never later than the first read, so the wallet counts
+    /// from the read.
+    pub first_read_at: u64,
+    /// How many claims the PSP mint counts for this record, from the terms.
+    pub max_attempts: u32,
+    /// The claim the wallet built, saved before it was first sent.
+    pub request: Option<SavedClaim>,
+    /// Other saved claims for this record, each different from `request`: two
+    /// copies of the wallet each built and sent a claim, and a merge keeps both
+    /// (the blinding factors of each are the only copy). Each is sent again at
+    /// every start; the first one the PSP mint answers is applied, and then all
+    /// of them are dropped. One the PSP mint refuses in a signed reply is dropped.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub others: Vec<SavedClaim>,
+    /// How many claims the wallet has built for this record.
+    pub attempts: u32,
+    /// True when the last time the saved claim was sent the PSP mint did not
+    /// answer. Cleared when a new claim is built.
+    pub unanswered: bool,
+    /// True once the user was told that the record is lost, so it is said once.
+    pub told_lost: bool,
+    /// True once the PSP mint's answer was applied and the notes are stored.
+    pub done: bool,
 }
 
-impl OpenPurchase {
-    /// Whether `other` is the same record of the PSP: everything but what the
-    /// wallet has done since (`reconcile`).
-    pub(crate) fn same_record(&self, other: &OpenPurchase) -> bool {
-        self.kind == other.kind
-            && self.reason == other.reason
-            && self.paid_sats == other.paid_sats
-            && self.paid_cents == other.paid_cents
-            && self.requested_units == other.requested_units
-            && self.over_under_bps == other.over_under_bps
-            && self.open_until == other.open_until
-            && self.rules == other.rules
+impl OwedClaim {
+    /// When the record's window closes: the first read plus `window_secs`
+    /// (Unix seconds).
+    pub fn window_ends(&self) -> u64 {
+        self.first_read_at.saturating_add(self.window_secs)
+    }
+
+    /// Whether the record's window is still open at `now`.
+    pub fn is_open(&self, now: u64) -> bool {
+        now < self.window_ends()
     }
 }
 
-/// What the wallet has done to settle one open payment (a held or rejected
-/// purchase, or a credit): the request it built, how many it has built, and what
-/// the user has been told. It is part of the payment's record, so a payment
-/// that is closed (reconciled, or its window ended) takes it along, and a merge
-/// carries it with the payment (see `merge.rs`).
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReconcileState {
-    /// The request that was built, saved before it was first sent. `None` until
-    /// one is built (and for a payment with nothing due, which is never sent).
-    pub request: Option<SavedRequest>,
-    /// How many requests the wallet has built for this payment. The PSP counts a
-    /// request it refuses for its content, and accepts `rules.max_attempts` of
-    /// them, so the wallet builds a second only for the keyset-rotation race and
-    /// never more than the rules allow.
-    pub attempts: u32,
-    /// True when the last time the saved request was sent the PSP did not answer
-    /// (every try of `air.attempts` passed with no reply). Cleared when a new
-    /// request is built.
-    pub unanswered: bool,
-    /// True once the user was told that the payment is lost (nothing is due, or
-    /// the PSP did not accept the request), so it is said once.
-    pub told_lost: bool,
-}
-
-/// A reconciliation request as it was built and saved: the exact bytes that are
-/// sent (a resend is these bytes, never a rebuilt request) and the blinding
-/// factors of its outputs, which are the only copy.
+/// A claim as it was built and saved: the exact bytes that are sent (a resend is
+/// these bytes, never a rebuilt claim) and the blinding factors of its outputs,
+/// which are the only copy.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SavedRequest {
-    /// The request body as sent: the JSON of `sp_wire::psp::ReconcileRequest`,
-    /// as hex.
+pub struct SavedClaim {
+    /// The claim body as sent: the JSON of `sp_wire::psp::ClaimRequest`, as hex.
     pub body: String,
-    /// The request's hash (`ReconcileRequest::hash`): the key the PSP stores its
+    /// The claim's hash (`ClaimRequest::hash`): the key the PSP mint stores its
     /// answer and its counted refusals under.
     pub hash: String,
-    /// The keyset the request names for its outputs.
+    /// The keyset the claim names for its outputs.
     pub keyset: String,
-    /// The request's outputs, with what is needed to unblind them.
+    /// The epoch of that keyset, from the PSP mint's rotation reply when the claim
+    /// was built. The notes it brings are stamped with it.
+    pub epoch: u64,
+    /// The claim's outputs, with what is needed to unblind them.
     pub outputs: Vec<PendingOutput>,
-}
-
-/// How long the wallet keeps a purchase's key when the PSP's record names no
-/// window for what is outstanding (outputs neither signed nor reported as
-/// dropped): 14 days, the PSP's default reconciliation window.
-pub const OPEN_KEY_FALLBACK_SECS: u64 = 14 * 24 * 3600;
-
-/// The one-off key of a purchase that was claimed but may not be closed: the PSP
-/// owes the payer a credit, or part of the purchase was neither signed nor
-/// reported as dropped. A credit is claimed with a reconciliation request (AIR
-/// kind 15) signed by this key, and the PSP's answer is sealed to it, so the key
-/// is kept until the credit is claimed or `open_until` ([`Wallet::close_expired`]
-/// deletes it then).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OpenReply {
-    /// The purchase's id (`PendingPurchase::id`).
-    pub id: String,
-    pub delivery_id: String,
-    pub mint_did_pubkey: String,
-    pub reply_secret: String,
-    /// What the PSP said it owes, in USD cents.
-    pub credit_cents: u64,
-    /// Requested units that were neither signed nor reported as dropped.
-    pub unaccounted_units: u64,
-    /// Unix seconds: when the PSP's window for the credit closes (from its
-    /// record), or, for outputs only unaccounted for, when the wallet gives up
-    /// ([`OPEN_KEY_FALLBACK_SECS`] after the record was applied).
-    pub open_until: u64,
-    /// The rules of the credit claim, from the record that said a credit is owed.
-    /// `Some` for every credit (a record that owes one and carries no rules is
-    /// not stored). `None` for a key kept only because some outputs were neither
-    /// signed nor reported as dropped: the PSP gave no rules for it, so there is
-    /// nothing to send.
-    pub rules: Option<ReconcileRules>,
-    /// What the wallet has built and sent to claim it.
-    pub reconcile: ReconcileState,
 }
 
 /// An ESP exchange that has been built and has not been finished.
@@ -305,9 +258,9 @@ pub struct WalletData {
     /// another network is refused by a merge.
     pub network: String,
     pub notes: Vec<StoredNote>,
-    pub pending_purchases: Vec<PendingPurchase>,
-    /// The one-off keys of PSP purchases that were claimed but may still be open.
-    pub open_replies: Vec<OpenReply>,
+    /// The throwaway key of each PSP purchase, with the records the PSP mint owes
+    /// for it (see [`ClaimKey`]).
+    pub claim_keys: Vec<ClaimKey>,
     pub pending_exchanges: Vec<PendingExchange>,
     /// What this wallet has handed to services, kept as a record. The notes in
     /// it are no longer in `notes`.
@@ -379,13 +332,6 @@ pub struct WalletData {
     /// Requests over AIR that have not ended (see `air.rs`). Local to
     /// this copy of the wallet: a merge keeps this copy's.
     pub air_requests: Vec<PendingAirRequest>,
-    /// Ids of PSP purchases whose reconciliation is done (the corrected request
-    /// or the credit claim was answered and its notes stored). A purchase that is
-    /// claimed with a credit owed is `finished` already while its key is kept, so
-    /// `finished` cannot say that the credit was claimed; this does, and a copy
-    /// retrieved from storage cannot bring back an open payment, or a credit,
-    /// that either copy has reconciled (see `merge.rs`).
-    pub reconciled: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -405,7 +351,8 @@ pub struct Balance {
     pub unswapped_psp: u128,
     /// Notes held back for a pending request.
     pub reserved: usize,
-    pub pending_purchases: usize,
+    /// The PSP purchase keys the wallet holds (see [`ClaimKey`]).
+    pub claim_keys: usize,
     pub pending_exchanges: usize,
     /// Redemptions built and not over, including ones queued for payout.
     pub pending_redemptions: usize,
@@ -433,11 +380,6 @@ pub struct Wallet {
     path: PathBuf,
     data: WalletData,
     limits: EspLimits,
-    /// The PSP's largest note size, once read from its `GET /keys`. Not saved.
-    psp_top: Option<u64>,
-    /// The smallest purchase the wallet will build, in PSP units
-    /// (`psp.min_purchase`). Not saved: it is a setting, given by the caller.
-    psp_min: u64,
 }
 
 /// Read a wallet file's bytes (`what` names the file in messages). A file that
@@ -487,8 +429,6 @@ impl Wallet {
             path: path.to_path_buf(),
             data,
             limits: EspLimits::default(),
-            psp_top: None,
-            psp_min: crate::psp::DEFAULT_MIN_PURCHASE,
         })
     }
 
@@ -500,39 +440,6 @@ impl Wallet {
     /// Set the ESP mint's note limits (see [`EspLimits`]).
     pub fn set_esp_limits(&mut self, limits: EspLimits) {
         self.limits = limits;
-    }
-
-    /// The PSP's largest note size, if it has been read (see
-    /// `mint_info::sync_psp_limits`). The wallet keeps no number of its own: until
-    /// it is read, a purchase is checked only for being a power of two and the
-    /// PSP decides the top.
-    pub fn psp_max_denomination(&self) -> Option<u64> {
-        self.psp_top
-    }
-
-    /// Set the PSP's largest note size.
-    pub fn set_psp_max_denomination(&mut self, top: Option<u64>) {
-        self.psp_top = top;
-    }
-
-    /// The smallest purchase this wallet will build, in PSP units: the default
-    /// ([`crate::psp::DEFAULT_MIN_PURCHASE`]) until [`Wallet::set_psp_min_purchase`].
-    pub fn psp_min_purchase(&self) -> u64 {
-        self.psp_min
-    }
-
-    /// Set the smallest purchase the wallet will build (`psp.min_purchase`), in
-    /// PSP units, 1 or more. This is the wallet refusing to build a payload that
-    /// the PSP's fees could eat whole; the PSP itself is unchanged. The setting
-    /// is not saved in the wallet file: the caller gives it every run.
-    pub fn set_psp_min_purchase(&mut self, units: u64) -> Result<(), WalletError> {
-        if units == 0 {
-            return Err(WalletError::Invalid(
-                "psp.min_purchase must be 1 or more PSP units".into(),
-            ));
-        }
-        self.psp_min = units;
-        Ok(())
     }
 
     pub(crate) fn data(&self) -> &WalletData {
@@ -547,13 +454,9 @@ impl Wallet {
         &self.data.notes
     }
 
-    pub fn pending_purchases(&self) -> &[PendingPurchase] {
-        &self.data.pending_purchases
-    }
-
-    /// The keys kept for PSP purchases that may still be open.
-    pub fn open_replies(&self) -> &[OpenReply] {
-        &self.data.open_replies
+    /// The throwaway key of each PSP purchase, with its owed records.
+    pub fn claim_keys(&self) -> &[ClaimKey] {
+        &self.data.claim_keys
     }
 
     pub fn pending_exchanges(&self) -> &[PendingExchange] {
@@ -681,7 +584,7 @@ impl Wallet {
             }
         }
         b.unswapped_psp = self.unswapped_psp();
-        b.pending_purchases = self.data.pending_purchases.len();
+        b.claim_keys = self.data.claim_keys.len();
         b.pending_exchanges = self.data.pending_exchanges.len();
         b.pending_redemptions = self.data.pending_redemptions.len();
         b.handed_over = self.data.handovers.len();
@@ -702,7 +605,6 @@ impl Wallet {
 /// The ids of the requests a wallet is waiting on, of every kind.
 fn pending_ids(d: &WalletData) -> BTreeSet<String> {
     let mut ids = BTreeSet::new();
-    ids.extend(d.pending_purchases.iter().map(|p| p.id.clone()));
     ids.extend(d.pending_exchanges.iter().map(|p| p.id.clone()));
     ids.extend(d.pending_redemptions.iter().map(|p| p.id.clone()));
     ids.extend(d.pending_fsp.iter().map(|p| p.id.clone()));

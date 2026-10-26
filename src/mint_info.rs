@@ -5,16 +5,15 @@
 //!
 //! **The PSP's** calls are its mint info ([`verify_psp`]), its keys, keysets and
 //! rotation ([`psp_keys`], [`psp_keysets`], [`psp_window`], and the calls built
-//! on them: [`sync_psp_limits`], [`rotation_sync`], [`reclaim_handoff`]) and its
-//! two POSTs, rollover and check-state
-//! ([`psp_post`], and the calls built on it: [`rotation_sync`],
-//! [`reclaim_handoff`], [`check_handoff`], [`complete_import`]). **The PSP's
-//! delivery** is not a call: the PSP writes each purchase's signatures to the
-//! SPI's AIR server, and [`psp_pickup`] reads those records (the AIR server is
-//! `air.server` and `air.host`, as for every PSP call). **The PSP's
-//! reconciliation** (AIR kind 15) settles a payment the PSP held or rejected, or
-//! a credit it owes: [`psp_reconcile`] builds the request from the record's
-//! rules, sends it and applies the answer.
+//! on them: [`rotation_sync`], [`reclaim_handoff`]) and its two POSTs, rollover
+//! and check-state ([`psp_post`], and the calls built on it: [`rotation_sync`],
+//! [`reclaim_handoff`], [`check_handoff`], [`complete_import`]). **What the PSP
+//! mint owes for a purchase** is not a call: the PSP mint writes an owed record
+//! for each payment to the SPI's AIR server, and [`psp_pickup`] reads those
+//! records (the AIR server is `air.server` and `air.host`, as for every PSP
+//! call). **The PSP's claim** (AIR kind 15) is how the notes are had: [`psp_claim`]
+//! builds the claim from the record, sends it and applies the answer, and
+//! [`psp_close_expired`] closes the records whose window has passed.
 //!
 //! **The ESP's** are its mint info ([`verify_esp`]), keysets ([`sync_esp_keysets`]),
 //! fees ([`sync_esp_limits`], [`fetch_redeem_fees`]), rotation ([`esp_window`])
@@ -51,12 +50,12 @@ use sp_wire::air_request::client::{self, ServerRef, block_on_new_runtime};
 use sp_wire::air_request::delivery;
 use sp_wire::air_request::{
     KIND_CHECK_STATE, KIND_EXCHANGE, KIND_FEES, KIND_FSP_ISSUE, KIND_FSP_SPEND, KIND_KEYS,
-    KIND_KEYSETS, KIND_PSP_RECONCILE, KIND_REDEEM, KIND_ROLLOVER, KIND_ROTATION,
+    KIND_KEYSETS, KIND_PSP_CLAIM, KIND_REDEEM, KIND_ROLLOVER, KIND_ROTATION,
 };
 use sp_wire::esp::exchange::{ExchangeRequest, ExchangeResponse};
 use sp_wire::esp::redeem::RedeemResponse;
 use sp_wire::keys::{CheckStateRequest, CheckStateResponse};
-use sp_wire::psp::ReconcileResponse;
+use sp_wire::psp::ClaimResponse;
 
 use crate::Wallet;
 use crate::config::{AirSettings, Party};
@@ -112,104 +111,87 @@ pub fn psp_window(wallet: &mut Wallet, air: &AirSettings) -> Result<Window, Wall
     Ok(reply.into())
 }
 
-/// Read the PSP's largest note size from its keys (the highest amount it has a
-/// key for) and give it to the wallet, so no cap is written into the wallet.
-pub fn sync_psp_limits(wallet: &mut Wallet, air: &AirSettings) -> Result<(), WalletError> {
-    let keys = psp_keys(wallet, air)?;
-    wallet.set_psp_max_denomination(keys.keys().map(|a| a.units).max());
-    Ok(())
-}
-
-/// What picking up one pending purchase's record came to.
+/// What picking up one claim key's owed records came to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PickedUp {
-    /// The pending purchase's id.
+    /// The claim key's id (the purchase).
     pub id: String,
-    pub what: Pickup,
+    /// The records read for the first time, in order.
+    pub new: Vec<crate::store::OwedClaim>,
+    /// The cells that did not open (a mint error or a forged write) and were
+    /// skipped for good: the cell's index and why.
+    pub skipped: Vec<(u32, String)>,
+    /// True when the key holds no record at all: the PSP mint has not written
+    /// one yet (a payment is settled at the confirmations its tier asks for), or
+    /// the payload was never paid.
+    pub no_record: bool,
+    /// Why the key could not be read, if it could not (a claim key or a PSP mint
+    /// key in the wallet file that is not valid, or an AIR failure after the
+    /// first read). The key is as it was.
+    pub problem: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Pickup {
-    /// The record was there: the notes were claimed (and the purchase cleared).
-    Claimed(crate::psp::Claimed),
-    /// The record said the PSP holds the payment, or rejected the purchase, and
-    /// nothing was signed. The purchase and its key are kept open until the
-    /// window closes ([`Wallet::close_expired`]).
-    Open(crate::store::OpenPurchase),
-    /// An open purchase from an earlier pickup, not read again: its record is
-    /// written once, and a reconciliation request settles it
-    /// ([`psp_reconcile`]).
-    StillOpen(crate::store::OpenPurchase),
-    /// The PSP has not written the record yet (a payment settles at 6
-    /// confirmations).
-    NotThere,
-    /// The record was there and was not accepted (it did not open, was not the
-    /// PSP's, or did not match the purchase). Nothing changed.
-    Bad(String),
-}
-
-/// Read the PSP's record for every pending purchase that has none yet and apply
-/// it: the notes are claimed and the purchase cleared, or the purchase is marked
-/// open with what the PSP said (held, or rejected) and kept. A purchase that is
-/// open already is reported ([`Pickup::StillOpen`]) and not read. Each
-/// purchase's address is computed from the PSP's DID, the purchase's own reply
-/// DID and the purchase id; the record is opened with the purchase's one-off key
-/// and the PSP's signature is checked ([`delivery::open_record`]). A record that
-/// is not there yet is waited for, for `wait_secs` in all (0 reads once and
-/// returns). Reading again changes nothing: a purchase that was claimed is no
-/// longer pending, and one that is open is not read.
+/// Read the next owed record of every claim key and apply what is there.
 ///
-/// With no purchase to read nothing is asked of the network and the AIR settings
-/// are not needed. Otherwise they are, and a missing `air.server` or `air.host`
-/// is an error that names it. An unreachable AIR server is [`WalletError::Mint`]
-/// and changes nothing; a record that fails a check is that purchase's
-/// [`Pickup::Bad`] and the others are still picked up.
+/// Each key's records are the cells 0, 1, 2 and so on of the PSP mint, computed
+/// from its DID, the key's claim DID and the index
+/// (`sp_wire::air_request::delivery::owed_address`). The wallet reads from the
+/// key's `next_index`, opens each cell with the claim key and the PSP mint's
+/// signature is checked ([`Wallet::apply_delivery`]), skips a cell that does not
+/// open ([`PickedUp::skipped`]) and reads on, and stops at the first cell that is
+/// empty, which it will read again the next time. A key that holds no record yet
+/// is waited for, for `wait_secs` in all (0 reads once and returns); a key that
+/// holds records is read once. Reading again changes nothing: a cell that was
+/// applied or skipped is not read again.
+///
+/// With no claim key nothing is asked of the network and the AIR settings are not
+/// needed. Otherwise they are, and a missing `air.server` or `air.host` is an
+/// error that names it. An unreachable AIR server is [`WalletError::Mint`] and
+/// changes nothing; a record that fails a check is that key's
+/// [`PickedUp::skipped`] and the others are still picked up.
 pub fn psp_pickup(
     wallet: &mut Wallet,
     air: &AirSettings,
     wait_secs: u64,
 ) -> Result<Vec<PickedUp>, WalletError> {
     struct Job {
+        out: usize,
         id: String,
-        address: sp_wire::seal::PublicKey,
-        reply_key: sp_wire::seal::SecretKey,
         psp: ServiceDid,
-        purchase: [u8; 32],
+        claim: ServiceDid,
+        next: u32,
+        had_records: bool,
     }
     let mut out: Vec<PickedUp> = Vec::new();
     let mut jobs: Vec<Job> = Vec::new();
-    for p in wallet.pending_purchases() {
-        if let Some(open) = &p.open {
-            out.push(PickedUp {
-                id: p.id.clone(),
-                what: Pickup::StillOpen(open.clone()),
-            });
-            continue;
-        }
+    for key in wallet.claim_keys() {
+        out.push(PickedUp {
+            id: key.id.clone(),
+            new: Vec::new(),
+            skipped: Vec::new(),
+            no_record: false,
+            problem: None,
+        });
         let made = (|| -> Result<Job, String> {
-            let reply_key = sp_wire::air_request::addr::secret_from_hex(&p.reply_secret)
-                .map_err(|e| format!("the saved reply key: {e}"))?;
-            let purchase: [u8; 32] = hex::decode(&p.delivery_id)
-                .ok()
-                .and_then(|b| b.try_into().ok())
-                .ok_or("the saved delivery id is not 32 bytes of hex")?;
-            let psp = ServiceDid::parse(&p.mint_did_pubkey)
-                .map_err(|e| format!("the PSP key the purchase was sealed to: {e}"))?;
-            let reply = sp_wire::air_request::addr::key_to_did(&reply_key.public_key());
+            let psp = ServiceDid::parse(&key.psp_did)
+                .map_err(|e| format!("the PSP mint key the purchase was sealed to: {e}"))?;
+            let claim = ServiceDid::parse(&key.claim_did)
+                .map_err(|e| format!("the saved claim DID: {e}"))?;
             Ok(Job {
-                id: p.id.clone(),
-                address: delivery::delivery_address(&psp, &reply, &purchase),
-                reply_key,
+                out: out.len() - 1,
+                id: key.id.clone(),
                 psp,
-                purchase,
+                claim,
+                next: key.next_index,
+                had_records: !key.records.is_empty(),
             })
         })();
         match made {
             Ok(job) => jobs.push(job),
-            Err(why) => out.push(PickedUp {
-                id: p.id.clone(),
-                what: Pickup::Bad(why),
-            }),
+            Err(why) => {
+                let last = out.len() - 1;
+                out[last].problem = Some(why);
+            }
         }
     }
     if jobs.is_empty() {
@@ -220,91 +202,144 @@ pub fn psp_pickup(
         .address(air)
         .map_err(WalletError::Invalid)?;
     let server = ServerRef { name, host };
-    let addresses: Vec<_> = jobs.iter().map(|j| j.address).collect();
     let read_secs = air.timeout_secs;
-    let found = block_on_new_runtime(|| async {
-        let client = client::connect(&server).await.map_err(|e| e.0)?;
-        delivery::read_records(&client, &addresses, read_secs, wait_secs)
-            .await
-            .map_err(|e| e.0)
-    })
-    .map_err(|e| WalletError::Mint(e.0))?
-    .map_err(|e| {
-        WalletError::Mint(format!(
-            "the PSP's records could not be read from the AIR server: {e}"
-        ))
-    })?;
-
-    for (job, sealed) in jobs.into_iter().zip(found) {
-        let what = match sealed {
-            None => Pickup::NotThere,
-            Some(bytes) => {
-                match delivery::open_record(&job.reply_key, &job.psp, &job.purchase, &bytes) {
-                    Err(e) => Pickup::Bad(format!("the record was not accepted: {e}")),
-                    Ok(opened) => match wallet.apply_delivery(&job.id, &opened.outcome) {
-                        Ok(crate::psp::Delivered::Claimed(c)) => Pickup::Claimed(c),
-                        Ok(crate::psp::Delivered::Open(open)) => Pickup::Open(open),
-                        // Applied by a copy of this wallet meanwhile.
-                        Ok(crate::psp::Delivered::AlreadyDone) => continue,
-                        Err(e) => Pickup::Bad(format!("the record could not be applied: {e}")),
-                    },
+    let now = sp_wire::air_request::addr::now_secs();
+    let mut active: Vec<Job> = jobs;
+    let mut first_round = true;
+    while !active.is_empty() {
+        // Only a key with no record yet is waited for, and only in the first
+        // round: a key that has records is read once.
+        let hold: Vec<bool> = active
+            .iter()
+            .map(|j| first_round && !j.had_records)
+            .collect();
+        let addresses: Vec<_> = active
+            .iter()
+            .map(|j| delivery::owed_address(&j.psp, &j.claim, j.next))
+            .collect();
+        let waited: Vec<_> = addresses
+            .iter()
+            .zip(&hold)
+            .filter(|(_, h)| **h)
+            .map(|(a, _)| *a)
+            .collect();
+        let once: Vec<_> = addresses
+            .iter()
+            .zip(&hold)
+            .filter(|(_, h)| !**h)
+            .map(|(a, _)| *a)
+            .collect();
+        let read = block_on_new_runtime(|| async {
+            let client = client::connect(&server).await.map_err(|e| e.0)?;
+            let waited = if waited.is_empty() {
+                Vec::new()
+            } else {
+                delivery::read_records(&client, &waited, read_secs, wait_secs)
+                    .await
+                    .map_err(|e| e.0)?
+            };
+            let once = if once.is_empty() {
+                Vec::new()
+            } else {
+                delivery::read_records(&client, &once, read_secs, 0)
+                    .await
+                    .map_err(|e| e.0)?
+            };
+            Ok::<_, String>((waited, once))
+        })
+        .map_err(|e| WalletError::Mint(e.0))
+        .and_then(|r| {
+            r.map_err(|e| {
+                WalletError::Mint(format!(
+                    "the PSP mint's records could not be read from the AIR server: {e}"
+                ))
+            })
+        });
+        let (mut waited, mut once) = match read {
+            Ok((waited, once)) => (waited.into_iter(), once.into_iter()),
+            Err(e) if first_round => return Err(e),
+            Err(e) => {
+                for job in &active {
+                    out[job.out].problem = Some(e.to_string());
                 }
+                break;
             }
         };
-        out.push(PickedUp { id: job.id, what });
+        first_round = false;
+        let mut next_round = Vec::new();
+        for (mut job, hold) in active.into_iter().zip(hold) {
+            let sealed = (if hold { waited.next() } else { once.next() }).flatten();
+            let Some(bytes) = sealed else {
+                continue;
+            };
+            match wallet.apply_delivery(&job.id, job.next, &bytes, now) {
+                Ok(crate::psp::Delivered::Stored(record)) => out[job.out].new.push(record),
+                Ok(crate::psp::Delivered::AlreadyDone) => {}
+                Err(WalletError::Mint(why)) => {
+                    out[job.out].skipped.push((job.next, why));
+                    wallet.skip_record(&job.id, job.next)?;
+                }
+                Err(e) => {
+                    out[job.out].problem = Some(e.to_string());
+                    continue;
+                }
+            }
+            job.next += 1;
+            job.had_records = true;
+            next_round.push(job);
+        }
+        active = next_round;
+    }
+    for (p, key) in out.iter_mut().zip(wallet.claim_keys()) {
+        p.no_record = key.records.is_empty() && p.problem.is_none();
     }
     Ok(out)
 }
 
-/// What the reconciliation of one open payment came to this time.
+/// What claiming one owed record came to this time.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReconcileReport {
-    /// The purchase's id.
+pub struct ClaimReport {
+    /// The claim key's id (the purchase).
     pub id: String,
-    pub what: Reconciled,
+    /// The record's index under the claim key.
+    pub index: u32,
+    pub what: ClaimOutcome,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Reconciled {
-    /// The PSP answered: the notes were stored, and the purchase or credit, its
-    /// key and the saved request were removed.
-    Settled(crate::psp::Settled),
-    /// The rules' `due_units` is 0: the PSP's fees take the whole amount, so
-    /// nothing was built or sent, and the payment is lost at `open_until`. Said
-    /// once; the wallet remembers it told the user.
-    NothingDue(crate::psp::Loss),
-    /// The request was sent and the PSP did not answer. It answers an accepted
-    /// request only, so this is also what a refused one looks like. The identical
-    /// request is sent again at the next start, until `open_until` (`attempts`
-    /// requests have been built).
-    Waiting { attempts: u32, open_until: u64 },
-    /// The PSP did not answer, and every request the rules allow has been built:
-    /// the PSP did not accept the request, and the payment is lost at
-    /// `open_until`. Said once. The saved request is still sent again, in case it
-    /// was accepted and its answer lost.
+pub enum ClaimOutcome {
+    /// The PSP mint answered: the notes were stored and the record is done.
+    Claimed(crate::psp::Settled),
+    /// The claim was sent and the PSP mint did not answer. It answers an accepted
+    /// claim only, so this is also what a refused one looks like. The identical
+    /// claim is sent again at the next start, until the window closes
+    /// (`attempts` claims have been built).
+    Waiting { attempts: u32, window_ends: u64 },
+    /// The PSP mint did not answer, and every claim the record allows has been
+    /// built: the PSP mint did not accept the claim. Said once. The saved claim is
+    /// still sent again, in case it was accepted and its answer lost.
     NotAccepted {
         loss: crate::psp::Loss,
         attempts: u32,
     },
-    /// Nothing was sent, and why (the purchase was sealed to another PSP than
+    /// Nothing was sent, and why (the purchase was sealed to another PSP mint than
     /// `air.psp_did`, say).
     NotSent(String),
-    /// The call failed or the answer was refused; the text says which. The
-    /// payment is as it was, with its key, and is tried again at the next start.
-    /// A bad answer stores nothing.
-    /// (At the close of the window, [`psp_close_expired`], a refused or bad
-    /// answer deletes the payment all the same, and a failed call keeps it for the
-    /// next start.)
+    /// The call failed or the answer was refused; the text says which. The record
+    /// is as it was, with its key, and is tried again at the next start. A bad
+    /// answer stores nothing. (At the close of the window, [`psp_close_expired`], a
+    /// refused or bad answer gives the claim up all the same, and a failed call
+    /// keeps it for the next start.)
     Failed(String),
 }
 
-/// What sending a saved request came to.
+/// What sending a saved claim came to.
 enum Step {
     Settled(crate::psp::Settled),
-    /// The payment was settled already (by a copy of this wallet).
+    /// The record was done already (by a copy of this wallet).
     Already,
     NoReply,
-    /// The call failed (`network`: the AIR server or the PSP could not be
+    /// The call failed (`network`: the AIR server or the PSP mint could not be
     /// reached, so the others will fail too) or the answer was refused.
     Failed {
         why: String,
@@ -312,14 +347,33 @@ enum Step {
     },
 }
 
-/// Send the request saved for `id` as it is, and apply the answer.
-fn send_saved(wallet: &mut Wallet, air: &AirSettings, id: &str) -> Result<Step, WalletError> {
-    let to_send = wallet.reconcile_to_send(id)?;
+/// Send the claim saved for record `index` of purchase `id` as it is, and apply
+/// the answer.
+fn send_saved(
+    wallet: &mut Wallet,
+    air: &AirSettings,
+    id: &str,
+    index: u32,
+) -> Result<Step, WalletError> {
+    send_saved_of(wallet, air, id, index, None)
+}
+
+/// [`send_saved`] for the saved claim whose hash is `other` (one of the record's
+/// other saved claims, which a merge kept), or the main one for `None`. Only the
+/// main one's silence is recorded (`unanswered`).
+fn send_saved_of(
+    wallet: &mut Wallet,
+    air: &AirSettings,
+    id: &str,
+    index: u32,
+    other: Option<&str>,
+) -> Result<Step, WalletError> {
+    let to_send = wallet.claim_to_send_of(id, index, other)?;
     let sent = match crate::air::call_with_key(
         wallet,
         air,
         Party::Psp,
-        KIND_PSP_RECONCILE,
+        KIND_PSP_CLAIM,
         &to_send.body,
         &to_send.key,
     ) {
@@ -333,33 +387,37 @@ fn send_saved(wallet: &mut Wallet, air: &AirSettings, id: &str) -> Result<Step, 
     };
     let verified = match sent {
         crate::air::Sent::NoReply(_) => {
-            wallet.note_unanswered(id, true)?;
+            if other.is_none() {
+                wallet.note_unanswered(id, index, true)?;
+            }
             return Ok(Step::NoReply);
         }
         crate::air::Sent::Answered(verified) => verified,
     };
-    wallet.note_unanswered(id, false)?;
+    if other.is_none() {
+        wallet.note_unanswered(id, index, false)?;
+    }
     if verified.refused() {
         return Ok(Step::Failed {
             why: format!(
-                "the PSP refused the reconciliation request in a signed reply: {}",
+                "the PSP mint refused the claim in a signed reply: {}",
                 String::from_utf8_lossy(verified.body())
             ),
             network: false,
         });
     }
-    let response: ReconcileResponse = match serde_json::from_slice(verified.body()) {
+    let response: ClaimResponse = match serde_json::from_slice(verified.body()) {
         Ok(response) => response,
         Err(e) => {
             return Ok(Step::Failed {
                 why: format!(
-                    "PSP reconciliation over AIR: the PSP signed a reply that is not what was asked for: {e}"
+                    "PSP claim over AIR: the PSP mint signed a reply that is not what was asked for: {e}"
                 ),
                 network: false,
             });
         }
     };
-    Ok(match wallet.apply_reconcile(id, &response) {
+    Ok(match wallet.apply_claim_to(id, index, other, &response) {
         Ok(crate::psp::Applied::Settled(settled)) => Step::Settled(settled),
         Ok(crate::psp::Applied::AlreadyDone) => Step::Already,
         Err(e) => Step::Failed {
@@ -369,74 +427,79 @@ fn send_saved(wallet: &mut Wallet, air: &AirSettings, id: &str) -> Result<Step, 
     })
 }
 
-/// Tell the user, once, about every open payment with nothing due (the PSP's fees
-/// take the whole amount): [`Reconciled::NothingDue`], and nothing else. It asks
-/// nothing of the network and needs no AIR settings. A payment it has told about
-/// before is not reported again ([`psp_reconcile`] calls this first, so the two
-/// never say it twice). The command line calls it by itself so that this is said
-/// even when the PSP cannot be reached for the others.
-pub fn psp_nothing_due(wallet: &mut Wallet) -> Result<Vec<ReconcileReport>, WalletError> {
-    use crate::psp::ReconcileStatus;
-    let now = sp_wire::air_request::addr::now_secs();
-    let mut out = Vec::new();
-    for open in wallet.open_reconciliations(now) {
-        if open.state == ReconcileStatus::NothingDue && !open.told_lost {
-            wallet.note_told_lost(&open.id)?;
-            if let Some(loss) = wallet.reconcile_loss(&open.id) {
-                out.push(ReconcileReport {
-                    id: open.id,
-                    what: Reconciled::NothingDue(loss),
-                });
-            }
-        }
-    }
-    Ok(out)
-}
-
-/// Settle every open payment the PSP holds, rejected or owes a credit for, with a
-/// reconciliation request (AIR kind 15), without being asked: this runs at every
-/// wallet start and in `claim-psp`.
-///
-/// For each payment still open ([`Wallet::open_reconciliations`]):
-///
-/// - **Nothing due** (the rules' `due_units` is 0): nothing is built and nothing
-///   is sent. The user is told once ([`Reconciled::NothingDue`]).
-/// - **No request saved yet:** read the PSP's keysets (fresh), build the request
-///   on its current keyset ([`Wallet::build_reconcile`]; it is saved before
-///   anything is sent) and send it.
-/// - **A request saved and unanswered:** send the identical request, once
-///   (`air.attempts` tries of `air.reply_wait_secs`). The PSP answers a repeat
-///   of an accepted request from its stored answer and counts nothing twice.
-/// - **The answer** is checked and applied in one write
-///   ([`Wallet::apply_reconcile`]): the notes are stored, and the purchase or
-///   credit, its key and the saved request are removed.
-/// - **No answer:** the PSP answers an accepted request only. The keysets are
-///   read again; when the saved request's keyset is neither the PSP's current nor
-///   its previous one, the one second request the rules allow is built on the
-///   current keyset and sent once, in the same run. Otherwise only the identical
-///   request is sent again, at the next start. When every request the rules
-///   allow has gone unanswered the user is told once that the PSP did not accept
-///   it ([`Reconciled::NotAccepted`]).
-///
-/// Nothing loops: each payment's request is sent once per call, and the second
-/// one only after a rotation. With no open payment nothing is asked of the
-/// network and the AIR settings are not needed; with nothing to send (every
-/// payment has nothing due) neither. A request is for the PSP the purchase was
-/// sealed to, and is not sent to another one ([`Reconciled::NotSent`]). A failed
-/// call is that payment's [`Reconciled::Failed`] and stops the others (the AIR
-/// server cannot be reached); the payment is tried again at the next start.
-pub fn psp_reconcile(
+/// Send each other saved claim of record `index` of purchase `id` (the ones a
+/// merge kept beside the main one, [`crate::store::OwedClaim::others`]), first.
+/// The first one the PSP mint answers is applied: the record is done and every
+/// saved claim of it is dropped, so the main one is not sent and nothing is told
+/// lost. One refused in a signed reply is dropped. One with no reply is kept and
+/// sent again at the next start (or, at the close, given up: `closing`). Returns
+/// what settled the record, if one did, and whether a call failed for the network.
+fn send_others(
     wallet: &mut Wallet,
     air: &AirSettings,
-) -> Result<Vec<ReconcileReport>, WalletError> {
-    use crate::psp::ReconcileStatus;
+    id: &str,
+    index: u32,
+    closing: bool,
+) -> Result<(Option<Step>, bool), WalletError> {
+    for hash in wallet.other_claims(id, index) {
+        match send_saved_of(wallet, air, id, index, Some(&hash))? {
+            step @ (Step::Settled(_) | Step::Already) => return Ok((Some(step), false)),
+            Step::NoReply => {
+                if closing {
+                    wallet.drop_other_claim(id, index, &hash)?;
+                }
+            }
+            Step::Failed { network: true, .. } => return Ok((None, true)),
+            Step::Failed { network: false, .. } => wallet.drop_other_claim(id, index, &hash)?,
+        }
+    }
+    Ok((None, false))
+}
+
+/// The PSP mint's current keyset and its epoch (rotation, kind 4) and that
+/// keyset's keys (kind 2), as a claim is built from them.
+fn current_keys(
+    wallet: &mut Wallet,
+    air: &AirSettings,
+) -> Result<(Window, BTreeMap<Amount, PublicKey>), WalletError> {
+    let window = psp_window(wallet, air)?;
+    let keys = psp_keys(wallet, air)?;
+    Ok((window, keys))
+}
+
+/// Claim every owed record the PSP mint has written, without being asked: this
+/// runs at every wallet start and in `claim-psp`, after [`psp_pickup`].
+///
+/// For each record that is still open ([`Wallet::open_claims`]):
+///
+/// - **No claim saved yet:** read the PSP mint's current keyset (rotation, kind 4)
+///   and its keys (kind 2), build the claim on that keyset
+///   ([`Wallet::build_claim`]; it is saved before anything is sent) and send it as
+///   AIR kind 15.
+/// - **A claim saved and unanswered:** send the identical claim, once
+///   (`air.attempts` tries of `air.reply_wait_secs`). The PSP mint answers a repeat
+///   of an accepted claim from its stored answer and counts nothing twice.
+/// - **The answer** is checked and applied in one write
+///   ([`Wallet::apply_claim`]): the notes are stored and the record is done.
+/// - **No answer:** the PSP mint answers an accepted claim only. The current
+///   keyset is read again. When it is not the keyset the saved claim names (the
+///   keyset rotated between the two), the claim is built again on the current one
+///   and sent once, in the same run, as long as the record's `max_attempts` allow
+///   it. Otherwise the identical claim is sent once more. When every claim the
+///   record allows has gone unanswered the user is told once that the PSP mint did
+///   not accept it ([`ClaimOutcome::NotAccepted`]).
+///
+/// Nothing loops: each record's claim is sent at most twice per call. With no
+/// record to claim nothing is asked of the network and the AIR settings are not
+/// needed. A claim is for the PSP mint the purchase was sealed to, and is not sent
+/// to another one ([`ClaimOutcome::NotSent`]). A failed call is that record's
+/// [`ClaimOutcome::Failed`] and stops the others (the AIR server cannot be
+/// reached); the record is tried again at the next start.
+pub fn psp_claim(wallet: &mut Wallet, air: &AirSettings) -> Result<Vec<ClaimReport>, WalletError> {
+    use crate::psp::ClaimStatus;
     let now = sp_wire::air_request::addr::now_secs();
-    let mut out = psp_nothing_due(wallet)?;
-    let to_do: Vec<_> = wallet
-        .open_reconciliations(now)
-        .into_iter()
-        .filter(|o| o.state != ReconcileStatus::NothingDue)
-        .collect();
+    let to_do = wallet.open_claims(now);
+    let mut out = Vec::new();
     if to_do.is_empty() {
         return Ok(out);
     }
@@ -444,83 +507,112 @@ pub fn psp_reconcile(
     Party::Psp.address(air).map_err(WalletError::Invalid)?;
     let psp = Party::Psp.did(air).to_hex();
 
-    let push = |out: &mut Vec<ReconcileReport>, id: &str, what: Reconciled| {
-        out.push(ReconcileReport {
+    let push = |out: &mut Vec<ClaimReport>, id: &str, index: u32, what: ClaimOutcome| {
+        out.push(ClaimReport {
             id: id.to_string(),
+            index,
             what,
         });
     };
     for open in to_do {
-        let id = open.id.clone();
-        if open.mint != psp {
+        let (id, index) = (open.id.clone(), open.index);
+        if open.psp != psp {
             push(
                 &mut out,
                 &id,
-                Reconciled::NotSent(format!(
-                    "purchase {id} was sealed to the PSP {}, but air.psp_did is {psp}. A reconciliation request is for the PSP the purchase was sent to, so nothing was sent",
-                    open.mint
+                index,
+                ClaimOutcome::NotSent(format!(
+                    "purchase {id} was sealed to the PSP mint {}, but air.psp_did is {psp}. A claim is for the PSP mint the purchase was sent to, so nothing was sent",
+                    open.psp
                 )),
             );
             continue;
         }
-        if open.state == ReconcileStatus::Due {
-            let keysets = match psp_keysets(wallet, air) {
-                Ok(keysets) => keysets,
+        // The other saved claims a merge kept go first: if the PSP mint signed one
+        // of them, the record is done with it and the main one is not sent.
+        match send_others(wallet, air, &id, index, false)? {
+            (Some(Step::Settled(settled)), _) => {
+                push(&mut out, &id, index, ClaimOutcome::Claimed(settled));
+                continue;
+            }
+            (Some(_), _) => continue,
+            (None, true) => {
+                push(
+                    &mut out,
+                    &id,
+                    index,
+                    ClaimOutcome::Failed(
+                        "an other saved claim could not be sent: the AIR server cannot be reached"
+                            .into(),
+                    ),
+                );
+                break;
+            }
+            (None, false) => {}
+        }
+        if open.status == ClaimStatus::Due {
+            let (window, keys) = match current_keys(wallet, air) {
+                Ok(read) => read,
                 Err(e) => {
-                    push(&mut out, &id, Reconciled::Failed(e.to_string()));
+                    push(&mut out, &id, index, ClaimOutcome::Failed(e.to_string()));
                     break;
                 }
             };
-            if let Err(e) = wallet.build_reconcile(&id, &keysets, now) {
-                push(&mut out, &id, Reconciled::Failed(e.to_string()));
+            if let Err(e) = wallet.build_claim(&id, index, &window, &keys, now) {
+                push(&mut out, &id, index, ClaimOutcome::Failed(e.to_string()));
                 continue;
             }
         }
-        let mut step = send_saved(wallet, air, &id)?;
+        let mut step = send_saved(wallet, air, &id, index)?;
         if matches!(step, Step::NoReply) {
-            // A request the PSP refused gets no reply, so what is left to ask is
-            // whether the request's keyset is still one the PSP signs with.
-            if let Ok(keysets) = psp_keysets(wallet, air) {
-                let sent = wallet.reconcile_to_send(&id)?;
-                if !crate::psp::keyset_is_live(&keysets, &sent.keyset)
-                    && wallet.build_reconcile(&id, &keysets, now).is_ok()
-                {
-                    step = send_saved(wallet, air, &id)?;
+            // A claim the PSP mint refused gets no reply, so what is left to ask is
+            // whether the keyset the claim names is still the one it signs with.
+            if let Ok(window) = psp_window(wallet, air) {
+                let sent = wallet.claim_to_send(&id, index)?;
+                if window.current_id != sent.keyset {
+                    if let Ok(keys) = psp_keys(wallet, air)
+                        && wallet.build_claim(&id, index, &window, &keys, now).is_ok()
+                    {
+                        step = send_saved(wallet, air, &id, index)?;
+                    }
+                } else {
+                    step = send_saved(wallet, air, &id, index)?;
                 }
             }
         }
         match step {
-            Step::Settled(settled) => push(&mut out, &id, Reconciled::Settled(settled)),
+            Step::Settled(settled) => push(&mut out, &id, index, ClaimOutcome::Claimed(settled)),
             Step::Already => {}
             Step::NoReply => {
                 let open = wallet
-                    .open_reconciliations(now)
+                    .open_claims(now)
                     .into_iter()
-                    .find(|o| o.id == id);
+                    .find(|o| o.id == id && o.index == index);
                 match open {
                     // nothing more can be built and nothing came back: said once
-                    Some(o) if o.state == ReconcileStatus::Lost && !o.told_lost => {
-                        wallet.note_told_lost(&id)?;
-                        let loss = wallet.reconcile_loss(&id).expect("the payment is open");
-                        let what = Reconciled::NotAccepted {
+                    Some(o) if o.status == ClaimStatus::Refused && !o.told_lost => {
+                        wallet.note_told_lost(&id, index)?;
+                        let loss = wallet.refused_loss(&id, index).expect("the record is open");
+                        let what = ClaimOutcome::NotAccepted {
                             loss,
                             attempts: o.attempts,
                         };
-                        push(&mut out, &id, what);
+                        push(&mut out, &id, index, what);
                     }
                     Some(o) => push(
                         &mut out,
                         &id,
-                        Reconciled::Waiting {
+                        index,
+                        ClaimOutcome::Waiting {
                             attempts: o.attempts,
-                            open_until: o.open_until,
+                            window_ends: o.window_ends,
                         },
                     ),
                     None => {}
                 }
             }
             Step::Failed { why, network } => {
-                push(&mut out, &id, Reconciled::Failed(why));
+                push(&mut out, &id, index, ClaimOutcome::Failed(why));
                 if network {
                     break;
                 }
@@ -530,97 +622,129 @@ pub fn psp_reconcile(
     Ok(out)
 }
 
-/// What closing the reconciliation window came to.
+/// What closing the claim windows came to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Closed {
-    /// The payments the last resend settled ([`Reconciled::Settled`]), and the
+    /// The records the last resend settled ([`ClaimOutcome::Claimed`]), and the
     /// ones whose last resend was answered with a refusal or a bad answer
-    /// ([`Reconciled::Failed`]); the failed ones are deleted all the same, and
+    /// ([`ClaimOutcome::Failed`]); the failed ones are given up all the same, and
     /// reported in `lost`.
-    pub reports: Vec<ReconcileReport>,
-    /// The payments kept, with their key and saved request, because the last
-    /// resend could not be sent: [`Reconciled::Failed`] for the one whose call
-    /// failed, [`Reconciled::NotSent`] for the others (the AIR settings are
-    /// missing, or an earlier call failed and the AIR server cannot be reached).
-    /// They are closed at the next start.
-    pub kept: Vec<ReconcileReport>,
-    /// What [`Wallet::close_expired`] deleted, one [`crate::psp::Loss`] each.
+    pub reports: Vec<ClaimReport>,
+    /// The records kept, with their key and saved claim, because the last resend
+    /// could not be sent: [`ClaimOutcome::Failed`] for the one whose call failed,
+    /// [`ClaimOutcome::NotSent`] for the others (the AIR settings are missing, or
+    /// an earlier call failed and the AIR server cannot be reached). They are
+    /// closed at the next start.
+    pub kept: Vec<ClaimReport>,
+    /// What [`Wallet::close_expired`] reported lost, one [`crate::psp::Loss`] each.
     pub lost: Vec<crate::psp::Loss>,
 }
 
-/// Close the reconciliation window at `now`: send each expired payment's saved
-/// request one last time, then delete what is left ([`Wallet::close_expired`]).
+/// Close the claim windows at `now`: send each expired record's saved claim one
+/// last time, then delete what is left ([`Wallet::close_expired`]).
 ///
-/// The PSP answers an identical resend of a request it took even after the
-/// deadline (it holds the stored answer, or the record it saved before signing),
-/// and never forfeits a payment with such a record, so a payment whose last
-/// answer was lost can still be settled here. For each payment whose `open_until`
-/// is `now` or earlier and that has a saved request:
+/// The PSP mint answers an identical resend of a claim it took even after the
+/// deadline (it holds the stored answer), so a record whose last answer was lost
+/// can still be settled here. For each record whose window has closed and that has
+/// a saved claim:
 ///
 /// - the saved bytes are sent once, as they are, with the usual `air.attempts`
-///   tries ([`psp_reconcile`] does the same before the close). No request is
-///   built, even when the request's keyset has left the PSP's live set, and
-///   nothing loops;
-/// - an answer is checked and applied by [`Wallet::apply_reconcile`], as on any
-///   settle: the payment is settled and is not reported lost;
-/// - no answer, a refusal or a bad answer: the payment is deleted and reported
-///   lost, as before;
+///   tries ([`psp_claim`] does the same before the close). No claim is built, even
+///   when the claim's keyset has left the PSP mint's live set, and nothing loops;
+/// - an answer is checked and applied by [`Wallet::apply_claim`], as on any claim:
+///   the record is done and is not reported lost;
+/// - no answer, a refusal or a bad answer: the claim is given up, and the record
+///   is reported lost by [`Wallet::close_expired`];
 /// - **the send could not be made** (the AIR settings are missing, or the call
-///   failed, which stops the sends: the AIR server cannot be reached): the
-///   payment is **not deleted**. It is kept with its key and its saved request
-///   ([`Closed::kept`]), and so is every later expired payment that was not
-///   tried, and the close is tried again at the next start. Deleting it would
-///   lose a payment the PSP may have settled already.
+///   failed, which stops the sends: the AIR server cannot be reached): the claim
+///   key is **not deleted**. It is kept with its secret and its saved claim
+///   ([`Closed::kept`]), and so is every later expired record that was not tried,
+///   and the close is tried again at the next start. Deleting it would lose a
+///   payment the PSP mint may have settled already.
 ///
-/// A payment with no saved request (nothing due, or none built) is deleted with
-/// nothing sent. A request is for the PSP the purchase was sealed to; a payment
-/// sealed to another one than `air.psp_did` is deleted with nothing sent.
+/// A record sealed to another PSP mint than `air.psp_did` has its claim given up
+/// with nothing sent.
 pub fn psp_close_expired(
     wallet: &mut Wallet,
     air: &AirSettings,
     now: u64,
 ) -> Result<Closed, WalletError> {
     let mut reports = Vec::new();
-    let mut kept: Vec<ReconcileReport> = Vec::new();
+    let mut kept: Vec<ClaimReport> = Vec::new();
     let psp = Party::Psp.did(air).to_hex();
     let address = Party::Psp.address(air);
     let mut unreachable = false;
-    for (id, mint) in wallet.expired_requests(now) {
+    for (id, index, mint) in wallet.expired_claims(now) {
         if mint != psp {
+            wallet.give_up_claim(&id, index)?;
             continue;
         }
-        let not_sent = |why: String| ReconcileReport {
+        let not_sent = |why: String| ClaimReport {
             id: id.clone(),
-            what: Reconciled::NotSent(why),
+            index,
+            what: ClaimOutcome::NotSent(why),
         };
         if let Err(e) = &address {
             kept.push(not_sent(format!(
-                "the saved request was not sent one last time: {e}"
+                "the saved claim was not sent one last time: {e}"
             )));
             continue;
         }
         if unreachable {
             kept.push(not_sent(
-                "the saved request was not sent one last time: an earlier call failed and the AIR server cannot be reached"
+                "the saved claim was not sent one last time: an earlier call failed and the AIR server cannot be reached"
                     .into(),
             ));
             continue;
         }
-        match send_saved(wallet, air, &id)? {
-            Step::Settled(settled) => reports.push(ReconcileReport {
-                id,
-                what: Reconciled::Settled(settled),
-            }),
-            Step::Already | Step::NoReply => {}
-            Step::Failed { why, network } => {
-                let report = ReconcileReport {
+        match send_others(wallet, air, &id, index, true)? {
+            (Some(Step::Settled(settled)), _) => {
+                reports.push(ClaimReport {
                     id,
-                    what: Reconciled::Failed(why),
+                    index,
+                    what: ClaimOutcome::Claimed(settled),
+                });
+                continue;
+            }
+            (Some(_), _) => continue,
+            (None, true) => {
+                unreachable = true;
+                kept.push(ClaimReport {
+                    id: id.clone(),
+                    index,
+                    what: ClaimOutcome::Failed(
+                        "the last resend of an other saved claim could not be sent: the AIR server cannot be reached"
+                            .into(),
+                    ),
+                });
+                continue;
+            }
+            (None, false) => {}
+        }
+        if wallet.claim_to_send(&id, index).is_err() {
+            // only other saved claims were left, and none was answered
+            wallet.give_up_claim(&id, index)?;
+            continue;
+        }
+        match send_saved(wallet, air, &id, index)? {
+            Step::Settled(settled) => reports.push(ClaimReport {
+                id,
+                index,
+                what: ClaimOutcome::Claimed(settled),
+            }),
+            Step::Already => {}
+            Step::NoReply => wallet.give_up_claim(&id, index)?,
+            Step::Failed { why, network } => {
+                let report = ClaimReport {
+                    id: id.clone(),
+                    index,
+                    what: ClaimOutcome::Failed(why),
                 };
                 if network {
                     unreachable = true;
                     kept.push(report);
                 } else {
+                    wallet.give_up_claim(&id, index)?;
                     reports.push(report);
                 }
             }

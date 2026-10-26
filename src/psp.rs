@@ -1,77 +1,99 @@
-//! Buying PSP with BTC, and settling a payment the PSP did not sign.
+//! Buying PSP with BTC, and claiming what the PSP mint owes for it.
 //!
 //! The wallet has no BTC wallet. The app's own Bitcoin wallet puts the bytes from
-//! [`Wallet::build_psp_payload`] in an OP_RETURN and pays the PSP's address. The
-//! PSP then delivers the purchase on its own: when it handles the payment, it
-//! writes one record on the SPI's AIR server, at an address the wallet computes
-//! (`sp_wire::air_request::delivery`). The record is the blind signature of each
-//! output it signed and the keysets to unblind them with, or it says the payment
-//! is held, or the purchase was rejected, with the reason and what was paid, or
-//! that a credit is owed. [`crate::mint_info::psp_pickup`] reads those records and
-//! [`Wallet::apply_delivery`] turns one into notes. There is nothing to paste.
+//! [`Wallet::build_psp_payload`] in an OP_RETURN and pays the PSP mint's address.
+//! Nothing else is built at buy time: the payload is the purchase's claim DID
+//! and nothing more, with no amounts and no notes.
 //!
-//! **A purchase pays exactly once.** The payload is one-time use: a second
-//! payment that carries the same payload buys nothing and its funds are lost
-//! ([`ONE_TIME_USE`]; `buy-psp` prints it with the payload). It is also not
-//! built below `psp.min_purchase` ([`DEFAULT_MIN_PURCHASE`], 50 PSP): the PSP's
-//! fees come out of what a payment buys, so a small purchase can be eaten whole
-//! and the payment lost.
+//! **A claim key for each purchase.** [`Wallet::build_psp_payload`] makes a fresh
+//! throwaway key at random, never derived from or linked to the wallet's main DID,
+//! and saves its secret in the wallet file ([`ClaimKey`]) before the payload is
+//! returned, so the PSP mint cannot link two purchases of one wallet. The secret
+//! opens the PSP mint's owed records, signs the claims, is kept like a PSP note
+//! (a backup carries it and a merge keeps it), and is never logged and never part
+//! of a handoff.
 //!
-//! **A key for each purchase.** The payload names a reply DID, and the PSP seals
-//! the record to it. [`Wallet::build_psp_payload`] makes a fresh one-off key for
-//! each purchase and saves its secret with the pending purchase, so the PSP
-//! cannot link two purchases of one wallet. The secret is deleted when the
-//! purchase is reconciled: when its signatures are claimed and the PSP owes
-//! nothing and every output is accounted for, when the corrected request or the
-//! credit claim is answered ([`Wallet::apply_reconcile`]), or when the PSP's
-//! reconciliation window closes ([`Wallet::close_expired`]).
+//! **What is owed is a record, and there may be many.** When the payment has its
+//! confirmations the PSP mint writes an owed record for it to the SPI's AIR
+//! server, at a cell the wallet can compute from `(PSP mint, claim DID, index)`
+//! and nobody else can (`sp_wire::air_request::delivery`). A claim DID may be paid
+//! more than once, so the records are cells 0, 1, 2 and so on, in the order the
+//! PSP mint writes them. [`crate::mint_info::psp_pickup`] reads them: it opens
+//! each cell with [`Wallet::apply_delivery`], skips a cell that does not open (a
+//! mint error or a forged write) and says so, and stops at the first empty cell.
+//! Every start and every `claim-psp` reads the next empty cell of each key once.
+//! A record says the units the payment is owed (`due_units`, whole PSP units
+//! after every fee), how long it stays claimable (`window_secs`,
+//! `sp_wire::psp::CLAIM_WINDOW_SECS`, 30 days) and how many claims the PSP mint
+//! counts for it.
 //!
-//! **A held or rejected payment, or a credit, is settled by a reconciliation
-//! request (AIR kind 15).** The PSP has the bitcoin and signed nothing (held,
-//! rejected), or owes the payer a credit, so the purchase and its key are kept
-//! ([`Delivered::Open`], [`OpenReply`]) for the window the record names
-//! (`open_until`; 14 days by default at the PSP). The record carries the rules
-//! ([`ReconcileRules`]): what to send, the exact total the request must carry
-//! (`due_units`, after every fee), the deadline and how many requests the PSP
-//! counts. The wallet follows them without being asked:
+//! **A clock for each record.** The window is counted from the PSP mint's write,
+//! which the wallet cannot see and which is never later than the wallet's first
+//! read, so each record's window runs from the wallet's first read of it
+//! ([`OwedClaim::first_read_at`]) for its own `window_secs`. A claim key is kept
+//! until the window of its last record has closed and nothing it holds is waiting
+//! for an answer to a saved claim ([`Wallet::close_expired`]).
 //!
-//! - [`Wallet::build_reconcile`] makes the request: fresh blinded outputs that
-//!   are powers of two, none above the PSP's largest note, adding up to
-//!   `due_units` exactly (the PSP signs the request whole or not at all), on the
-//!   PSP's current keyset, signed (BIP340) by the purchase's reply key over
-//!   [`ReconcileRequest::digest`]. [`check_reconcile`] checks all of it, and the
-//!   rules' kind and deadline, before anything is saved or sent: a request that
-//!   fails is a wallet bug, and is neither saved nor sent. The request, its bytes,
-//!   its hash and the blinding factors are saved with the purchase or credit,
-//!   together with the AIR request that will carry it (`R` is the reply key), in
-//!   one write before the first AIR write.
-//! - [`crate::mint_info::psp_reconcile`] sends it, at every start and in
-//!   `claim-psp`, until `open_until`. The PSP answers an accepted request only; a
-//!   refused one gets no reply. A saved request with no answer is sent again as
-//!   the identical bytes (the PSP answers a repeat of an accepted request from its
-//!   stored answer and counts nothing twice). The one exception is the
-//!   keyset-rotation race: when the PSP does not answer and the request's keyset is
-//!   no longer one of its two live keysets, the wallet builds the one second
-//!   request on the current keyset the rules allow, never more than
-//!   `rules.max_attempts`.
-//! - [`Wallet::apply_reconcile`] checks the answer (the keyset's keys hash to its
-//!   id, one signature for each output in order, `issued_units == due_units`),
-//!   and in one write stores the notes, records their keyset and removes the
-//!   purchase or credit, its key and the saved request. A bad answer stores
-//!   nothing and keeps the key. Applying an answer twice adds no notes.
+//! **A key with no record expires.** A purchase that was never paid would
+//! otherwise be kept, and read, for ever. A key that still has no owed record
+//! `psp.unpaid_key_days` days (90 by default) after it was made
+//! ([`ClaimKey::created_at`]) is dropped with its secret, and the user is told
+//! once ([`Loss::unpaid`], [`Wallet::expire_unpaid`]). It is dropped only right
+//! after the PSP mint's AIR server was asked and had no record for it, never when
+//! the AIR server could not be read. 0 keeps such a key for ever. **A payment
+//! made to the payload after its key was dropped is lost**: the PSP mint writes
+//! the record, and nothing is left that can open it or claim it.
 //!
-//! **When nothing is due** (`due_units` is 0, because the PSP's fees take the
-//! whole amount) nothing is built and nothing is sent: the PSP would refuse it
-//! as `nothing_to_issue`. The user is told once that the payment is lost at
-//! `open_until` ([`Loss::nothing_due`]). **When a window closes** with the
-//! payment still open, [`Wallet::close_expired`] returns what was forfeited
-//! ([`Loss::forfeited`]), the amount included.
+//! **A claim (AIR kind 15, `KIND_PSP_CLAIM`).** [`Wallet::build_claim`] builds
+//! it when the wallet claims, never before: fresh blinded outputs that are powers
+//! of two and add up to `due_units` exactly (the PSP mint signs a claim whole or
+//! not at all), on the PSP mint's current keyset (rotation, kind 4), signed
+//! (BIP340) by the claim key over `ClaimRequest::digest(psp)`. The request, its
+//! bytes, its hash and the blinding factors are saved with the record, together
+//! with the AIR request that will carry it, in one write before the first AIR
+//! write. [`crate::mint_info::psp_claim`] sends it. The PSP mint answers an
+//! accepted claim only; a refused one gets no reply. A saved claim with no answer
+//! is sent again as the identical bytes (the PSP mint answers a repeat of an
+//! accepted claim from its stored answer and counts nothing twice). The one
+//! exception is the keyset race: when the PSP mint does not answer and its
+//! current keyset is no longer the one the claim names, the wallet builds a new
+//! claim on the current keyset, never more than the record's `max_attempts`. A
+//! refusal that names the keyset (not current, retired, unknown) does not use up
+//! an attempt at the PSP mint.
 //!
-//! **A credit is in whole PSP units, and the wallet never rounds it.** The PSP
-//! owes cents; the rules' `due_units` is what it will issue, after rounding (it
-//! rounds up from `reconciliation.round_up_from`, 9 cents by default, so a credit
-//! of 8 cents or less is 0 units) and fees. [`PspCredit`] shows `due_units` PSP
-//! with the exact cents in USD.
+//! [`Wallet::apply_claim`] checks the answer (the keyset is the one asked for and
+//! its keys hash to its id, one signature for each output in order, each a curve
+//! point, `issued_units == due_units`) and in one write stores the notes, stamped
+//! with the keyset and the epoch that signed them, and marks the record done. A
+//! bad answer stores nothing. Applying an answer twice adds no notes, and a note
+//! that has left this wallet already (spent, handed over, lost) is never added
+//! back: a copy of the wallet from before the claim was settled can bring the key
+//! and its saved claim back in a merge, the resend gets the PSP mint's stored
+//! answer, and those notes were spent since. A note claimed on the current keyset
+//! is not rolled over: only notes of a previous keyset are.
+//!
+//! **What the wallet cannot check.** Plain BDHKE is not publicly verifiable, and
+//! the PSP mint sends no DLEQ proof (mint-core has none). The wallet can check
+//! that each signature is a curve point for the right output, under keys that
+//! hash to the keyset named, but it cannot prove that a signature is the PSP
+//! mint's real one for that output. It relies on the PSP mint signing correctly:
+//! an answer of valid points that are not real signatures would be stored as
+//! notes that the PSP mint then refuses to spend, and the record would be done.
+//!
+//! **Two copies, two claims.** When two copies of the wallet each built a claim
+//! for the same record, a merge keeps both ([`OwedClaim::others`]). Both are sent
+//! at each start, the others first; the one the PSP mint signed is applied and
+//! the record is done, and the rest are dropped with no loss told. A signed
+//! refusal of one drops that one only.
+//!
+//! **When a window closes** with the record unclaimed, [`Wallet::close_expired`]
+//! returns what was lost ([`Loss::forfeited`]), once, with the units. **When
+//! nothing is due** (`due_units` is 0, because the fees take the whole payment)
+//! nothing is claimed.
+//!
+//! **A PSP note is valid if its amount is a power of two.** There is no largest
+//! note and no smallest purchase: a PSP mint keyset has 64 keys, one for each
+//! power of two a note can have.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -79,380 +101,232 @@ use mint_types::{Amount, BlindNonce};
 use secp256k1::{Keypair, PublicKey, SECP256K1};
 use sha2::{Digest, Sha256};
 use sp_wire::ServiceDid;
-use sp_wire::air_request::delivery::{
-    self, Outcome, ReconcileRules, SEND_CORRECTED_REQUEST, SEND_CREDIT_CLAIM,
-};
-use sp_wire::air_request::{KIND_PSP_RECONCILE, addr};
-use sp_wire::payload::{self, Payload};
-use sp_wire::psp::{KeysetsResponse, MAX_ROLLOVER_NOTES, ReconcileRequest, ReconcileResponse};
+use sp_wire::air_request::delivery::{self, Outcome, SEND_PURCHASE_CLAIM};
+use sp_wire::air_request::{KIND_PSP_CLAIM, addr};
+use sp_wire::payload;
+use sp_wire::psp::{ClaimRequest, ClaimResponse, KeysetsResponse};
 use sp_wire::seal::{PublicKey as DidPublicKey, SecretKey as DidSecretKey};
 
 use crate::blind::PendingOutput;
 use crate::error::WalletError;
+use crate::rotate::Window;
 use crate::store::{
-    Kind, OPEN_KEY_FALLBACK_SECS, OpenKind, OpenPurchase, OpenReply, PendingAirRequest,
-    PendingPurchase, ReconcileState, SavedRequest, StoredNote, Wallet, WalletData,
+    ClaimKey, Kind, OwedClaim, PendingAirRequest, SavedClaim, StoredNote, Wallet, WalletData,
 };
 
-/// The most outputs in one purchase (the payload's count is one byte).
-pub const MAX_OUTPUTS: usize = 255;
-
-/// The default of `psp.min_purchase`: the smallest purchase the wallet builds,
-/// in PSP units. The PSP's fees are taken from what a payment buys, so a small
-/// purchase can be eaten whole and the payment lost; 100 PSP ($10) is a
-/// realistic purchase. Lowering the setting is not advised.
-pub const DEFAULT_MIN_PURCHASE: u64 = 50;
-
 /// What `buy-psp` says next to the payload, and what an app should show next to
-/// it: the payload is paid once. The PSP refuses a second payment that carries
-/// the same payload and keeps its funds.
-pub const ONE_TIME_USE: &str = "ONE-TIME USE: pay this payload exactly once. A second payment carrying the same payload buys nothing and its funds are lost.";
+/// it. A second payment to the same payload is not lost, but it links the two
+/// purchases.
+pub const PAY_ONCE: &str = "Pay this payload once. Each purchase has a key of its own so the PSP mint cannot link your purchases; a second payment to the same payload is still owed to you and claimed with the first, but it links the two.";
 
-/// The most requests the wallet builds for one open payment: the first, and the
-/// one second request the keyset-rotation race allows. Never more than the
-/// rules' `max_attempts` either.
-pub const MAX_BUILT_REQUESTS: u32 = 2;
+/// What `buy-psp` and the docs say about the size of a purchase. It is a
+/// recommendation: nothing in the wallet enforces it.
+pub const RECOMMENDED_PURCHASE: &str = "We recommend a PSP purchase of at least $5 (50 PSP): the PSP mint's fees come out of what a payment buys, so a smaller payment can buy little or nothing. This is a recommendation; nothing enforces it.";
 
+/// A purchase the wallet has made the payload of.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PurchaseBuild {
-    /// Identifies this purchase in the wallet: SHA-256 of `payload`, as hex.
+    /// Identifies this purchase (its claim key) in the wallet: SHA-256 of
+    /// `payload`, as hex.
     pub id: String,
     /// The encrypted payload, for the OP_RETURN.
     pub payload: Vec<u8>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ClaimResult {
-    /// The ids of the new notes.
-    pub claimed: Vec<String>,
-    pub claimed_units: u64,
-    /// Outputs of other purchases still waiting for a signature.
-    pub still_pending: usize,
-}
-
-/// Cents in one PSP unit: $0.10.
-const CENTS_PER_PSP: u128 = 10;
-const _: () = assert!(
-    CENTS_PER_PSP * (sp_wire::units::ESP_PER_USD / 100) == sp_wire::units::ESP_PER_PSP as u128
-);
-
-/// USD cents as dollars, two decimals: `"0.94"`.
-fn usd(cents: u64) -> String {
-    format!("{}.{:02}", cents / 100, cents % 100)
-}
-
-/// What the PSP owes the wallet in credit ([`Wallet::pending_psp_credit`]).
-///
-/// The PSP's credit is in USD cents. A PSP unit is worth $0.10 (10 PSP to the
-/// dollar, `sp_wire::units`), so a cent is a tenth of a PSP unit. The two figures
-/// are not the same number: `cents` is the exact value the PSP owes, and `units`
-/// is what its rules say it will issue for the claim (`due_units`: whole units,
-/// after the rounding the PSP applies and its fees). The wallet never rounds by
-/// itself, so a credit of 8 cents shows as `0 PSP (0.08 USD)`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PspCredit {
-    /// The credit, in USD cents.
-    pub cents: u128,
-    /// What the claims will issue, in PSP units (the rules' `due_units`).
-    pub units: u128,
-    /// How many purchases owe it.
-    pub purchases: usize,
-}
-
-impl PspCredit {
-    /// The credit as US dollars, two decimals: `"1.00"`.
-    pub fn usd(&self) -> String {
-        format!("{}.{:02}", self.cents / 100, self.cents % 100)
-    }
-
-    /// The line `balance` prints under the PSP total, or `None` when nothing is
-    /// owed: the PSP units the claim will issue with the exact cents in USD, as in
-    /// `9 PSP (0.94 USD) (pending)`. The credit is not a note yet, so it is marked
-    /// pending.
-    pub fn balance_line(&self) -> Option<String> {
-        (self.cents > 0).then(|| {
-            format!(
-                "{} PSP ({} USD) (pending): credit the PSP owes for {} purchase(s), not counted above until it is claimed",
-                self.psp(),
-                self.usd(),
-                self.purchases
-            )
-        })
-    }
-
-    /// The PSP units the claim will issue: `"9"`.
-    pub fn psp(&self) -> String {
-        self.units.to_string()
-    }
-}
-
-/// What a purchase's record said, once it was applied.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Claimed {
-    pub claim: ClaimResult,
-    /// Requested units the PSP did not sign because the payment was short. It
-    /// keeps their value.
-    pub skipped_units: u64,
-    /// What the PSP owes the payer for an overpayment, in USD cents.
-    pub credit_cents: u64,
-    /// Requested units that were neither signed nor reported as dropped.
-    pub unaccounted_units: u64,
-    /// True when the purchase's key was kept because the purchase may still be
-    /// open (a credit is owed, or outputs are unaccounted for).
-    pub key_kept: bool,
-}
-
-/// What applying one purchase's record did.
+/// What applying one owed record did.
+// One value is made for each record read, so the size does not matter; boxing
+// the record would change the public type for nothing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Delivered {
-    /// The signatures were claimed and the purchase cleared.
-    Claimed(Claimed),
-    /// The PSP holds the payment, or rejected the purchase: nothing was signed.
-    /// The purchase and its key are kept open until `open_until` (see
-    /// [`Wallet::close_expired`]) or until a reconciliation request settles it
-    /// ([`crate::mint_info::psp_reconcile`]). The bitcoin that was paid stays
-    /// with the PSP; if the purchase is not settled by then, the PSP forfeits it.
-    Open(OpenPurchase),
-    /// Nothing changed: the purchase is not pending (its record was applied
-    /// before), or it is open already with this very record.
+    /// The record opened, passed its checks and was stored.
+    Stored(OwedClaim),
+    /// Nothing changed: the cell was read before, here or in another copy of the
+    /// wallet.
     AlreadyDone,
 }
 
-/// Where a payment that is open stands (see [`OpenReconciliation`]).
+/// Where an owed record that is still open stands ([`OpenClaim`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReconcileStatus {
-    /// Nothing has been built yet: the next [`crate::mint_info::psp_reconcile`]
-    /// builds the request and sends it.
+pub enum ClaimStatus {
+    /// No claim has been built yet: the next [`crate::mint_info::psp_claim`]
+    /// builds it and sends it.
     Due,
-    /// A request is saved and sent; the PSP has not answered it yet. It is sent
-    /// again, as the identical bytes, at the next start.
+    /// A claim is saved and sent. It is sent again, as the identical bytes, at
+    /// the next start.
     Sent,
-    /// The rules' `due_units` is 0: the fees take the whole amount. Nothing is
-    /// built or sent, and the payment is lost at `open_until`.
-    NothingDue,
-    /// The PSP did not answer the last request and the wallet has built every
-    /// request the rules allow, so the PSP did not accept it. The payment is lost
-    /// at `open_until` (the saved request is still sent again, as it might have
-    /// been accepted and its answer lost).
-    Lost,
+    /// The PSP mint did not answer the last claim and the wallet has built every
+    /// claim the record allows, so the PSP mint did not accept it. The saved claim
+    /// is still sent again, in case it was accepted and its answer lost.
+    Refused,
 }
 
-/// One open payment the wallet is settling: a held or rejected purchase, or a
-/// credit ([`Wallet::open_reconciliations`]).
+/// One owed record that can still be claimed ([`Wallet::open_claims`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OpenReconciliation {
-    /// The purchase's id.
+pub struct OpenClaim {
+    /// The claim key's id (the purchase).
     pub id: String,
-    /// The PSP's key the purchase was sealed to (66 hex characters), the mint
-    /// the request is for.
-    pub mint: String,
-    /// What is sent: [`SEND_CORRECTED_REQUEST`] or [`SEND_CREDIT_CLAIM`].
-    pub send: String,
-    /// The exact total the request must carry, in PSP units.
+    /// The record's index under the claim key.
+    pub index: u32,
+    /// The PSP mint's DID the purchase was sealed to (66 hex characters).
+    pub psp: String,
+    /// The transaction the record is for.
+    pub txid: String,
+    /// The exact total of the claim, in PSP units.
     pub due_units: u64,
-    /// When the window closes (Unix seconds, the PSP's clock).
-    pub open_until: u64,
-    /// How many requests the wallet has built for it.
+    /// When the record's window closes (Unix seconds): its first read plus its
+    /// `window_secs`.
+    pub window_ends: u64,
+    /// How many claims the wallet has built for it.
     pub attempts: u32,
-    /// How many the PSP counts (`rules.max_attempts`).
+    /// How many the PSP mint counts (the record's `max_attempts`).
     pub max_attempts: u32,
-    pub state: ReconcileStatus,
-    /// True once the user was told the payment is lost (nothing due, or the PSP
-    /// did not accept the request), so it is said once.
+    pub status: ClaimStatus,
+    /// True once the user was told the record is lost, so it is said once.
     pub told_lost: bool,
-    /// What was paid, for a purchase (0 for a credit).
-    pub paid_sats: u64,
-    pub paid_cents: u64,
-    /// What is owed, for a credit (0 for a purchase).
-    pub credit_cents: u64,
 }
 
-/// What a payment that is lost was worth, for the words the user is told.
+/// Why a record is lost, for the words the user is told.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LossKind {
-    /// A payment the PSP holds.
-    Held,
-    /// A purchase the PSP rejected.
-    Rejected,
-    /// A credit the PSP owes.
-    Credit,
-    /// A key kept only for outputs that were neither signed nor reported as
-    /// dropped: no rules, no amount.
-    Key,
+    /// The window closed and the record was never claimed.
+    Expired,
+    /// The PSP mint did not accept the claim, and the wallet has built every
+    /// claim the record allows.
+    Refused,
+    /// The claim key had no owed record `psp.unpaid_key_days` after it was made,
+    /// and was dropped ([`Wallet::expire_unpaid`]). `index` is 0, `txid` empty,
+    /// `due_units` 0 and `window_ends` the time the key expired.
+    Unpaid,
 }
 
 /// A payment that is, or will be, lost: its words ([`Loss::forfeited`],
-/// [`Loss::nothing_due`], [`Loss::not_accepted`]) say so plainly, with the
-/// amount.
+/// [`Loss::not_accepted`]) say so plainly, with the units.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Loss {
-    /// The purchase's id.
+    /// The claim key's id (the purchase).
     pub id: String,
+    /// The record's index under the claim key.
+    pub index: u32,
+    /// The transaction the record is for.
+    pub txid: String,
+    /// What the record owed, in PSP units.
+    pub due_units: u64,
     pub kind: LossKind,
-    /// What the PSP received, for a purchase.
-    pub paid_sats: u64,
-    pub paid_cents: u64,
-    /// What it owes, for a credit.
-    pub credit_cents: u64,
-    /// When the window closes or closed (Unix seconds).
-    pub open_until: u64,
+    /// When the record's window closes or closed (Unix seconds).
+    pub window_ends: u64,
 }
 
 impl Loss {
-    /// The amount in the user's words: sats and cents for a purchase, cents for a
-    /// credit.
-    pub fn amount(&self) -> String {
-        match self.kind {
-            LossKind::Held | LossKind::Rejected => {
-                format!("{} sat, {} USD", self.paid_sats, usd(self.paid_cents))
-            }
-            LossKind::Credit => format!("a credit of {} USD", usd(self.credit_cents)),
-            LossKind::Key => "no amount".to_string(),
-        }
-    }
-
     fn date(&self) -> String {
-        crate::date::format_utc(self.open_until)
+        crate::date::format_utc(self.window_ends)
     }
 
-    /// What is said when the window closed with the payment still open: the PSP
-    /// forfeited it and the funds are lost.
+    /// What is said once when the window closed with the record unclaimed: the PSP
+    /// mint keeps the payment and the funds are lost.
     pub fn forfeited(&self) -> String {
-        let id = &self.id;
-        let date = self.date();
-        match self.kind {
-            LossKind::Held | LossKind::Rejected => format!(
-                "purchase {id}: it was not reconciled by {date}, when its window closed. The PSP forfeited the payment: the funds are lost ({}). The purchase and its key are deleted",
-                self.amount()
-            ),
-            LossKind::Credit => format!(
-                "purchase {id}: the credit was not claimed by {date}, when its window closed. The PSP forfeited it: the funds are lost ({}). The purchase's key is deleted",
-                self.amount()
-            ),
-            LossKind::Key => {
-                format!("purchase {id}: its window closed at {date}. The purchase's key is deleted")
-            }
-        }
+        format!(
+            "purchase {}, record {} (payment {}): expired. It was not claimed by {}, when its window closed. The PSP mint keeps the payment: the funds are lost ({} PSP)",
+            self.id,
+            self.index,
+            self.txid,
+            self.date(),
+            self.due_units
+        )
     }
 
-    /// What is said once when the PSP's fees take the whole amount, so nothing is
-    /// due and nothing can be sent.
-    pub fn nothing_due(&self) -> String {
+    /// What is said once when a claim key with no owed record was dropped
+    /// ([`LossKind::Unpaid`]).
+    pub fn unpaid(&self) -> String {
         format!(
-            "purchase {}: the PSP's fees take the whole amount ({}), so nothing can be issued and no request is sent. The PSP forfeits the payment at {}: the funds are lost",
+            "purchase {}: the PSP mint has written no record for it, and it expired at {}, so its claim key was dropped. If its payload is paid now the PSP mint keeps the payment: the funds are lost. Set psp.unpaid_key_days to keep an unpaid purchase longer (0 keeps it for ever)",
             self.id,
-            self.amount(),
             self.date()
         )
     }
 
-    /// What is said once when the PSP did not answer the request after the wallet
-    /// had built every request the rules allow.
+    /// What is said once for this loss: [`Loss::forfeited`] or [`Loss::unpaid`].
+    /// (A refusal is said by [`Loss::not_accepted`], which needs the attempts.)
+    pub fn said(&self) -> String {
+        match self.kind {
+            LossKind::Unpaid => self.unpaid(),
+            LossKind::Expired | LossKind::Refused => self.forfeited(),
+        }
+    }
+
+    /// What is said once when the PSP mint did not answer the claim after the
+    /// wallet had built every claim the record allows.
     pub fn not_accepted(&self, attempts: u32) -> String {
         format!(
-            "purchase {}: the request was not accepted by the PSP (it answers an accepted request only) after {attempts} attempt(s). The payment ({}) is forfeited at {}: the funds are lost",
+            "purchase {}, record {} (payment {}): refused. The PSP mint did not accept the claim (it answers an accepted claim only) after {attempts} attempt(s). Unless it answers by {}, the payment ({} PSP) is lost",
             self.id,
-            self.amount(),
-            self.date()
+            self.index,
+            self.txid,
+            self.date(),
+            self.due_units
         )
     }
 }
 
-/// What applying the PSP's answer to a reconciliation request did.
+/// What applying the PSP mint's answer to a claim did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Applied {
-    /// The notes were stored and the purchase or credit, its key and its saved
-    /// request were removed.
+    /// The notes were stored and the record was marked done.
     Settled(Settled),
-    /// Nothing changed: the payment is not open any more (the answer was applied
+    /// Nothing changed: the record is done already (the answer was applied
     /// before, here or in another copy of the wallet).
     AlreadyDone,
 }
 
-/// The notes a reconciliation brought.
+/// The notes a claim brought.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settled {
     /// The ids of the new notes.
     pub claimed: Vec<String>,
-    /// Their total, in PSP units (the rules' `due_units`).
+    /// Their total, in PSP units (the record's `due_units`).
     pub units: u64,
-    /// True for a credit claim, false for a corrected request.
-    pub credit: bool,
 }
 
-/// A reconciliation request the wallet built and saved.
+/// A claim the wallet built and saved.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReconcileBuild {
-    /// The purchase's id.
+pub struct ClaimBuild {
+    /// The claim key's id (the purchase).
     pub id: String,
-    pub request: ReconcileRequest,
+    /// The record's index under the claim key.
+    pub index: u32,
+    pub request: ClaimRequest,
     /// The bytes that are sent: the JSON of `request`, exactly as saved.
     pub body: Vec<u8>,
-    /// `request.hash()`: what the PSP stores its answer under.
+    /// `request.hash(psp)`: what the PSP mint stores its answer under.
     pub hash: String,
-    /// 1 for the first request built for the payment, 2 for the second.
+    /// 1 for the first claim built for the record, 2 for the second, and so on.
     pub attempt: u32,
 }
 
-/// Check that `amount` is a PSP denomination: a power of two, and not above the
-/// PSP's largest note (`top`, read from its `GET /keys`) when that is known.
-/// With `top` unknown the PSP decides how large a note may be.
-pub fn check_denomination(amount: u64, top: Option<u64>) -> Result<(), WalletError> {
-    if amount == 0 || !amount.is_power_of_two() {
+/// Check that `amount` is a PSP note size: a power of two. There is no largest
+/// note size; the PSP mint's keyset has a key for every power of two.
+pub fn check_denomination(amount: u64) -> Result<(), WalletError> {
+    if !amount.is_power_of_two() {
         return Err(WalletError::Invalid(format!(
             "{amount} is not a PSP note size: use a power of two"
         )));
     }
-    if let Some(top) = top.filter(|&top| amount > top) {
-        return Err(WalletError::Invalid(format!(
-            "{amount} is above the PSP's largest note, {top} (its mint.max_denomination_units)"
-        )));
-    }
     Ok(())
 }
 
-/// A purchase's output sizes, checked without any network: at least one, at most
-/// [`MAX_OUTPUTS`], each a PSP note size (see [`check_denomination`]), and adding
-/// up to at least `min_purchase` PSP (`psp.min_purchase`): the PSP's fees come out
-/// of what a payment buys, so a small purchase can be eaten whole. The command
-/// line runs this before it asks the PSP anything, so a bad amount is refused for
-/// itself; `build_psp_payload` runs it again.
-pub fn check_outputs(
-    outputs: &[u64],
-    top: Option<u64>,
-    min_purchase: u64,
-) -> Result<(), WalletError> {
+/// A claim's output sizes, checked without any network: at least one, and each a
+/// PSP note size ([`check_denomination`]). There is no largest and no smallest
+/// total.
+pub fn check_outputs(outputs: &[u64]) -> Result<(), WalletError> {
     if outputs.is_empty() {
         return Err(WalletError::Invalid(
-            "a purchase needs at least one output".into(),
+            "a claim needs at least one output".into(),
         ));
     }
-    if outputs.len() > MAX_OUTPUTS {
-        return Err(WalletError::Invalid(format!(
-            "a purchase holds at most {MAX_OUTPUTS} outputs"
-        )));
-    }
     for &amount in outputs {
-        check_denomination(amount, top)?;
-    }
-    let total: u128 = outputs.iter().map(|&a| u128::from(a)).sum();
-    if total < u128::from(min_purchase) {
-        return Err(WalletError::Invalid(format!(
-            "a purchase of {total} PSP is below the minimum of {min_purchase} PSP (psp.min_purchase, or ECASH_PSP_MIN_PURCHASE). The PSP's fees come out of what a payment buys, so a small purchase can be eaten whole and the payment lost: nothing was built. Buy at least {min_purchase} PSP (100 PSP is a realistic purchase), or lower the setting (not advised)"
-        )));
+        check_denomination(amount)?;
     }
     Ok(())
-}
-
-/// The end of a purchase's window from a record: the PSP's when it names one,
-/// else the wallet's own ([`OPEN_KEY_FALLBACK_SECS`] from now), so a record with
-/// none never closes a purchase at once.
-fn window(open_until: u64) -> u64 {
-    if open_until > 0 {
-        open_until
-    } else {
-        addr::now_secs().saturating_add(OPEN_KEY_FALLBACK_SECS)
-    }
 }
 
 /// A curve point written as 66 hex characters (a blind nonce or a signature).
@@ -462,15 +336,15 @@ fn point(text: &str) -> Result<PublicKey, WalletError> {
         .map_err(|_| WalletError::Invalid(format!("not a curve point: {text}")))
 }
 
-/// The keys of the keyset that signed, from the record or the answer. They must
-/// be the keys the keyset's id names, or it is not to be trusted with the notes.
+/// The keys of the keyset that signed, from the answer. They must be the keys the
+/// keyset's id names, or it is not to be trusted with the notes.
 fn keys_of(
     keyset: &str,
     keysets: &KeysetsResponse,
 ) -> Result<BTreeMap<Amount, PublicKey>, WalletError> {
     let Some(keys) = keysets.keysets.get(keyset) else {
         return Err(WalletError::Mint(format!(
-            "the PSP's reply does not carry the keys of keyset {keyset}, which signed"
+            "the PSP mint's reply does not carry the keys of keyset {keyset}, which signed"
         )));
     };
     let keys: BTreeMap<Amount, PublicKey> = keys
@@ -479,269 +353,68 @@ fn keys_of(
         .collect();
     if sp_wire::keyset::keyset_id(&keys) != keyset {
         return Err(WalletError::Mint(format!(
-            "the keys in the PSP's reply are not those of keyset {keyset}"
+            "the keys in the PSP mint's reply are not those of keyset {keyset}"
         )));
     }
     Ok(keys)
 }
 
-/// The words for a record that opens a reconciliation but carries no rules.
-fn no_rules(what: &str) -> WalletError {
-    WalletError::Mint(format!(
-        "the PSP's record for this {what} opens a reconciliation window but carries no rules, so nothing can be sent to settle it. The record is not stored and the purchase is left as it was"
-    ))
+/// The outputs of a claim for `due` units: the binary digits of `due`, largest
+/// first, each a power of two, adding up to `due` exactly. At most 64 of them.
+fn split_due(due: u64) -> Vec<u64> {
+    (0..64)
+        .rev()
+        .map(|shift| 1u64 << shift)
+        .filter(|bit| due & bit != 0)
+        .collect()
 }
 
-/// The rules of a record, or the mint error for a record without them.
-fn rules_of(what: &str, rules: &Option<ReconcileRules>) -> Result<ReconcileRules, WalletError> {
-    rules.clone().ok_or_else(|| no_rules(what))
-}
-
-/// The fewest outputs that add up to `due` exactly, each a power of two and at
-/// most `top`: as many of `top` as fit, then the binary digits of the rest. More
-/// than [`MAX_ROLLOVER_NOTES`] of them is refused before anything is built.
-fn split_due(due: u64, top: u64) -> Result<Vec<u64>, WalletError> {
-    let (full, rest) = (due / top, due % top);
-    let count = u128::from(full) + u128::from(rest.count_ones());
-    if count > MAX_ROLLOVER_NOTES as u128 {
-        return Err(WalletError::Invalid(format!(
-            "{due} PSP in notes of at most {top} needs {count} notes, and a reconciliation request carries at most {MAX_ROLLOVER_NOTES}. The PSP signs a request whole or not at all, so nothing was built"
-        )));
-    }
-    let mut out = vec![top; full as usize];
-    for shift in 0..64 {
-        let bit = 1u64 << shift;
-        if bit >= top {
-            break;
-        }
-        if rest & bit != 0 {
-            out.push(bit);
-        }
-    }
-    Ok(out)
-}
-
-/// The keys of a keyset the PSP names as live, from a keysets reply. `id` must be
-/// its current or its previous keyset, with keys that hash to the id.
-fn live_keys(
-    keysets: &KeysetsResponse,
-    id: &str,
-) -> Result<BTreeMap<Amount, PublicKey>, WalletError> {
-    let live = id == keysets.current || keysets.previous.as_deref() == Some(id);
-    if !live {
-        return Err(WalletError::Invalid(format!(
-            "keyset {id} is neither the PSP's current keyset ({}) nor its previous one",
-            keysets.current
-        )));
-    }
-    keys_of(id, keysets)
-}
-
-/// True when `keyset` is one of the PSP's two live keysets.
-pub fn keyset_is_live(keysets: &KeysetsResponse, keyset: &str) -> bool {
-    keyset == keysets.current || keysets.previous.as_deref() == Some(keyset)
-}
-
-/// The check every reconciliation request passes before it is saved or sent. A
-/// request that fails it is a bug in the wallet, so the error says so and the
-/// caller saves nothing and sends nothing. It checks, against `rules` (the
-/// PSP's own, from the first record) and `keysets` (a fresh read of the PSP's
-/// live keysets):
-///
-/// - the rules name kind 15 ([`KIND_PSP_RECONCILE`]) and `now` is before
-///   `rules.open_until`;
-/// - the request names this purchase's reply DID and purchase id, and its
-///   signature verifies (BIP340, by the reply key, over the request's digest);
-/// - the keyset is the PSP's current or previous one, and its keys hash to its id;
-/// - there are at least 1 and at most [`MAX_ROLLOVER_NOTES`] outputs;
-/// - each output is a power of two and a denomination the keyset has a key for
-///   (so none is above the PSP's largest note);
-/// - no two outputs share a blind nonce;
-/// - the outputs add up to `rules.due_units` exactly.
-pub fn check_reconcile(
-    request: &ReconcileRequest,
-    rules: &ReconcileRules,
-    keysets: &KeysetsResponse,
-    reply_did: &ServiceDid,
-    purchase: &[u8; 32],
-    now: u64,
-) -> Result<(), WalletError> {
-    let bug = |why: String| {
-        WalletError::Invalid(format!(
-            "the reconciliation request is not right ({why}). That is a bug in the wallet, so nothing was saved and nothing was sent"
-        ))
-    };
-    if rules.kind != KIND_PSP_RECONCILE {
-        return Err(bug(format!(
-            "the PSP's rules name request kind {}, not {KIND_PSP_RECONCILE}",
-            rules.kind
-        )));
-    }
-    if now >= rules.open_until {
-        return Err(bug(format!(
-            "the window closed at {}",
-            crate::date::format_utc(rules.open_until)
-        )));
-    }
-    if &request.reply_did != reply_did {
-        return Err(bug("it names another reply DID than the purchase's".into()));
-    }
-    if &request.purchase != purchase {
-        return Err(bug("it names another purchase id".into()));
-    }
-    SECP256K1
-        .verify_schnorr(
-            &request.signature,
-            &request.digest(),
-            &request.reply_did.x_only(),
-        )
-        .map_err(|_| bug("the signature does not verify under the reply key".into()))?;
-    let keys = live_keys(keysets, &request.keyset).map_err(|e| bug(e.to_string()))?;
-    if request.outputs.is_empty() {
-        return Err(bug("it has no outputs".into()));
-    }
-    if request.outputs.len() > MAX_ROLLOVER_NOTES {
-        return Err(bug(format!(
-            "it has {} outputs, at most {MAX_ROLLOVER_NOTES}",
-            request.outputs.len()
-        )));
-    }
-    let mut seen = BTreeSet::new();
-    let mut total: u128 = 0;
-    for (i, output) in request.outputs.iter().enumerate() {
-        let units = output.amount.units;
-        if units == 0 || !units.is_power_of_two() {
-            return Err(bug(format!("output {i}: {units} is not a power of two")));
-        }
-        if !keys.contains_key(&output.amount) {
-            return Err(bug(format!(
-                "output {i}: {units} is above the PSP's largest note, or not a denomination of keyset {}",
-                request.keyset
-            )));
-        }
-        if !seen.insert(output.blind_nonce.0.serialize()) {
-            return Err(bug(format!("output {i} repeats a blind nonce")));
-        }
-        total += u128::from(units);
-    }
-    if total != u128::from(rules.due_units) {
-        return Err(bug(format!(
-            "the outputs add up to {total}, the rules say {}",
-            rules.due_units
-        )));
-    }
-    Ok(())
-}
-
-/// One open payment, as the wallet keeps it: a held or rejected purchase, or a
-/// credit that is owed.
-struct Target {
-    id: String,
-    credit: bool,
-    reply_secret: String,
-    /// The purchase's reply DID as saved (a purchase has it; a credit does not).
-    reply_did: Option<String>,
-    delivery_id: String,
-    mint_did_pubkey: String,
-    rules: Option<ReconcileRules>,
-    state: ReconcileState,
-    open_until: u64,
-    kind: LossKind,
-    paid_sats: u64,
-    paid_cents: u64,
-    credit_cents: u64,
-}
-
-impl Target {
-    fn loss(&self) -> Loss {
-        Loss {
-            id: self.id.clone(),
-            kind: self.kind,
-            paid_sats: self.paid_sats,
-            paid_cents: self.paid_cents,
-            credit_cents: self.credit_cents,
-            open_until: self.open_until,
-        }
-    }
-
-    fn status(&self, rules: &ReconcileRules) -> ReconcileStatus {
-        let may_build = rules.max_attempts.min(MAX_BUILT_REQUESTS);
-        if rules.due_units == 0 {
-            ReconcileStatus::NothingDue
-        } else if self.state.request.is_none() {
-            ReconcileStatus::Due
-        } else if self.state.unanswered && self.state.attempts >= may_build {
-            ReconcileStatus::Lost
-        } else {
-            ReconcileStatus::Sent
-        }
-    }
-}
-
-fn target_of(d: &WalletData, id: &str) -> Option<Target> {
-    if let Some(p) = d.pending_purchases.iter().find(|p| p.id == id) {
-        let o = p.open.as_ref()?;
-        return Some(Target {
-            id: p.id.clone(),
-            credit: false,
-            reply_secret: p.reply_secret.clone(),
-            reply_did: Some(p.reply_did.clone()),
-            delivery_id: p.delivery_id.clone(),
-            mint_did_pubkey: p.mint_did_pubkey.clone(),
-            rules: Some(o.rules.clone()),
-            state: o.reconcile.clone(),
-            open_until: o.open_until,
-            kind: match o.kind {
-                OpenKind::Held => LossKind::Held,
-                OpenKind::Rejected => LossKind::Rejected,
-            },
-            paid_sats: o.paid_sats,
-            paid_cents: o.paid_cents,
-            credit_cents: 0,
-        });
-    }
-    let r = d.open_replies.iter().find(|r| r.id == id)?;
-    Some(Target {
-        id: r.id.clone(),
-        credit: true,
-        reply_secret: r.reply_secret.clone(),
-        reply_did: None,
-        delivery_id: r.delivery_id.clone(),
-        mint_did_pubkey: r.mint_did_pubkey.clone(),
-        rules: r.rules.clone(),
-        state: r.reconcile.clone(),
-        open_until: r.open_until,
-        kind: if r.credit_cents > 0 {
-            LossKind::Credit
-        } else {
-            LossKind::Key
-        },
-        paid_sats: 0,
-        paid_cents: 0,
-        credit_cents: r.credit_cents,
-    })
-}
-
-/// The state of an open payment, to change it in a write.
-fn state_mut<'a>(d: &'a mut WalletData, id: &str) -> Option<&'a mut ReconcileState> {
-    if let Some(p) = d.pending_purchases.iter_mut().find(|p| p.id == id) {
-        return p.open.as_mut().map(|o| &mut o.reconcile);
-    }
-    d.open_replies
-        .iter_mut()
-        .find(|r| r.id == id)
-        .map(|r| &mut r.reconcile)
-}
-
-/// Remove the kind 15 AIR request of the payment whose reply key is
-/// `reply_secret`. The reply key is the request's `R`, and no other request has
-/// it.
-fn drop_air_request(d: &mut WalletData, reply_secret: &str) {
+/// Remove the kind 15 AIR request that carries the claim whose body hashes to
+/// `body_hash`, made with the claim key `claim_secret` (its `R`). A key's other
+/// records have claims of their own, with other bodies.
+fn drop_air_request(d: &mut WalletData, claim_secret: &str, body_hash: &str) {
     d.air_requests
-        .retain(|r| !(r.kind == KIND_PSP_RECONCILE && r.r == reply_secret));
+        .retain(|r| !(r.kind == KIND_PSP_CLAIM && r.r == claim_secret && r.body_hash == body_hash));
 }
 
-/// What `psp_reconcile` needs to send a saved request.
+/// The record `index` of the claim key `id`, to change it in a write.
+fn record_mut<'a>(d: &'a mut WalletData, id: &str, index: u32) -> Option<&'a mut OwedClaim> {
+    d.claim_keys
+        .iter_mut()
+        .find(|k| k.id == id)?
+        .records
+        .iter_mut()
+        .find(|r| r.index == index)
+}
+
+/// The saved claim of `record` whose hash is `hash`, or its main one (`request`)
+/// for `None`.
+fn saved_of<'a>(record: &'a OwedClaim, hash: Option<&str>) -> Option<&'a SavedClaim> {
+    match hash {
+        None => record.request.as_ref(),
+        Some(h) => record
+            .request
+            .iter()
+            .chain(&record.others)
+            .find(|s| s.hash == h),
+    }
+}
+
+/// A day, in seconds.
+const DAY_SECS: u64 = 86_400;
+
+/// `psp.unpaid_key_days` by default: a claim key with no owed record is dropped
+/// 90 days after it was made.
+pub const DEFAULT_UNPAID_KEY_DAYS: u64 = 90;
+
+/// The claim key `id` and its record `index`.
+fn record_of<'a>(d: &'a WalletData, id: &str, index: u32) -> Option<(&'a ClaimKey, &'a OwedClaim)> {
+    let key = d.claim_keys.iter().find(|k| k.id == id)?;
+    let record = key.records.iter().find(|r| r.index == index)?;
+    Some((key, record))
+}
+
+/// What `psp_claim` needs to send a saved claim.
 pub(crate) struct ToSend {
     pub body: Vec<u8>,
     pub key: DidSecretKey,
@@ -749,56 +422,41 @@ pub(crate) struct ToSend {
 }
 
 impl Wallet {
-    /// Blind `outputs` (amounts in PSP, ten to the US dollar), make this
-    /// purchase's own one-off reply key, encode the payload with its public half
-    /// as the reply DID, and encrypt it to the mint's DID public key with AIR's
-    /// secp256k1 encryption. Returns the bytes for an OP_RETURN.
+    /// Make this purchase's own throwaway claim key, encode the payload (the claim
+    /// DID, 33 bytes, and nothing else), and encrypt it to the PSP mint's DID
+    /// public key with AIR's secp256k1 encryption. Returns the bytes for an
+    /// OP_RETURN.
     ///
-    /// The purchase must total at least `psp.min_purchase` PSP
-    /// ([`Wallet::psp_min_purchase`], 50 by default): the PSP's fees come out of
-    /// what a payment buys, so a small purchase can be eaten whole. A smaller one
-    /// is refused here, before anything is saved, with a message that names the
-    /// setting. The payload is one-time use ([`ONE_TIME_USE`]).
+    /// No amount is chosen and nothing is checked about the size of the purchase:
+    /// what the payment is worth is decided by the PSP mint when it handles the
+    /// payment, and the wallet claims whatever it is owed. A purchase of at least
+    /// $5 (50 PSP) is recommended ([`RECOMMENDED_PURCHASE`]), not enforced. The
+    /// payload is paid once ([`PAY_ONCE`]).
     ///
-    /// The blinding factors, the spend keys and the reply key's secret are saved
-    /// in the wallet before this returns, so the notes can be claimed whenever
-    /// the PSP delivers them, and the key is on disk before any payment is made.
+    /// The claim key is made at random, never derived from or linked to the
+    /// wallet's main DID, and its secret is saved in the wallet before this
+    /// returns, so the key is on disk before any payment is made.
     pub fn build_psp_payload(
         &mut self,
-        outputs: &[u64],
-        mint_did_pubkey: &DidPublicKey,
+        psp_did: &DidPublicKey,
     ) -> Result<PurchaseBuild, WalletError> {
-        check_outputs(
-            outputs,
-            self.psp_max_denomination(),
-            self.psp_min_purchase(),
-        )?;
-        let pending: Vec<PendingOutput> = outputs.iter().map(|&a| PendingOutput::new(a)).collect();
-        let reply_key = DidSecretKey::new();
-        let reply_did = addr::key_to_bytes(&reply_key.public_key());
-        // The payload names the PSP's current keyset as last seen, like every
-        // other request, and the PSP signs with it while it is live (else with
-        // its current one). The record carries the keyset that signed and its
-        // keys.
-        let plaintext = payload::encode(&Payload {
-            keyset: self.psp_output_keyset(),
-            did: reply_did,
-            outputs: pending.iter().map(PendingOutput::mint_output).collect(),
-        })
-        .map_err(|e| WalletError::Invalid(e.to_string()))?;
-        let sealed = sp_wire::seal::encrypt(mint_did_pubkey, &plaintext)?;
+        let key = DidSecretKey::new();
+        let claim_did = addr::key_to_bytes(&key.public_key());
+        let plaintext =
+            payload::encode(&claim_did).map_err(|e| WalletError::Invalid(e.to_string()))?;
+        let sealed = sp_wire::seal::encrypt(psp_did, &plaintext)?;
         let id = hex::encode(Sha256::digest(&sealed));
-        let record = PendingPurchase {
+        let record = ClaimKey {
             id: id.clone(),
-            reply_did: hex::encode(reply_did),
-            mint_did_pubkey: mint_did_pubkey.to_string(),
-            outputs: pending,
-            reply_secret: addr::secret_to_hex(&reply_key),
-            delivery_id: hex::encode(delivery::purchase_id(&plaintext)),
-            open: None,
+            claim_did: hex::encode(claim_did),
+            claim_secret: addr::secret_to_hex(&key),
+            psp_did: psp_did.to_string(),
+            created_at: addr::now_secs(),
+            next_index: 0,
+            records: Vec::new(),
         };
         self.update(|d| {
-            d.pending_purchases.push(record);
+            d.claim_keys.push(record);
             Ok(())
         })?;
         Ok(PurchaseBuild {
@@ -807,238 +465,166 @@ impl Wallet {
         })
     }
 
-    /// Apply the PSP's record for the pending purchase `purchase_id` (its `id`),
-    /// which has been opened and checked (`delivery::open_record`).
+    /// Apply the PSP mint's owed record at cell `index` of the claim key `id`:
+    /// `sealed` is the cell's bytes, `now` this wallet's clock in Unix seconds
+    /// (the first read of the record, which starts its window).
     ///
-    /// - **Signed.** Each pair is unblinded with the keys of the keyset that
-    ///   signed, which the record carries (they must be the keys that keyset's id
-    ///   names), and becomes a note. All or nothing: a pair that matches no
-    ///   pending output, or an amount the keyset has no key for, changes nothing.
-    ///   The purchase is cleared. Its key is deleted with it unless the purchase
-    ///   may still be open: the PSP owes a credit, or some output was neither
-    ///   signed nor reported as dropped. Then the key is kept in `open_replies`
-    ///   until the record's `open_until` (or, with none named, 14 days from now).
-    ///   A credit carries the record's rules, which are what the claim
-    ///   ([`Wallet::build_reconcile`]) follows; a record that owes a credit and
-    ///   carries no rules is a mint error, and nothing is stored.
-    /// - **Held or Refused.** The purchase and its key are kept, marked open with
-    ///   what the PSP said and its rules ([`Delivered::Open`]). Nothing is cleared
-    ///   until a reconciliation request settles it ([`Wallet::apply_reconcile`])
-    ///   or `open_until` passes ([`Wallet::close_expired`]). A record that opens a
-    ///   window and carries no rules is a mint error, and nothing is stored: there
-    ///   would be nothing to send.
-    /// - A purchase that is not pending (this record was applied before) is
-    ///   [`Delivered::AlreadyDone`], and nothing is written. So is an open
-    ///   purchase given the same held or refused record again (a request already
-    ///   built for it is kept). A different record replaces the first, and a
-    ///   request built under other rules is dropped with its AIR request.
+    /// The record is opened with the claim key and checked
+    /// (`delivery::open_record`: it opens, names this PSP mint, carries the PSP
+    /// mint's signature and answers this record id and claim DID), and its terms
+    /// must be a purchase claim sent as kind 15. A record that fails any of this is
+    /// a mint error and changes nothing; [`crate::mint_info::psp_pickup`] then skips
+    /// the cell ([`Wallet::skip_record`]) and reads on. A good record is stored in
+    /// the key's `records` and `next_index` moves past it, in one write. A record
+    /// whose `due_units` is 0 (the fees take the whole payment) is stored as done
+    /// and told: there is nothing to claim.
+    ///
+    /// Cells are applied in order. A cell below `next_index` was applied or skipped
+    /// before, here or in another copy of the wallet ([`Delivered::AlreadyDone`]);
+    /// one above it is a caller's error.
     pub fn apply_delivery(
         &mut self,
-        purchase_id: &str,
-        outcome: &Outcome,
+        id: &str,
+        index: u32,
+        sealed: &[u8],
+        now: u64,
     ) -> Result<Delivered, WalletError> {
-        let Some(current) = self
-            .pending_purchases()
-            .iter()
-            .find(|p| p.id == purchase_id)
-        else {
+        let Some(key) = self.claim_keys().iter().find(|k| k.id == id) else {
+            return Err(WalletError::Unknown(format!("no purchase {id}")));
+        };
+        if index < key.next_index {
             return Ok(Delivered::AlreadyDone);
-        };
-        let open = match outcome {
-            Outcome::Signed(_) => None,
-            Outcome::Refused(r) => Some(OpenPurchase {
-                kind: OpenKind::Rejected,
-                reason: r.reason.clone(),
-                paid_sats: r.paid_sats,
-                paid_cents: r.paid_cents,
-                requested_units: 0,
-                over_under_bps: 0,
-                open_until: window(r.open_until),
-                rules: rules_of("rejected purchase", &r.rules)?,
-                reconcile: ReconcileState::default(),
-            }),
-            Outcome::Held(h) => Some(OpenPurchase {
-                kind: OpenKind::Held,
-                reason: h.reason.clone(),
-                paid_sats: h.paid_sats,
-                paid_cents: h.paid_cents,
-                requested_units: h.requested_units,
-                over_under_bps: h.over_under_bps,
-                open_until: window(h.open_until),
-                rules: rules_of("held payment", &h.rules)?,
-                reconcile: ReconcileState::default(),
-            }),
-        };
-        if let Some(mut open) = open {
-            if current
-                .open
-                .as_ref()
-                .is_some_and(|kept| kept.same_record(&open))
-            {
-                return Ok(Delivered::AlreadyDone);
-            }
-            let key = current.reply_secret.clone();
-            self.update(|d| {
-                let old = d
-                    .pending_purchases
-                    .iter_mut()
-                    .find(|p| p.id == purchase_id)
-                    .and_then(|p| p.open.take());
-                if let Some(old) = old {
-                    if old.rules == open.rules {
-                        open.reconcile = old.reconcile;
-                    } else {
-                        drop_air_request(d, &key);
-                    }
-                }
-                if let Some(p) = d.pending_purchases.iter_mut().find(|p| p.id == purchase_id) {
-                    p.open = Some(open);
-                }
-                Ok(())
-            })?;
-            let kept = self
-                .pending_purchases()
-                .iter()
-                .find(|p| p.id == purchase_id)
-                .and_then(|p| p.open.clone())
-                .expect("the open record was just stored");
-            return Ok(Delivered::Open(kept));
         }
-        let Outcome::Signed(signed) = outcome else {
-            unreachable!("the other outcomes returned above");
+        if index > key.next_index {
+            return Err(WalletError::Invalid(format!(
+                "purchase {id}: record {index} is read before record {}",
+                key.next_index
+            )));
+        }
+        let corrupt = |what: &str| WalletError::Corrupt(format!("purchase {id}: {what}"));
+        let secret = addr::secret_from_hex(&key.claim_secret)
+            .map_err(|_| corrupt("its claim key is not valid"))?;
+        let psp = ServiceDid::parse(&key.psp_did)
+            .map_err(|_| corrupt("the PSP mint key it was sealed to is not valid"))?;
+        let claim = addr::key_to_did(&secret.public_key());
+        if claim.to_hex() != key.claim_did {
+            return Err(corrupt("its claim key is not the one its payload names"));
+        }
+        let opened = delivery::open_record(&secret, &psp, index, sealed).map_err(|e| {
+            WalletError::Mint(format!(
+                "the PSP mint's record {index} for purchase {id} was not accepted: {e}"
+            ))
+        })?;
+        let Outcome::Owed(owed) = opened.outcome;
+        let terms = &owed.terms;
+        if terms.send != SEND_PURCHASE_CLAIM || terms.kind != KIND_PSP_CLAIM {
+            return Err(WalletError::Mint(format!(
+                "the PSP mint's record {index} for purchase {id} says to send {:?} as kind {}, but this wallet sends {SEND_PURCHASE_CLAIM:?} as kind {KIND_PSP_CLAIM}. Nothing was stored",
+                terms.send, terms.kind
+            )));
+        }
+        let nothing_due = terms.due_units == 0;
+        let record = OwedClaim {
+            index,
+            record_id: hex::encode(delivery::record_id(&claim, index)),
+            txid: owed.txid.clone(),
+            due_units: terms.due_units,
+            window_secs: terms.window_secs,
+            first_read_at: now,
+            max_attempts: terms.max_attempts,
+            request: None,
+            others: Vec::new(),
+            attempts: 0,
+            unanswered: false,
+            told_lost: nothing_due,
+            done: nothing_due,
         };
-        let claim_rules = if signed.credit_cents > 0 {
-            Some(rules_of("credit", &signed.rules)?)
-        } else {
-            signed.rules.clone()
-        };
-        let keys = keys_of(&signed.keyset, &signed.keysets)?;
+        let stored = record.clone();
         self.update(|d| {
-            let at = d
-                .pending_purchases
-                .iter()
-                .position(|p| p.id == purchase_id)
-                .ok_or_else(|| {
-                    WalletError::Unknown(format!("no pending purchase {purchase_id}"))
-                })?;
-            let mut claimed = Vec::new();
-            let mut claimed_units = 0u64;
-            for pair in &signed.signatures {
-                let blind_nonce = BlindNonce(point(&pair.blind_nonce)?);
-                let signature = point(&pair.signature)?;
-                let found = d.pending_purchases[at]
-                    .outputs
-                    .iter()
-                    .position(|o| o.blind_nonce == blind_nonce);
-                let Some(o) = found else {
-                    return Err(WalletError::Unknown(format!(
-                        "no pending output of purchase {purchase_id} has blind nonce {}",
-                        blind_nonce.0
-                    )));
-                };
-                let output = d.pending_purchases[at].outputs.remove(o);
-                let key = keys
-                    .get(&Amount::from_units(output.amount))
-                    .ok_or_else(|| {
-                        WalletError::Mint(format!("the PSP has no key for {} units", output.amount))
-                    })?;
-                let note = StoredNote {
-                    kind: Kind::Psp,
-                    amount: output.amount,
-                    note: output.unblind(&signature, key),
-                    spend_secret: output.nonce_secret,
-                    terms: None,
-                    reserved_by: None,
-                };
-                // The keyset is the one whose keys unblinded the note.
-                d.keysets.insert(note.id(), signed.keyset.clone());
-                claimed.push(note.id());
-                claimed_units = claimed_units
-                    .checked_add(output.amount)
-                    .ok_or_else(|| WalletError::Invalid("amounts are too large".into()))?;
-                d.notes.push(note);
+            let key = d
+                .claim_keys
+                .iter_mut()
+                .find(|k| k.id == id)
+                .ok_or_else(|| WalletError::Unknown(format!("no purchase {id}")))?;
+            key.records.push(record);
+            key.records.sort_by_key(|r| r.index);
+            key.next_index = index + 1;
+            Ok(())
+        })?;
+        Ok(Delivered::Stored(stored))
+    }
+
+    /// Move the claim key `id` past cell `index` without storing a record: the
+    /// cell did not open, so it is skipped for good (a cell is written once). Does
+    /// nothing when `index` is not the key's next cell.
+    pub(crate) fn skip_record(&mut self, id: &str, index: u32) -> Result<(), WalletError> {
+        match self.claim_keys().iter().find(|k| k.id == id) {
+            Some(key) if key.next_index == index => {}
+            _ => return Ok(()),
+        }
+        self.update(|d| {
+            if let Some(key) = d.claim_keys.iter_mut().find(|k| k.id == id) {
+                key.next_index = index + 1;
             }
-            let purchase = d.pending_purchases.remove(at);
-            // What was asked for and not signed must be what the PSP says it
-            // dropped. A difference either way means the purchase may not be
-            // closed, so its key is kept.
-            let left: u64 = purchase.outputs.iter().map(|o| o.amount).sum();
-            let unaccounted_units = left.abs_diff(signed.skipped_units);
-            let key_kept = signed.credit_cents > 0 || unaccounted_units > 0;
-            if key_kept {
-                // The PSP's window for a credit; else the wallet's own.
-                let open_until = window(signed.open_until);
-                d.open_replies.push(OpenReply {
-                    id: purchase.id,
-                    delivery_id: purchase.delivery_id,
-                    mint_did_pubkey: purchase.mint_did_pubkey,
-                    reply_secret: purchase.reply_secret,
-                    credit_cents: signed.credit_cents,
-                    unaccounted_units,
-                    open_until,
-                    rules: claim_rules,
-                    reconcile: ReconcileState::default(),
-                });
-            }
-            let still_pending = d.pending_purchases.iter().map(|p| p.outputs.len()).sum();
-            Ok(Delivered::Claimed(Claimed {
-                claim: ClaimResult {
-                    claimed,
-                    claimed_units,
-                    still_pending,
-                },
-                skipped_units: signed.skipped_units,
-                credit_cents: signed.credit_cents,
-                unaccounted_units,
-                key_kept,
-            }))
+            Ok(())
         })
     }
 
-    /// The credit the PSP owes this wallet for overpayments, summed over the
-    /// credits whose window is still open at `now` (Unix seconds, this wallet's
-    /// clock). It is not in [`Wallet::balance`]'s `psp`: the wallet holds no note
-    /// for it until the credit is claimed ([`crate::mint_info::psp_reconcile`]).
-    /// `units` is what the claim will issue (the rules' `due_units`), `cents` the
-    /// exact credit. A credit whose window has closed is left out, as
-    /// [`Wallet::close_expired`] would delete it, and so is one that was claimed.
-    pub fn pending_psp_credit(&self, now: u64) -> PspCredit {
-        let mut credit = PspCredit {
-            cents: 0,
-            units: 0,
-            purchases: 0,
-        };
-        for r in self
-            .open_replies()
-            .iter()
-            .filter(|r| r.credit_cents > 0 && r.open_until > now)
-        {
-            credit.cents += u128::from(r.credit_cents);
-            credit.units += r
-                .rules
-                .as_ref()
-                .map_or(0, |rules| u128::from(rules.due_units));
-            credit.purchases += 1;
+    /// The owed records that can still be claimed at `now`: the window is open,
+    /// the record is not done and something is due. Oldest key first, each key's
+    /// records in order.
+    pub fn open_claims(&self, now: u64) -> Vec<OpenClaim> {
+        let mut out = Vec::new();
+        for key in self.claim_keys() {
+            let psp = ServiceDid::parse(&key.psp_did)
+                .map_or_else(|_| key.psp_did.clone(), |did| did.to_hex());
+            for r in &key.records {
+                if r.done || r.due_units == 0 || !r.is_open(now) {
+                    continue;
+                }
+                let status = if r.request.is_none() {
+                    ClaimStatus::Due
+                } else if r.unanswered && r.attempts >= r.max_attempts {
+                    ClaimStatus::Refused
+                } else {
+                    ClaimStatus::Sent
+                };
+                out.push(OpenClaim {
+                    id: key.id.clone(),
+                    index: r.index,
+                    psp: psp.clone(),
+                    txid: r.txid.clone(),
+                    due_units: r.due_units,
+                    window_ends: r.window_ends(),
+                    attempts: r.attempts,
+                    max_attempts: r.max_attempts,
+                    status,
+                    told_lost: r.told_lost,
+                });
+            }
         }
-        credit
+        out
     }
 
-    /// Delete what a closed reconciliation window leaves behind: every open
-    /// purchase (held or rejected) whose `open_until` is `now` or earlier, with
-    /// its blinding factors, its reply key and the request it saved, and every
-    /// kept reply key (a credit, or outputs not accounted for) whose `open_until`
-    /// has passed. The PSP forfeits a payment that is still open at its
-    /// `open_until`, so nothing can arrive for these any more. The window is the
-    /// PSP's, read from its record, and `now` is this wallet's clock.
+    /// Delete what closed windows leave behind. Each record whose window has
+    /// closed (its first read plus its `window_secs` is `now` or earlier) without
+    /// being claimed goes to the returned list once ([`Loss::forfeited`]), and a
+    /// record that was reported lost already, or has a claim saved and waiting for
+    /// an answer, is not. A claim key is deleted, with its secret, its records and
+    /// their saved claims, only when it holds at least one record, the window of
+    /// every record has closed and none of them is waiting for an answer to a
+    /// saved claim ([`crate::mint_info::psp_close_expired`] sends that claim one
+    /// last time first). A key with no record is not deleted here: its payment
+    /// may still be waiting for its confirmations ([`Wallet::expire_unpaid`]
+    /// drops it once it is old enough). The windows are the records', and `now`
+    /// is this wallet's clock.
     ///
-    /// Nothing is written when nothing is closed. Returns what was closed, one
-    /// [`Loss`] each: its [`Loss::forfeited`] says plainly that the payment was
-    /// forfeited and the funds are lost, with the amount.
+    /// Nothing is written when nothing is closed.
     pub fn close_expired(&mut self, now: u64) -> Result<Vec<Loss>, WalletError> {
         self.close_expired_keeping(now, &[])
     }
 
-    /// [`Wallet::close_expired`], leaving the payments in `keep` as they are: the
+    /// [`Wallet::close_expired`], leaving the claim keys in `keep` in place: the
     /// ones whose last resend could not be sent
     /// ([`crate::mint_info::psp_close_expired`]), which are closed at a later
     /// start. No network use.
@@ -1047,288 +633,364 @@ impl Wallet {
         now: u64,
         keep: &[String],
     ) -> Result<Vec<Loss>, WalletError> {
-        let due = |p: &PendingPurchase| {
-            p.open.as_ref().is_some_and(|o| o.open_until <= now) && !keep.contains(&p.id)
+        let mut losses = Vec::new();
+        for key in self.claim_keys() {
+            for r in &key.records {
+                if !r.is_open(now)
+                    && !r.done
+                    && !r.told_lost
+                    && r.request.is_none()
+                    && r.others.is_empty()
+                {
+                    losses.push(Loss {
+                        id: key.id.clone(),
+                        index: r.index,
+                        txid: r.txid.clone(),
+                        due_units: r.due_units,
+                        kind: LossKind::Expired,
+                        window_ends: r.window_ends(),
+                    });
+                }
+            }
+        }
+        let deletable = |k: &ClaimKey| {
+            !keep.contains(&k.id)
+                && !k.records.is_empty()
+                && k.records.iter().all(|r| {
+                    !r.is_open(now) && (r.done || (r.request.is_none() && r.others.is_empty()))
+                })
         };
-        let expired = |r: &OpenReply| r.open_until <= now && !keep.contains(&r.id);
-        let d = self.data();
-        let ids: Vec<String> = d
-            .pending_purchases
-            .iter()
-            .filter(|p| due(p))
-            .map(|p| p.id.clone())
-            .chain(
-                d.open_replies
-                    .iter()
-                    .filter(|r| expired(r))
-                    .map(|r| r.id.clone()),
-            )
-            .collect();
-        if ids.is_empty() {
+        if losses.is_empty() && !self.claim_keys().iter().any(deletable) {
             return Ok(Vec::new());
         }
-        let losses: Vec<Loss> = ids
-            .iter()
-            .filter_map(|id| target_of(d, id))
-            .map(|t| t.loss())
-            .collect();
-        let keys: Vec<String> = ids
-            .iter()
-            .filter_map(|id| target_of(d, id))
-            .map(|t| t.reply_secret)
-            .collect();
+        let told: Vec<(String, u32)> = losses.iter().map(|l| (l.id.clone(), l.index)).collect();
         self.update(|d| {
-            d.pending_purchases.retain(|p| !due(p));
-            d.open_replies.retain(|r| !expired(r));
-            for key in &keys {
-                drop_air_request(d, key);
+            for (id, index) in &told {
+                if let Some(r) = record_mut(d, id, *index) {
+                    r.told_lost = true;
+                }
+            }
+            let gone: Vec<ClaimKey> = d
+                .claim_keys
+                .iter()
+                .filter(|k| deletable(k))
+                .cloned()
+                .collect();
+            d.claim_keys.retain(|k| !deletable(k));
+            for key in &gone {
+                d.air_requests
+                    .retain(|a| !(a.kind == KIND_PSP_CLAIM && a.r == key.claim_secret));
             }
             Ok(())
         })?;
         Ok(losses)
     }
 
-    /// Forget a purchase that was never paid. Its blinding factors and its reply
-    /// key are dropped. Do not do this once the payment has been sent.
+    /// Forget a purchase that was never paid. Its claim key and its secret are
+    /// dropped. Do not do this once the payment has been sent: the PSP mint may
+    /// already owe it.
     pub fn discard_purchase(&mut self, id: &str) -> Result<(), WalletError> {
         self.update(|d| {
-            let before = d.pending_purchases.len();
-            d.pending_purchases.retain(|p| p.id != id);
-            if d.pending_purchases.len() == before {
-                return Err(WalletError::Unknown(format!("no pending purchase {id}")));
+            let before = d.claim_keys.len();
+            d.claim_keys.retain(|k| k.id != id);
+            if d.claim_keys.len() == before {
+                return Err(WalletError::Unknown(format!("no purchase {id}")));
             }
             Ok(())
         })
     }
 
-    /// The payments the wallet is settling that are still open at `now`: every
-    /// held or rejected purchase and every credit, with what is due, until when,
-    /// and where it stands ([`ReconcileStatus`]). Oldest first (purchases, then
-    /// credits). A payment whose window has closed is not listed:
-    /// [`Wallet::close_expired`] reports it as lost.
-    pub fn open_reconciliations(&self, now: u64) -> Vec<OpenReconciliation> {
-        let d = self.data();
-        let ids = d
-            .pending_purchases
+    /// Drop the claim keys that have no owed record and were made `days` days or
+    /// more before `now` (`psp.unpaid_key_days`; 0 keeps them for ever), each
+    /// returned once as a [`LossKind::Unpaid`] loss ([`Loss::unpaid`]). Only the
+    /// keys in `checked` are looked at: the ones the PSP mint's AIR server was just
+    /// asked about and had no record for ([`crate::mint_info::psp_pickup`],
+    /// `no_record`), so a key is never dropped because the AIR server could not be
+    /// read. A key with a record is never dropped here: its records keep their own
+    /// rules ([`Wallet::close_expired`]). A payment made to a dropped key's payload
+    /// is lost. Nothing is written when nothing expires.
+    pub fn expire_unpaid(
+        &mut self,
+        now: u64,
+        days: u64,
+        checked: &[String],
+    ) -> Result<Vec<Loss>, WalletError> {
+        if days == 0 {
+            return Ok(Vec::new());
+        }
+        let after = days.saturating_mul(DAY_SECS);
+        let expired = |k: &ClaimKey| {
+            k.records.is_empty()
+                && checked.contains(&k.id)
+                && now >= k.created_at.saturating_add(after)
+        };
+        let losses: Vec<Loss> = self
+            .claim_keys()
             .iter()
-            .filter(|p| p.open.is_some())
-            .map(|p| p.id.clone())
-            .chain(
-                d.open_replies
-                    .iter()
-                    .filter(|r| r.rules.is_some())
-                    .map(|r| r.id.clone()),
-            );
-        ids.filter_map(|id| {
-            let t = target_of(d, &id)?;
-            let rules = t.rules.clone()?;
-            (t.open_until > now).then(|| OpenReconciliation {
-                id: t.id.clone(),
-                mint: ServiceDid::parse(&t.mint_did_pubkey)
-                    .map_or_else(|_| t.mint_did_pubkey.clone(), |did| did.to_hex()),
-                send: rules.send.clone(),
-                due_units: rules.due_units,
-                open_until: t.open_until,
-                attempts: t.state.attempts,
-                max_attempts: rules.max_attempts,
-                state: t.status(&rules),
-                told_lost: t.state.told_lost,
-                paid_sats: t.paid_sats,
-                paid_cents: t.paid_cents,
-                credit_cents: t.credit_cents,
+            .filter(|k| expired(k))
+            .map(|k| Loss {
+                id: k.id.clone(),
+                index: 0,
+                txid: String::new(),
+                due_units: 0,
+                kind: LossKind::Unpaid,
+                window_ends: k.created_at.saturating_add(after),
             })
-        })
-        .collect()
+            .collect();
+        if losses.is_empty() {
+            return Ok(losses);
+        }
+        self.update(|d| {
+            let gone: Vec<String> = d
+                .claim_keys
+                .iter()
+                .filter(|k| expired(k))
+                .map(|k| k.claim_secret.clone())
+                .collect();
+            d.claim_keys.retain(|k| !expired(k));
+            d.air_requests
+                .retain(|a| !(a.kind == KIND_PSP_CLAIM && gone.contains(&a.r)));
+            Ok(())
+        })?;
+        Ok(losses)
     }
 
-    /// The payments whose window has closed at `now` (`open_until` is `now` or
-    /// earlier) and that still hold a saved request: `(id, the PSP it was sealed
-    /// to as hex)`. These are the ones [`crate::mint_info::psp_close_expired`]
-    /// sends the saved request of one last time before
-    /// [`Wallet::close_expired`] deletes them. A payment without a saved request
-    /// (nothing due, or none built) is not listed.
-    pub(crate) fn expired_requests(&self, now: u64) -> Vec<(String, String)> {
-        let d = self.data();
-        d.pending_purchases
-            .iter()
-            .filter(|p| p.open.is_some())
-            .map(|p| p.id.clone())
-            .chain(
-                d.open_replies
-                    .iter()
-                    .filter(|r| r.rules.is_some())
-                    .map(|r| r.id.clone()),
-            )
-            .filter_map(|id| {
-                let t = target_of(d, &id)?;
-                (t.open_until <= now && t.rules.is_some() && t.state.request.is_some()).then(|| {
-                    let mint = ServiceDid::parse(&t.mint_did_pubkey)
-                        .map_or_else(|_| t.mint_did_pubkey.clone(), |did| did.to_hex());
-                    (t.id.clone(), mint)
+    /// The records whose window has closed at `now` and that still hold a saved
+    /// claim that was not settled: `(the claim key's id, the record's index, the
+    /// PSP mint it was sealed to as hex)`. These are the ones
+    /// [`crate::mint_info::psp_close_expired`] sends the saved claim of one last
+    /// time before [`Wallet::close_expired`] deletes them.
+    pub(crate) fn expired_claims(&self, now: u64) -> Vec<(String, u32, String)> {
+        let mut out = Vec::new();
+        for key in self.claim_keys() {
+            let psp = ServiceDid::parse(&key.psp_did)
+                .map_or_else(|_| key.psp_did.clone(), |did| did.to_hex());
+            for r in &key.records {
+                if !r.is_open(now) && !r.done && (r.request.is_some() || !r.others.is_empty()) {
+                    out.push((key.id.clone(), r.index, psp.clone()));
+                }
+            }
+        }
+        out
+    }
+
+    /// Let go of the saved claim of a record whose window has closed and whose last
+    /// resend got no answer (or was never going to be sent: the purchase was sealed
+    /// to another PSP mint): the claim is over, the blinding factors are of no use,
+    /// and [`Wallet::close_expired`] can report the record lost and delete its key.
+    pub(crate) fn give_up_claim(&mut self, id: &str, index: u32) -> Result<(), WalletError> {
+        self.update(|d| {
+            let secret = d
+                .claim_keys
+                .iter()
+                .find(|k| k.id == id)
+                .map(|k| k.claim_secret.clone());
+            let hashes: Vec<String> = record_mut(d, id, index)
+                .map(|r| {
+                    r.unanswered = false;
+                    r.request
+                        .take()
+                        .into_iter()
+                        .chain(std::mem::take(&mut r.others))
+                        .map(|s| crate::air::body_hash(&hex_body(&s)))
+                        .collect()
                 })
-            })
-            .collect()
+                .unwrap_or_default();
+            if let Some(secret) = secret {
+                for hash in &hashes {
+                    drop_air_request(d, &secret, hash);
+                }
+            }
+            Ok(())
+        })
     }
 
-    /// What the user is told if payment `id` is lost: `None` when it is not an
-    /// open payment.
-    pub(crate) fn reconcile_loss(&self, id: &str) -> Option<Loss> {
-        target_of(self.data(), id).map(|t| t.loss())
+    /// What the user is told if the open record `index` of purchase `id` is lost
+    /// because the PSP mint did not accept the claim: `None` when it is not an
+    /// open record.
+    pub(crate) fn refused_loss(&self, id: &str, index: u32) -> Option<Loss> {
+        let (_, r) = record_of(self.data(), id, index)?;
+        Some(Loss {
+            id: id.to_string(),
+            index,
+            txid: r.txid.clone(),
+            due_units: r.due_units,
+            kind: LossKind::Refused,
+            window_ends: r.window_ends(),
+        })
     }
 
-    /// Build the reconciliation request (AIR kind 15) for the open payment `id`
-    /// and save it, so that [`crate::mint_info::psp_reconcile`] can send it.
-    /// `keysets` is a fresh read of the PSP's keysets, `now` this wallet's clock
-    /// in Unix seconds.
+    /// Build the claim (AIR kind 15) for the open record `index` of the claim key
+    /// `id` and save it, so that [`crate::mint_info::psp_claim`] can send it.
+    /// `window` is a fresh read of the PSP mint's rotation (its current keyset and
+    /// that keyset's epoch), `keys` a fresh read of the keys of that keyset, `now`
+    /// this wallet's clock in Unix seconds.
     ///
-    /// The request follows the payment's rules: fresh blinded outputs that are
-    /// powers of two, none above the PSP's largest note, adding up to the rules'
-    /// `due_units` exactly; on the PSP's current keyset; signed by the purchase's
-    /// reply key. [`check_reconcile`] checks all of it before anything is saved,
-    /// and a request that fails is refused: nothing is saved and nothing is sent.
-    /// The request, its bytes and its blinding factors are then saved with the
-    /// payment, together with the AIR request that will carry it (its `R` is the
-    /// reply key), in one write.
+    /// The claim follows the record: fresh blinded outputs that are powers of two
+    /// (the binary digits of `due_units`, largest first) adding up to `due_units`
+    /// exactly, on the PSP mint's current keyset, signed by the claim key over
+    /// `ClaimRequest::digest(psp)`. Every output must have a key in `keys`, and
+    /// `keys` must be the keys the keyset's id names. The claim, its bytes and its
+    /// blinding factors are then saved with the record, together with the AIR
+    /// request that will carry it (its `R` is the claim key), in one write; a
+    /// claim that fails a check is refused and nothing is saved.
     ///
-    /// It refuses, with the wallet unchanged: a payment with nothing due (the
-    /// fees take the whole amount); one whose window has closed; one whose rules
-    /// name something other than what this payment is sent as; a saved request
-    /// whose keyset is still live (that one is sent again as it is); and any
-    /// request beyond `min(rules.max_attempts, 2)`: the first, and the one second
-    /// request the keyset-rotation race allows.
-    pub fn build_reconcile(
+    /// It refuses, with the wallet unchanged: a record that is done, has nothing
+    /// due, or whose window has closed; a saved claim whose keyset is still the
+    /// current one (that one is sent again as it is, never rebuilt); and any claim
+    /// beyond the record's `max_attempts`.
+    pub fn build_claim(
         &mut self,
         id: &str,
-        keysets: &KeysetsResponse,
+        index: u32,
+        window: &Window,
+        keys: &BTreeMap<Amount, PublicKey>,
         now: u64,
-    ) -> Result<ReconcileBuild, WalletError> {
-        let t = target_of(self.data(), id)
-            .ok_or_else(|| WalletError::Unknown(format!("no open payment {id}")))?;
-        let Some(rules) = t.rules.clone() else {
-            return Err(WalletError::Unknown(format!(
-                "purchase {id} has no reconciliation rules: the PSP named nothing to send for it"
+    ) -> Result<ClaimBuild, WalletError> {
+        let (key, record) = record_of(self.data(), id, index)
+            .map(|(k, r)| (k.clone(), r.clone()))
+            .ok_or_else(|| WalletError::Unknown(format!("no record {index} of purchase {id}")))?;
+        let corrupt = |what: &str| WalletError::Corrupt(format!("purchase {id}: {what}"));
+        if record.done || record.due_units == 0 {
+            return Err(WalletError::Invalid(format!(
+                "purchase {id}, record {index}: nothing is left to claim"
             )));
-        };
-        let (send, what) = if t.credit {
-            (SEND_CREDIT_CLAIM, "a credit")
-        } else {
-            (SEND_CORRECTED_REQUEST, "a held or rejected payment")
-        };
-        if rules.send != send {
+        }
+        if !record.is_open(now) {
+            return Err(WalletError::Invalid(format!(
+                "purchase {id}, record {index}: the window closed at {}, so nothing is built or sent",
+                crate::date::format_utc(record.window_ends())
+            )));
+        }
+        if record.attempts >= record.max_attempts {
+            return Err(WalletError::Invalid(format!(
+                "purchase {id}, record {index}: {} claim(s) were built already, and the PSP mint counts {}. No other is built",
+                record.attempts, record.max_attempts
+            )));
+        }
+        let keyset = window.current_id.clone();
+        if let Some(saved) = &record.request
+            && saved.keyset == keyset
+        {
+            return Err(WalletError::Invalid(format!(
+                "purchase {id}, record {index}: the saved claim names keyset {keyset}, which is still current. It is sent again as it is, never rebuilt"
+            )));
+        }
+        if sp_wire::keyset::keyset_id(keys) != keyset {
             return Err(WalletError::Mint(format!(
-                "the PSP's rules for {what} say to send {:?}, but this wallet sends {send:?} for it. Nothing was built",
-                rules.send
+                "the keys the PSP mint gave are not those of its current keyset {keyset}"
             )));
         }
-        if now >= rules.open_until {
-            return Err(WalletError::Invalid(format!(
-                "purchase {id}: the window closed at {}, so nothing is built or sent",
-                crate::date::format_utc(rules.open_until)
-            )));
+        let amounts = split_due(record.due_units);
+        check_outputs(&amounts)?;
+        for amount in &amounts {
+            if !keys.contains_key(&Amount::from_units(*amount)) {
+                return Err(WalletError::Mint(format!(
+                    "the PSP mint's keyset {keyset} has no key for {amount} units, so a claim of {} cannot be built",
+                    record.due_units
+                )));
+            }
         }
-        if rules.due_units == 0 {
-            return Err(WalletError::Invalid(format!(
-                "purchase {id}: nothing is due (the PSP's fees take the whole amount), so no request is built"
-            )));
-        }
-        let may_build = rules.max_attempts.min(MAX_BUILT_REQUESTS);
-        if t.state.attempts >= may_build {
-            return Err(WalletError::Invalid(format!(
-                "purchase {id}: {} request(s) were built already, and the rules allow {} ({} at most the wallet builds). No other is built",
-                t.state.attempts, rules.max_attempts, MAX_BUILT_REQUESTS
-            )));
-        }
-        if let Some(saved) = &t.state.request
-            && keyset_is_live(keysets, &saved.keyset)
-        {
-            return Err(WalletError::Invalid(format!(
-                "purchase {id}: the saved request names keyset {}, which is still live. It is sent again as it is, never rebuilt",
-                saved.keyset
-            )));
-        }
-        let keyset = keysets.current.clone();
-        let keys = keys_of(&keyset, keysets)?;
-        let top =
-            keys.keys().map(|a| a.units).max().ok_or_else(|| {
-                WalletError::Mint(format!("the PSP's keyset {keyset} has no keys"))
-            })?;
-        let outputs: Vec<PendingOutput> = split_due(rules.due_units, top)?
-            .into_iter()
-            .map(PendingOutput::new)
-            .collect();
+        let outputs: Vec<PendingOutput> = amounts.into_iter().map(PendingOutput::new).collect();
 
-        let key = addr::secret_from_hex(&t.reply_secret).map_err(|_| {
-            WalletError::Corrupt(format!("the reply key of purchase {id} is not valid"))
-        })?;
-        let reply_did = addr::key_to_did(&key.public_key());
-        if t.reply_did
-            .as_deref()
-            .is_some_and(|saved| saved != reply_did.to_hex())
-        {
-            return Err(WalletError::Corrupt(format!(
-                "the reply key of purchase {id} is not the one its payload names"
-            )));
+        let secret = addr::secret_from_hex(&key.claim_secret)
+            .map_err(|_| corrupt("its claim key is not valid"))?;
+        let claim_did = addr::key_to_did(&secret.public_key());
+        if claim_did.to_hex() != key.claim_did {
+            return Err(corrupt("its claim key is not the one its payload names"));
         }
-        let purchase: [u8; 32] = hex::decode(&t.delivery_id)
+        let psp = ServiceDid::parse(&key.psp_did).map_err(|e| {
+            corrupt(&format!(
+                "the PSP mint key it was sealed to is not valid: {e}"
+            ))
+        })?;
+        let record_id: [u8; 32] = hex::decode(&record.record_id)
             .ok()
             .and_then(|b| b.try_into().ok())
-            .ok_or_else(|| {
-                WalletError::Corrupt(format!("the delivery id of purchase {id} is not valid"))
-            })?;
-        let secret = secp256k1::SecretKey::from_slice(&key.to_array()).map_err(|_| {
-            WalletError::Corrupt(format!("the reply key of purchase {id} is not valid"))
-        })?;
-        let mut request = ReconcileRequest {
-            reply_did,
-            purchase,
+            .ok_or_else(|| corrupt("a record id that is not 32 bytes of hex"))?;
+        let signing = secp256k1::SecretKey::from_slice(&secret.to_array())
+            .map_err(|_| corrupt("its claim key is not valid"))?;
+        let mut request = ClaimRequest {
+            claim_did,
+            record_id,
             keyset: keyset.clone(),
             outputs: outputs.iter().map(PendingOutput::mint_output).collect(),
             signature: secp256k1::schnorr::Signature::from_slice(&[0; 64])
                 .expect("any 64 bytes are a signature to sign over"),
         };
         request.signature = SECP256K1.sign_schnorr(
-            &request.digest(),
-            &Keypair::from_secret_key(SECP256K1, &secret),
+            &request.digest(&psp),
+            &Keypair::from_secret_key(SECP256K1, &signing),
         );
-        check_reconcile(&request, &rules, keysets, &reply_did, &purchase, now)?;
+        let bug = |why: &str| {
+            WalletError::Invalid(format!(
+                "the claim is not right ({why}). That is a bug in the wallet, so nothing was saved and nothing was sent"
+            ))
+        };
+        SECP256K1
+            .verify_schnorr(
+                &request.signature,
+                &request.digest(&psp),
+                &request.claim_did.x_only(),
+            )
+            .map_err(|_| bug("the signature does not verify under the claim key"))?;
+        let total: u128 = request
+            .outputs
+            .iter()
+            .map(|o| u128::from(o.amount.units))
+            .sum();
+        if total != u128::from(record.due_units) {
+            return Err(bug(&format!(
+                "the outputs add up to {total}, the record says {}",
+                record.due_units
+            )));
+        }
+        let mut nonces = BTreeSet::new();
+        if !request
+            .outputs
+            .iter()
+            .all(|o| nonces.insert(o.blind_nonce.0.serialize()))
+        {
+            return Err(bug("two outputs share a blind nonce"));
+        }
         let body = serde_json::to_vec(&request)
-            .map_err(|e| WalletError::Invalid(format!("the request could not be encoded: {e}")))?;
-        let hash = request.hash();
-        let attempt = t.state.attempts + 1;
+            .map_err(|e| WalletError::Invalid(format!("the claim could not be encoded: {e}")))?;
+        let hash = request.hash(&psp);
+        let attempt = record.attempts + 1;
 
-        let saved = SavedRequest {
+        let saved = SavedClaim {
             body: hex::encode(&body),
             hash: hash.clone(),
             keyset,
+            epoch: window.current_epoch,
             outputs,
         };
         let air_request = PendingAirRequest {
-            kind: KIND_PSP_RECONCILE,
+            kind: KIND_PSP_CLAIM,
             request_id: hex::encode(addr::random_id()),
-            mint: ServiceDid::parse(&t.mint_did_pubkey)
-                .map_err(|e| {
-                    WalletError::Corrupt(format!(
-                        "the PSP's key of purchase {id} is not valid: {e}"
-                    ))
-                })?
-                .to_hex(),
-            r: addr::secret_to_hex(&key),
+            mint: psp.to_hex(),
+            r: key.claim_secret.clone(),
             slots: Vec::new(),
             created_at: addr::now_secs(),
             body_hash: crate::air::body_hash(&body),
         };
+        let old = record.request.as_ref().map(hex_body);
         self.update(|d| {
-            let state = state_mut(d, id)
-                .ok_or_else(|| WalletError::Unknown(format!("no open payment {id}")))?;
-            state.request = Some(saved);
-            state.attempts = attempt;
-            state.unanswered = false;
-            drop_air_request(d, &t.reply_secret);
+            let r = record_mut(d, id, index).ok_or_else(|| {
+                WalletError::Unknown(format!("no record {index} of purchase {id}"))
+            })?;
+            r.request = Some(saved);
+            r.attempts = attempt;
+            r.unanswered = false;
+            if let Some(old) = &old {
+                drop_air_request(d, &key.claim_secret, &crate::air::body_hash(old));
+            }
             d.air_requests.push(air_request);
             Ok(())
         })?;
-        Ok(ReconcileBuild {
+        Ok(ClaimBuild {
             id: id.to_string(),
+            index,
             request,
             body,
             hash,
@@ -1336,50 +998,78 @@ impl Wallet {
         })
     }
 
-    /// Apply the PSP's answer to the reconciliation request saved for the open
-    /// payment `id`. The answer is checked first, and any failure is a mint error
-    /// that stores nothing and keeps the key and the saved request:
+    /// Apply the PSP mint's answer to the claim saved for record `index` of the
+    /// claim key `id`. The answer is checked first, and any failure is a mint error
+    /// that stores nothing and keeps the key and the saved claim:
     ///
-    /// - the keyset that signed is listed in the answer and its keys hash to its
-    ///   id (it need not be the keyset the request named: the PSP signs a request
-    ///   it had already taken with its current keyset when the request's keyset was
-    ///   deleted meanwhile);
-    /// - there is one signature for each output, in the request's order, for that
-    ///   output's blind nonce, and the keyset has a key for its amount;
-    /// - `issued_units` is the rules' `due_units`.
+    /// - the keyset that signed is the one the claim named, it is listed in the
+    ///   answer, and its keys hash to its id;
+    /// - there is one signature for each output, in the claim's order, for that
+    ///   output's blind nonce, each a curve point (a blind signature cannot be
+    ///   checked further without the PSP mint's secret key; the notes are checked
+    ///   when they are spent), and the keyset has a key for the output's amount;
+    /// - `issued_units` is the record's `due_units`.
     ///
-    /// Then, in one write, the notes are stored (with their keyset recorded), and
-    /// the purchase or credit, its reply key, the saved request and the AIR
-    /// request that carried it are removed. A payment that is not open any more
-    /// (the same answer applied before, here or in another copy of the wallet) is
+    /// Then, in one write, the notes are stored (with their keyset and the epoch
+    /// the claim was built under recorded), the record is marked done, its saved
+    /// claim is dropped and so are its other saved claims ([`OwedClaim::others`])
+    /// and the AIR requests that carried them. A record that is done already (the
+    /// same answer applied before, here or in another copy of the wallet) is
     /// [`Applied::AlreadyDone`]: nothing is written and no note is added.
-    pub fn apply_reconcile(
+    ///
+    /// A note that has left this wallet already (the ledgers count it departed and
+    /// not returned) or is held already is not added again: a stale copy merged in
+    /// can bring back a settled record's saved claim, and the PSP mint answers its
+    /// resend from its stored answer, with the notes that were spent since. When no
+    /// note is left to add, the record is marked done and the answer is
+    /// [`Applied::AlreadyDone`].
+    pub fn apply_claim(
         &mut self,
         id: &str,
-        response: &ReconcileResponse,
+        index: u32,
+        response: &ClaimResponse,
     ) -> Result<Applied, WalletError> {
-        let Some(t) = target_of(self.data(), id) else {
+        self.apply_claim_to(id, index, None, response)
+    }
+
+    /// [`Wallet::apply_claim`] for the saved claim whose hash is `hash` (one of
+    /// [`OwedClaim::others`], or the main one), or the main one for `None`.
+    pub(crate) fn apply_claim_to(
+        &mut self,
+        id: &str,
+        index: u32,
+        hash: Option<&str>,
+        response: &ClaimResponse,
+    ) -> Result<Applied, WalletError> {
+        let Some((key, record)) = record_of(self.data(), id, index) else {
             return Ok(Applied::AlreadyDone);
         };
-        let Some(rules) = t.rules.clone() else {
+        if record.done {
+            return Ok(Applied::AlreadyDone);
+        }
+        let Some(saved) = saved_of(record, hash).cloned() else {
             return Err(WalletError::Unknown(format!(
-                "purchase {id} has no reconciliation rules: there is no request to apply an answer to"
+                "no claim was built for record {index} of purchase {id}, so there is nothing for this answer to settle"
             )));
         };
-        let Some(saved) = t.state.request.clone() else {
-            return Err(WalletError::Unknown(format!(
-                "no reconciliation request was built for purchase {id}, so there is nothing for this answer to settle"
-            )));
-        };
+        let all_saved: Vec<String> = record
+            .request
+            .iter()
+            .chain(&record.others)
+            .map(|s| crate::air::body_hash(&hex_body(s)))
+            .collect();
+        let (due_units, secret) = (record.due_units, key.claim_secret.clone());
         let wrong = |why: String| {
             WalletError::Mint(format!(
-                "the PSP's answer to the reconciliation request of purchase {id} is not right ({why}). Nothing was stored and the key is kept"
+                "the PSP mint's answer to the claim of record {index} of purchase {id} is not right ({why}). Nothing was stored and the key is kept"
             ))
         };
-        // The keyset that signed need not be the one the request names: the PSP
-        // signs a resumed request whose keyset was deleted since with its current
-        // one, and the reply names it. It must be listed in the reply, with keys
-        // that hash to its id (`keys_of`), and the notes take it.
+        if response.keyset != saved.keyset {
+            return Err(wrong(format!(
+                "it was signed by keyset {}, the claim named {}",
+                response.keyset, saved.keyset
+            )));
+        }
         let keys =
             keys_of(&response.keyset, &response.keysets).map_err(|e| wrong(e.to_string()))?;
         if response.signatures.len() != saved.outputs.len() {
@@ -1413,96 +1103,165 @@ impl Wallet {
                 reserved_by: None,
             });
         }
-        if response.issued_units != rules.due_units {
+        if response.issued_units != due_units {
             return Err(wrong(format!(
-                "it issued {} units, the rules say {}",
-                response.issued_units, rules.due_units
+                "it issued {} units, the record says {due_units}",
+                response.issued_units
             )));
         }
+        let total: u64 = notes.iter().map(|n| n.amount).sum();
+        if total != due_units {
+            return Err(wrong(format!(
+                "the outputs add up to {total}, the record says {due_units}"
+            )));
+        }
+        // A note that left this wallet (spent, handed over, lost) or is held
+        // already is not added again.
+        let held: BTreeSet<String> = self.notes().iter().map(StoredNote::id).collect();
+        notes.retain(|n| {
+            let nid = n.id();
+            !held.contains(&nid) && !crate::store::has_departed(self.data(), &nid)
+        });
         let claimed: Vec<String> = notes.iter().map(StoredNote::id).collect();
         let units: u64 = notes.iter().map(|n| n.amount).sum();
         let keyset = response.keyset.clone();
         self.update(|d| {
             for note in notes {
                 d.keysets.insert(note.id(), keyset.clone());
+                d.epochs.insert(note.id(), saved.epoch);
                 d.notes.push(note);
             }
-            if t.credit {
-                d.open_replies.retain(|r| r.id != id);
-            } else {
-                d.pending_purchases.retain(|p| p.id != id);
+            if let Some(r) = record_mut(d, id, index) {
+                r.done = true;
+                r.unanswered = false;
+                r.request = None;
+                r.others.clear();
             }
-            drop_air_request(d, &t.reply_secret);
-            d.reconciled.insert(id.to_string());
+            for hash in &all_saved {
+                drop_air_request(d, &secret, hash);
+            }
             Ok(())
         })?;
-        Ok(Applied::Settled(Settled {
-            claimed,
-            units,
-            credit: t.credit,
-        }))
+        if claimed.is_empty() {
+            return Ok(Applied::AlreadyDone);
+        }
+        Ok(Applied::Settled(Settled { claimed, units }))
     }
 
-    /// The saved request of payment `id`, with what sending it needs.
-    pub(crate) fn reconcile_to_send(&self, id: &str) -> Result<ToSend, WalletError> {
-        let t = target_of(self.data(), id)
-            .ok_or_else(|| WalletError::Unknown(format!("no open payment {id}")))?;
-        let (Some(_), Some(saved)) = (t.rules.as_ref(), t.state.request.as_ref()) else {
+    /// The saved claim of record `index` of purchase `id`, with what sending it
+    /// needs.
+    pub(crate) fn claim_to_send(&self, id: &str, index: u32) -> Result<ToSend, WalletError> {
+        self.claim_to_send_of(id, index, None)
+    }
+
+    /// [`Wallet::claim_to_send`] for the saved claim whose hash is `hash`, or the
+    /// main one for `None`.
+    pub(crate) fn claim_to_send_of(
+        &self,
+        id: &str,
+        index: u32,
+        hash: Option<&str>,
+    ) -> Result<ToSend, WalletError> {
+        let (key, record) = record_of(self.data(), id, index)
+            .ok_or_else(|| WalletError::Unknown(format!("no record {index} of purchase {id}")))?;
+        let Some(saved) = saved_of(record, hash) else {
             return Err(WalletError::Unknown(format!(
-                "no reconciliation request is saved for purchase {id}"
+                "no claim is saved for record {index} of purchase {id}"
             )));
         };
         let corrupt = |what: &str| {
-            WalletError::Corrupt(format!("the saved request of purchase {id} has {what}"))
+            WalletError::Corrupt(format!(
+                "the saved claim of record {index} of purchase {id} has {what}"
+            ))
         };
         let body = hex::decode(&saved.body).map_err(|_| corrupt("a body that is not hex"))?;
-        let key = addr::secret_from_hex(&t.reply_secret)
+        let claim_key = addr::secret_from_hex(&key.claim_secret)
             .map_err(|_| corrupt("a key that is not valid"))?;
-        // The PSP key is not sent with the request, but a purchase sealed to a
-        // key that does not parse is still refused here, as it always was.
-        ServiceDid::parse(&t.mint_did_pubkey)
-            .map_err(|_| corrupt("a PSP key that is not valid"))?;
+        ServiceDid::parse(&key.psp_did).map_err(|_| corrupt("a PSP mint key that is not valid"))?;
         Ok(ToSend {
             body,
-            key,
+            key: claim_key,
             keyset: saved.keyset.clone(),
         })
     }
 
-    /// Record that the PSP did not answer the saved request of payment `id`
-    /// (`true`), or that it did (`false`). Nothing is written when it is as
-    /// recorded already.
+    /// The hashes of the other saved claims of record `index` of purchase `id`
+    /// ([`OwedClaim::others`]), in order. Empty when the record is done or gone.
+    pub(crate) fn other_claims(&self, id: &str, index: u32) -> Vec<String> {
+        match record_of(self.data(), id, index) {
+            Some((_, r)) if !r.done => r.others.iter().map(|s| s.hash.clone()).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Drop the other saved claim `hash` of record `index` of purchase `id`: the
+    /// PSP mint refused it in a signed reply, or its window closed and its last
+    /// resend got no answer. Nothing is written when it is not there.
+    pub(crate) fn drop_other_claim(
+        &mut self,
+        id: &str,
+        index: u32,
+        hash: &str,
+    ) -> Result<(), WalletError> {
+        let Some((key, r)) = record_of(self.data(), id, index) else {
+            return Ok(());
+        };
+        let Some(saved) = r.others.iter().find(|s| s.hash == hash) else {
+            return Ok(());
+        };
+        let (secret, body_hash) = (
+            key.claim_secret.clone(),
+            crate::air::body_hash(&hex_body(saved)),
+        );
+        self.update(|d| {
+            if let Some(r) = record_mut(d, id, index) {
+                r.others.retain(|s| s.hash != hash);
+            }
+            drop_air_request(d, &secret, &body_hash);
+            Ok(())
+        })
+    }
+
+    /// Record that the PSP mint did not answer the saved claim of record `index` of
+    /// purchase `id` (`true`), or that it did (`false`). Nothing is written when it
+    /// is as recorded already.
     pub(crate) fn note_unanswered(
         &mut self,
         id: &str,
+        index: u32,
         unanswered: bool,
     ) -> Result<(), WalletError> {
-        match target_of(self.data(), id) {
-            Some(t) if t.state.unanswered != unanswered => {}
+        match record_of(self.data(), id, index) {
+            Some((_, r)) if r.unanswered != unanswered => {}
             _ => return Ok(()),
         }
         self.update(|d| {
-            if let Some(state) = state_mut(d, id) {
-                state.unanswered = unanswered;
+            if let Some(r) = record_mut(d, id, index) {
+                r.unanswered = unanswered;
             }
             Ok(())
         })
     }
 
-    /// Record that the user was told payment `id` is lost, so it is said once.
-    /// Nothing is written when it was recorded already.
-    pub(crate) fn note_told_lost(&mut self, id: &str) -> Result<(), WalletError> {
-        match target_of(self.data(), id) {
-            Some(t) if !t.state.told_lost => {}
+    /// Record that the user was told record `index` of purchase `id` is lost, so it
+    /// is said once. Nothing is written when it was recorded already.
+    pub(crate) fn note_told_lost(&mut self, id: &str, index: u32) -> Result<(), WalletError> {
+        match record_of(self.data(), id, index) {
+            Some((_, r)) if !r.told_lost => {}
             _ => return Ok(()),
         }
         self.update(|d| {
-            if let Some(state) = state_mut(d, id) {
-                state.told_lost = true;
+            if let Some(r) = record_mut(d, id, index) {
+                r.told_lost = true;
             }
             Ok(())
         })
     }
+}
+
+/// The bytes of a saved claim.
+fn hex_body(saved: &SavedClaim) -> Vec<u8> {
+    hex::decode(&saved.body).unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -1510,17 +1269,14 @@ mod tests {
     use super::*;
     use crate::error::expect;
     use psp_mint::scan::Received;
-    use secp256k1::{SECP256K1, SecretKey};
-    use sp_wire::air_request::delivery::{Held, Refused, Signed, SignedOutput};
-    use sp_wire::psp::KeysetsResponse;
-    use sp_wire::seal::SecretKey as DidSecretKey;
+    use secp256k1::SecretKey;
+    use sp_wire::air_request::delivery::{ClaimTerms, EXPIRY_NOTICE, Owed, build_record};
+    use sp_wire::psp::{CLAIM_WINDOW_SECS, SignedOutput};
     use std::fs;
     use std::path::PathBuf;
 
-    /// Open a wallet file of the test network.
-    fn open_wallet(path: &std::path::Path) -> Result<crate::Wallet, crate::WalletError> {
-        crate::Wallet::open(path, "regtest")
-    }
+    const FIRST: u64 = 1_800_000_000;
+    const SECOND: u64 = 1_802_000_000;
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("ecash-wallet-psp-{}-{name}", {
@@ -1536,1645 +1292,1007 @@ mod tests {
         dir
     }
 
-    /// A wallet that takes small purchases: these tests use outputs of a few
-    /// units, below the default `psp.min_purchase` (the minimum has tests of its
-    /// own, which use the default).
+    fn open_wallet(path: &std::path::Path) -> Result<Wallet, WalletError> {
+        Wallet::open(path, "regtest")
+    }
+
     fn wallet(name: &str) -> (Wallet, PathBuf) {
         let dir = scratch(name);
-        let mut w = open_wallet(&dir.join("wallet.json")).unwrap();
-        w.set_psp_min_purchase(1).unwrap();
+        let w = open_wallet(&dir.join("wallet.json")).unwrap();
         (w, dir)
     }
 
-    /// The rules a PSP gives a payment that is open until `open_until`.
-    fn rules(send: &str, due_units: u64, open_until: u64) -> ReconcileRules {
-        ReconcileRules {
-            send: send.to_string(),
-            kind: KIND_PSP_RECONCILE,
-            due_units,
-            reconciliation_fee_units: 0,
-            read_prepaid_units: 0,
-            write_prepaid_units: 0,
-            open_until,
-            max_attempts: 3,
-            on_failure: delivery::FORFEIT_NOTICE.to_string(),
-        }
-    }
-
-    /// The ids of the payments a call closed.
-    fn lost_ids(losses: &[Loss]) -> Vec<String> {
-        losses.iter().map(|l| l.id.clone()).collect()
-    }
-
-    fn payment(payload: Vec<u8>) -> Received {
-        Received {
-            txid: "aa".into(),
-            confirmations: 6,
-            value_sats: 5_000,
-            payload: Some(payload),
-        }
-    }
-
-    #[test]
-    fn build_then_encrypt_then_the_mint_decrypts_and_decodes() {
-        let (mut w, dir) = wallet("roundtrip");
-        let mint = DidSecretKey::new();
-        let built = w.build_psp_payload(&[4, 1], &mint.public_key()).unwrap();
-
-        // the mint's side: the scanner opens the data output, then decodes it
-        let (kept, dropped) =
-            psp_mint::seal::open_payloads(&mint, vec![payment(built.payload.clone())]);
-        assert_eq!(dropped, 0);
-        let plaintext = kept[0].payload.clone().unwrap();
-        let decoded = payload::decode(&plaintext).unwrap();
-        let pending = &w.pending_purchases()[0];
-        // the payload names the purchase's own reply DID, whose secret the wallet kept
-        assert_eq!(hex::encode(decoded.did), pending.reply_did);
-        let secret = addr::secret_from_hex(&pending.reply_secret).unwrap();
-        assert_eq!(addr::key_to_bytes(&secret.public_key()), decoded.did);
-        assert_eq!(
-            pending.delivery_id,
-            hex::encode(delivery::purchase_id(&plaintext))
-        );
-        assert_eq!(decoded.outputs.len(), 2);
-        assert_eq!(decoded.outputs[0].amount, Amount::from_units(4));
-        assert_eq!(decoded.outputs[1].amount, Amount::from_units(1));
-        for (sent, held) in decoded.outputs.iter().zip(&pending.outputs) {
-            assert_eq!(sent.blind_nonce, held.blind_nonce);
-        }
-        assert_eq!(built.id, hex::encode(Sha256::digest(&built.payload)));
-        assert_eq!(pending.id, built.id);
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn a_purchase_names_the_psp_keyset_the_wallet_last_saw() {
-        let (mut w, dir) = wallet("names-keyset");
-        let mint = DidSecretKey::new();
-        let keyset_of = |w: &mut Wallet| {
-            let built = w.build_psp_payload(&[1], &mint.public_key()).unwrap();
-            let (kept, _) = psp_mint::seal::open_payloads(&mint, vec![payment(built.payload)]);
-            payload::decode(kept[0].payload.as_deref().unwrap())
-                .unwrap()
-                .keyset
-        };
-        assert_eq!(keyset_of(&mut w), None, "none seen yet");
-        let named = "ab".repeat(8);
-        w.update(|d| {
-            d.live_keysets
-                .insert("http://psp".to_string(), (named.clone(), None));
-            Ok(())
+    /// What a PSP mint writes for a payment owed `due_units`: the fees are on
+    /// (2 units prepaid for the two reads, 2 for the one write), so `due_units`
+    /// is four below `value_units`.
+    fn owed(txid: &str, due_units: u64) -> Outcome {
+        Outcome::Owed(Owed {
+            txid: txid.to_string(),
+            paid_sats: 100_000,
+            value_units: due_units + 4,
+            terms: ClaimTerms {
+                send: SEND_PURCHASE_CLAIM.to_string(),
+                kind: KIND_PSP_CLAIM,
+                due_units,
+                read_prepaid_units: 2,
+                write_prepaid_units: 2,
+                window_secs: CLAIM_WINDOW_SECS,
+                max_attempts: 3,
+                on_expiry: EXPIRY_NOTICE.to_string(),
+            },
         })
-        .unwrap();
-        assert_eq!(keyset_of(&mut w), Some(named));
-        fs::remove_dir_all(&dir).unwrap();
     }
 
-    #[test]
-    fn the_purchase_is_saved_before_the_bytes_are_returned() {
-        let (mut w, dir) = wallet("saved");
-        let mint = DidSecretKey::new();
-        let built = w.build_psp_payload(&[8], &mint.public_key()).unwrap();
-        let reopened = open_wallet(w.path()).unwrap();
-        assert_eq!(reopened.pending_purchases().len(), 1);
-        assert_eq!(reopened.pending_purchases()[0].id, built.id);
-        assert_eq!(reopened.pending_purchases()[0].outputs[0].amount, 8);
-        // the reply key's secret is on disk too, before any payment is made
-        assert_eq!(
-            reopened.pending_purchases()[0].reply_secret,
-            w.pending_purchases()[0].reply_secret
-        );
-        assert_eq!(
-            reopened.pending_purchases()[0].delivery_id,
-            w.pending_purchases()[0].delivery_id
-        );
-        assert!(!w.pending_purchases()[0].reply_secret.is_empty());
-        assert!(!w.pending_purchases()[0].delivery_id.is_empty());
-        fs::remove_dir_all(&dir).unwrap();
+    /// The sealed bytes of the PSP mint's record `index` for purchase `id`.
+    fn sealed(w: &Wallet, psp: &DidSecretKey, id: &str, index: u32, outcome: &Outcome) -> Vec<u8> {
+        let key = w.claim_keys().iter().find(|k| k.id == id).unwrap();
+        let claim = ServiceDid::parse(&key.claim_did).unwrap();
+        build_record(psp, &claim, index, outcome, FIRST)
+            .unwrap()
+            .sealed
     }
 
-    #[test]
-    fn only_psp_note_sizes_are_accepted() {
-        let (mut w, dir) = wallet("sizes");
-        let mint = DidSecretKey::new();
-        let key = mint.public_key();
-        for bad in [0u64, 3, 5, 6, 16_777_217, u64::MAX] {
-            let e = expect::invalid(w.build_psp_payload(&[bad], &key));
-            assert!(
-                e.contains(&format!("{bad} is not a PSP note size: use a power of two")),
-                "{bad}: {e}"
-            );
-        }
-        let e = expect::invalid(w.build_psp_payload(&[], &key));
-        assert!(e.contains("at least one output"), "{e}");
-        let e = expect::invalid(w.build_psp_payload(&vec![1; 256], &key));
-        assert!(e.contains("at most 255 outputs"), "{e}");
-        assert!(w.pending_purchases().is_empty());
-        for good in [1u64, 2, 4, 1024, 1_048_576, 16_777_216, 33_554_432] {
-            assert!(w.build_psp_payload(&[good], &key).is_ok(), "{good}");
-        }
-        assert!(w.build_psp_payload(&vec![1; 255], &key).is_ok());
-        fs::remove_dir_all(&dir).unwrap();
+    /// A purchase whose record 0 is owed `due_units`, first read at `FIRST`.
+    fn bought(w: &mut Wallet, psp: &DidSecretKey, due_units: u64) -> String {
+        let id = w.build_psp_payload(&psp.public_key()).unwrap().id;
+        let bytes = sealed(w, psp, &id, 0, &owed("aa", due_units));
+        assert!(matches!(
+            w.apply_delivery(&id, 0, &bytes, FIRST).unwrap(),
+            Delivered::Stored(_)
+        ));
+        id
     }
 
-    #[test]
-    fn the_largest_note_is_the_one_the_psp_says() {
-        let (mut w, dir) = wallet("top");
-        let mint = DidSecretKey::new();
-        let key = mint.public_key();
-        // unknown: only the power of two is checked here, the PSP decides the top
-        assert_eq!(w.psp_max_denomination(), None);
-        assert!(w.build_psp_payload(&[1 << 26], &key).is_ok());
-        // a PSP whose largest note is 1024
-        w.set_psp_max_denomination(Some(1024));
-        assert!(w.build_psp_payload(&[1024], &key).is_ok());
-        let e = w.build_psp_payload(&[2048], &key).unwrap_err();
-        assert!(e.to_string().contains("largest note, 1024"), "{e}");
-        // a PSP that was configured for bigger notes
-        w.set_psp_max_denomination(Some(1 << 27));
-        assert!(w.build_psp_payload(&[1 << 27], &key).is_ok());
-        let e = expect::invalid(w.build_psp_payload(&[1 << 28], &key));
-        assert!(e.contains("largest note, 134217728"), "{e}");
-        fs::remove_dir_all(&dir).unwrap();
+    /// A PSP mint keyset with keys for 1 to 1024, and the rotation window that
+    /// names it as current in epoch `epoch`.
+    struct Keyset {
+        sks: BTreeMap<Amount, SecretKey>,
+        pks: BTreeMap<Amount, PublicKey>,
+        window: Window,
     }
 
-    /// A PSP's keys, and what it does when it settles: sign each output.
-    fn sign_all(w: &Wallet, sks: &BTreeMap<Amount, SecretKey>) -> Vec<(BlindNonce, PublicKey)> {
-        w.pending_purchases()
-            .iter()
-            .flat_map(|p| &p.outputs)
-            .map(|o| {
-                let sk = &sks[&Amount::from_units(o.amount)];
-                (o.blind_nonce, bdhke::sign_message(sk, &o.blind_nonce.0))
-            })
-            .collect()
-    }
-
-    fn psp_keys() -> (BTreeMap<Amount, SecretKey>, BTreeMap<Amount, PublicKey>) {
-        let sks: BTreeMap<Amount, SecretKey> = [1u64, 2, 4, 8]
-            .iter()
-            .map(|&a| {
-                (
-                    Amount::from_units(a),
-                    SecretKey::new(&mut rand::rngs::OsRng),
-                )
-            })
-            .collect();
-        let pks = sks
-            .iter()
-            .map(|(a, sk)| (*a, sk.public_key(SECP256K1)))
-            .collect();
-        (sks, pks)
-    }
-
-    /// The record a PSP writes after signing `pairs` with the keys `pks`.
-    fn record(
-        pairs: &[(BlindNonce, PublicKey)],
-        pks: &BTreeMap<Amount, PublicKey>,
-        skipped_units: u64,
-        credit_cents: u64,
-    ) -> Outcome {
-        let id = sp_wire::keyset::keyset_id(pks);
-        let mut keysets = BTreeMap::new();
-        keysets.insert(id.clone(), pks.iter().map(|(a, k)| (a.units, *k)).collect());
-        Outcome::Signed(Signed {
-            keyset: id.clone(),
-            signatures: pairs
-                .iter()
-                .map(|(blind_nonce, signature)| SignedOutput {
-                    blind_nonce: blind_nonce.0.to_string(),
-                    signature: signature.to_string(),
+    impl Keyset {
+        fn new(epoch: u64) -> Keyset {
+            let sks: BTreeMap<Amount, SecretKey> = (0..=10)
+                .map(|bit| {
+                    (
+                        Amount::from_units(1 << bit),
+                        SecretKey::new(&mut rand::rngs::OsRng),
+                    )
                 })
-                .collect(),
-            keysets: KeysetsResponse {
+                .collect();
+            let pks: BTreeMap<Amount, PublicKey> = sks
+                .iter()
+                .map(|(a, sk)| (*a, sk.public_key(SECP256K1)))
+                .collect();
+            let window = Window {
+                current_epoch: epoch,
+                current_id: sp_wire::keyset::keyset_id(&pks),
+                current_starts: None,
+                previous_epoch: None,
+                previous_id: None,
+                period_hours: 24,
+                now: FIRST,
+            };
+            Keyset { sks, pks, window }
+        }
+
+        fn listing(&self) -> KeysetsResponse {
+            let id = self.window.current_id.clone();
+            let mut keysets = BTreeMap::new();
+            keysets.insert(
+                id.clone(),
+                self.pks.iter().map(|(a, k)| (a.units, *k)).collect(),
+            );
+            KeysetsResponse {
                 current: id,
                 previous: None,
                 keysets,
-            },
-            skipped_units,
-            credit_cents,
-            open_until: 0,
-            // a credit of 10 cents is a claim for 1 PSP unit
-            rules: (credit_cents > 0).then(|| rules(SEND_CREDIT_CLAIM, credit_cents / 10, 0)),
-        })
-    }
-
-    /// A signed record with the PSP's reconciliation window set.
-    fn windowed(outcome: Outcome, open_until: u64) -> Outcome {
-        let Outcome::Signed(mut signed) = outcome else {
-            unreachable!()
-        };
-        signed.open_until = open_until;
-        if let Some(r) = signed.rules.as_mut() {
-            r.open_until = open_until;
-        }
-        Outcome::Signed(signed)
-    }
-
-    fn claimed(delivered: Delivered) -> Claimed {
-        match delivered {
-            Delivered::Claimed(c) => c,
-            other => panic!("{other:?}"),
+            }
         }
     }
 
+    /// What the PSP mint answers to the claim saved for record `index`: each output
+    /// signed by this keyset.
+    fn answer(w: &Wallet, id: &str, index: u32, ks: &Keyset) -> ClaimResponse {
+        let (_, r) = record_of(w.data(), id, index).unwrap();
+        answer_to(r.request.as_ref().unwrap(), r.due_units, ks)
+    }
+
+    /// What the PSP mint answers to the saved claim `saved` of a record owed
+    /// `due_units`.
+    fn answer_to(saved: &SavedClaim, due_units: u64, ks: &Keyset) -> ClaimResponse {
+        ClaimResponse {
+            keyset: saved.keyset.clone(),
+            signatures: saved
+                .outputs
+                .iter()
+                .map(|o| SignedOutput {
+                    blind_nonce: o.blind_nonce.0.to_string(),
+                    signature: bdhke::sign_message(
+                        &ks.sks[&Amount::from_units(o.amount)],
+                        &o.blind_nonce.0,
+                    )
+                    .to_string(),
+                })
+                .collect(),
+            keysets: ks.listing(),
+            issued_units: due_units,
+            read_prepaid_units: 2,
+            write_prepaid_units: 2,
+        }
+    }
+
+    fn record_state(w: &Wallet, id: &str, index: u32) -> OwedClaim {
+        record_of(w.data(), id, index).unwrap().1.clone()
+    }
+
+    /// The payload is the 33-byte claim DID and nothing else. Fails if the payload
+    /// carries amounts, a keyset or notes again, or is not sealed to the PSP mint.
     #[test]
-    fn each_purchase_has_a_key_of_its_own() {
-        let (mut w, dir) = wallet("own-key");
+    fn the_payload_is_the_claim_did_alone() {
+        let (mut w, dir) = wallet("payload");
         let mint = DidSecretKey::new();
-        w.build_psp_payload(&[1], &mint.public_key()).unwrap();
-        w.build_psp_payload(&[1], &mint.public_key()).unwrap();
-        let [a, b] = w.pending_purchases() else {
-            panic!("two purchases");
-        };
-        assert_ne!(a.reply_did, b.reply_did, "the PSP cannot link them");
-        assert_ne!(a.reply_secret, b.reply_secret);
-        assert_ne!(a.delivery_id, b.delivery_id);
-        for p in [a, b] {
-            let secret = addr::secret_from_hex(&p.reply_secret).unwrap();
-            assert_eq!(
-                hex::encode(addr::key_to_bytes(&secret.public_key())),
-                p.reply_did
-            );
-        }
+        let built = w.build_psp_payload(&mint.public_key()).unwrap();
+        let (kept, dropped) = psp_mint::seal::open_payloads(
+            &mint,
+            vec![Received {
+                txid: "aa".into(),
+                confirmations: 6,
+                value_sats: 100_000,
+                payload: Some(built.payload.clone()),
+                block_time: Some(FIRST),
+            }],
+        );
+        assert_eq!(dropped, 0);
+        let plaintext = kept[0].payload.clone().unwrap();
+        assert_eq!(plaintext.len(), 33);
+        let decoded = payload::decode(&plaintext).unwrap();
+        let key = &w.claim_keys()[0];
+        assert_eq!(decoded.claim_did.to_hex(), key.claim_did);
+        assert_eq!(built.id, hex::encode(Sha256::digest(&built.payload)));
+        assert_eq!(key.id, built.id);
+        assert_eq!(key.psp_did, mint.public_key().to_string());
+        assert_eq!(key.next_index, 0);
+        assert!(key.records.is_empty());
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// The claim key is on disk before the payload is returned, and every purchase
+    /// has a key of its own. Fails if the secret is saved after the return, is
+    /// derived from the wallet's main DID, or is shared by two purchases.
     #[test]
-    fn claimed_signatures_become_notes_the_psp_accepts_and_the_purchase_and_its_key_are_cleared() {
-        let (mut w, dir) = wallet("claim");
+    fn the_claim_key_is_saved_before_the_payload_is_returned_and_is_new_each_time() {
+        let (mut w, dir) = wallet("saved");
         let mint = DidSecretKey::new();
-        let built = w.build_psp_payload(&[4, 1], &mint.public_key()).unwrap();
-        let (sks, pks) = psp_keys();
-        let sigs = sign_all(&w, &sks);
-
-        let c = claimed(
-            w.apply_delivery(&built.id, &record(&sigs, &pks, 0, 0))
-                .unwrap(),
+        let first = w.build_psp_payload(&mint.public_key()).unwrap();
+        let reopened = open_wallet(w.path()).unwrap();
+        assert_eq!(reopened.claim_keys().len(), 1);
+        assert_eq!(reopened.claim_keys()[0].id, first.id);
+        assert_eq!(reopened.claim_keys()[0].claim_secret.len(), 64);
+        assert_eq!(
+            reopened.claim_keys()[0].claim_secret,
+            w.claim_keys()[0].claim_secret
         );
-        assert_eq!(c.claim.claimed.len(), 2);
-        assert_eq!(c.claim.claimed_units, 5);
-        assert_eq!(c.claim.still_pending, 0);
-        assert!(!c.key_kept);
-        assert!(w.pending_purchases().is_empty());
-        assert!(w.open_replies().is_empty(), "nothing is outstanding");
-        assert_eq!(w.balance().psp, 5);
+        let second = w.build_psp_payload(&mint.public_key()).unwrap();
+        assert_ne!(second.id, first.id);
+        let keys = w.claim_keys();
+        assert_eq!(keys.len(), 2);
+        assert_ne!(keys[0].claim_did, keys[1].claim_did);
+        assert_ne!(keys[0].claim_secret, keys[1].claim_secret);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A good record is stored with the terms it states, a record read twice
+    /// changes nothing, and a cell is never read out of order. Fails if the clock
+    /// starts anywhere but the first read or `next_index` does not move.
+    #[test]
+    fn a_record_is_stored_once_with_its_own_terms_and_clock() {
+        let (mut w, dir) = wallet("store");
+        let psp = DidSecretKey::new();
+        let id = w.build_psp_payload(&psp.public_key()).unwrap().id;
+        let bytes = sealed(&w, &psp, &id, 0, &owed("bb", 797));
+        let Delivered::Stored(r) = w.apply_delivery(&id, 0, &bytes, FIRST).unwrap() else {
+            panic!("the record was not stored");
+        };
+        assert_eq!(
+            (r.index, r.txid.as_str(), r.due_units, r.window_secs),
+            (0, "bb", 797, 2_592_000)
+        );
+        assert_eq!((r.first_read_at, r.max_attempts), (FIRST, 3));
+        assert_eq!(r.record_id.len(), 64);
+        assert!(r.request.is_none() && !r.done && !r.told_lost);
+        assert_eq!(w.claim_keys()[0].next_index, 1);
+        assert_eq!(
+            w.apply_delivery(&id, 0, &bytes, FIRST + 5).unwrap(),
+            Delivered::AlreadyDone
+        );
+        assert_eq!(record_state(&w, &id, 0).first_read_at, FIRST);
+        let e = expect::invalid(w.apply_delivery(&id, 2, &bytes, FIRST));
+        assert!(e.contains("record 2 is read before record 1"), "{e}");
+        let e = expect::unknown(w.apply_delivery("nope", 0, &bytes, FIRST));
+        assert_eq!(e, "no purchase nope");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A record the PSP mint did not sign, one for another claim key, and one that
+    /// asks for something else are refused with the wallet unchanged. Fails if the
+    /// wallet stores a forged or foreign record.
+    #[test]
+    fn a_forged_or_foreign_record_is_a_mint_error_and_changes_nothing() {
+        let (mut w, dir) = wallet("forged");
+        let psp = DidSecretKey::new();
+        let id = w.build_psp_payload(&psp.public_key()).unwrap().id;
+        let other = w.build_psp_payload(&psp.public_key()).unwrap().id;
+        let forger = DidSecretKey::new();
+        let forged = sealed(&w, &forger, &id, 0, &owed("cc", 50));
+        let e = expect::mint(w.apply_delivery(&id, 0, &forged, FIRST));
+        assert!(e.contains("was not accepted"), "{e}");
+        let foreign = sealed(&w, &psp, &other, 0, &owed("cc", 50));
+        expect::mint(w.apply_delivery(&id, 0, &foreign, FIRST));
+        let mut outcome = owed("cc", 50);
+        let Outcome::Owed(o) = &mut outcome;
+        o.terms.kind = 14;
+        let wrong_kind = sealed(&w, &psp, &id, 0, &outcome);
+        let e = expect::mint(w.apply_delivery(&id, 0, &wrong_kind, FIRST));
+        assert!(e.contains("as kind 14"), "{e}");
+        let Outcome::Owed(o) = &mut outcome;
+        o.terms.kind = KIND_PSP_CLAIM;
+        o.terms.send = "swap".into();
+        let wrong_send = sealed(&w, &psp, &id, 0, &outcome);
+        expect::mint(w.apply_delivery(&id, 0, &wrong_send, FIRST));
+        assert_eq!(w.claim_keys()[0].next_index, 0);
+        assert!(w.claim_keys()[0].records.is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A cell that cannot be opened is skipped for good, and the next one is still
+    /// read. A record with nothing due is stored done and told. Fails if a bad
+    /// cell stops the key or a zero record is offered for a claim.
+    #[test]
+    fn a_bad_cell_is_skipped_and_a_record_with_nothing_due_is_done() {
+        let (mut w, dir) = wallet("skip");
+        let psp = DidSecretKey::new();
+        let id = w.build_psp_payload(&psp.public_key()).unwrap().id;
+        w.skip_record(&id, 1).unwrap();
+        assert_eq!(w.claim_keys()[0].next_index, 0, "not the next cell");
+        w.skip_record(&id, 0).unwrap();
+        assert_eq!(w.claim_keys()[0].next_index, 1);
+        let zero = sealed(&w, &psp, &id, 1, &owed("dd", 0));
+        w.apply_delivery(&id, 1, &zero, FIRST).unwrap();
+        let r = record_state(&w, &id, 1);
+        assert!(r.done && r.told_lost);
+        assert_eq!(w.claim_keys()[0].next_index, 2);
+        assert!(w.open_claims(FIRST).is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The lifetime of a key with two records (W3): each record has its own clock
+    /// from its first read, a loss is told once, and the key goes with its last
+    /// record. Fails if one clock serves both records, a loss is told twice, or
+    /// the key goes before its last window closes.
+    #[test]
+    fn a_key_lives_until_its_last_record_window_closes() {
+        let (mut w, dir) = wallet("lifetime");
+        let psp = DidSecretKey::new();
+        let id = bought(&mut w, &psp, 797);
+        let second = sealed(&w, &psp, &id, 1, &owed("bb", 100));
+        w.apply_delivery(&id, 1, &second, SECOND).unwrap();
+        let empty = w.build_psp_payload(&psp.public_key()).unwrap().id;
+
+        // record 0 closes at 1_800_000_000 + 2_592_000
+        assert!(w.close_expired(1_802_591_999).unwrap().is_empty());
+        assert_eq!(w.open_claims(1_802_591_999).len(), 2);
+        let lost = w.close_expired(1_802_592_000).unwrap();
+        assert_eq!(
+            lost,
+            vec![Loss {
+                id: id.clone(),
+                index: 0,
+                txid: "aa".into(),
+                due_units: 797,
+                kind: LossKind::Expired,
+                window_ends: 1_802_592_000,
+            }]
+        );
+        assert_eq!(
+            lost[0].forfeited(),
+            format!(
+                "purchase {id}, record 0 (payment aa): expired. It was not claimed by 2027-02-14 08:00 UTC, when its window closed. The PSP mint keeps the payment: the funds are lost (797 PSP)"
+            )
+        );
+        assert_eq!(w.claim_keys().len(), 2, "the key is kept for record 1");
+        assert!(
+            w.close_expired(1_802_592_000).unwrap().is_empty(),
+            "told once"
+        );
+
+        // only record 1 can be claimed now
+        let open = w.open_claims(1_803_000_000);
+        assert_eq!(open.len(), 1);
+        assert_eq!((open[0].index, open[0].due_units), (1, 100));
+        assert_eq!(open[0].window_ends, 1_804_592_000);
+
+        assert!(w.close_expired(1_804_591_999).unwrap().is_empty());
+        assert_eq!(w.claim_keys().len(), 2);
+        let lost = w.close_expired(1_804_592_000).unwrap();
+        assert_eq!(lost.len(), 1);
+        assert_eq!((lost[0].index, lost[0].due_units), (1, 100));
+        assert_eq!(
+            lost[0].forfeited(),
+            format!(
+                "purchase {id}, record 1 (payment bb): expired. It was not claimed by 2027-03-09 11:33 UTC, when its window closed. The PSP mint keeps the payment: the funds are lost (100 PSP)"
+            )
+        );
+        // the key with records is gone; the key with none is not closed by
+        // close_expired (only expire_unpaid drops it, after psp.unpaid_key_days)
+        assert_eq!(w.claim_keys().len(), 1);
+        assert_eq!(w.claim_keys()[0].id, empty);
+        assert!(w.close_expired(1_900_000_000).unwrap().is_empty());
+        assert_eq!(w.claim_keys().len(), 1);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// With record 0's window closed and record 1's open (W3), a claim is built
+    /// for record 1 and none for record 0. Fails if the window is counted for the
+    /// key and not for each record, in either direction.
+    #[test]
+    fn a_claim_is_built_only_for_a_record_whose_own_window_is_open() {
+        let (mut w, dir) = wallet("own-window");
+        let psp = DidSecretKey::new();
+        let id = bought(&mut w, &psp, 797);
+        let second = sealed(&w, &psp, &id, 1, &owed("bb", 100));
+        w.apply_delivery(&id, 1, &second, SECOND).unwrap();
+        let ks = Keyset::new(5);
+
+        // 1_800_000_000 + 2_592_000 = 1_802_592_000 < 1_803_000_000
+        let refused = w
+            .build_claim(&id, 0, &ks.window, &ks.pks, 1_803_000_000)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            refused
+                .contains("the window closed at 2027-02-14 08:00 UTC, so nothing is built or sent"),
+            "{refused}"
+        );
+        assert!(record_state(&w, &id, 0).request.is_none());
+
+        // 1_802_000_000 + 2_592_000 = 1_804_592_000 > 1_803_000_000: 64 + 32 + 4 = 100
+        let built = w
+            .build_claim(&id, 1, &ks.window, &ks.pks, 1_803_000_000)
+            .unwrap();
+        let amounts: Vec<u64> = built
+            .request
+            .outputs
+            .iter()
+            .map(|o| o.amount.units)
+            .collect();
+        assert_eq!(amounts, vec![64, 32, 4]);
+        assert_eq!((built.index, built.attempt), (1, 1));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A key with a saved claim nobody answered is not deleted when the window
+    /// closes, is not reported lost, and is offered for one last resend; once the
+    /// claim is given up it is reported and deleted. Fails if the key is deleted
+    /// under an unanswered claim.
+    #[test]
+    fn an_unanswered_saved_claim_keeps_the_key_past_the_window() {
+        let (mut w, dir) = wallet("unanswered");
+        let psp = DidSecretKey::new();
+        let id = bought(&mut w, &psp, 797);
+        let ks = Keyset::new(5);
+        w.build_claim(&id, 0, &ks.window, &ks.pks, FIRST + 10)
+            .unwrap();
+        let after = FIRST + CLAIM_WINDOW_SECS;
+        assert!(w.close_expired(after).unwrap().is_empty());
+        assert_eq!(w.claim_keys().len(), 1);
+        assert_eq!(w.air_requests().len(), 1);
+        assert_eq!(
+            w.expired_claims(after),
+            vec![(id.clone(), 0, psp.public_key().to_string())]
+        );
+        assert!(w.expired_claims(after - 1).is_empty());
+        // a key whose last resend could not be sent is left for a later start
+        w.give_up_claim(&id, 0).unwrap();
+        assert!(w.air_requests().is_empty());
+        let told = w
+            .close_expired_keeping(after, std::slice::from_ref(&id))
+            .unwrap();
+        assert_eq!(told.len(), 1);
+        assert_eq!((told[0].index, told[0].due_units), (0, 797));
+        assert_eq!(w.claim_keys().len(), 1, "kept, as asked");
+        let lost = w.close_expired(after).unwrap();
+        assert!(lost.is_empty(), "already told above");
+        assert!(w.claim_keys().is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The claim for 797 units is the binary split 512+256+16+8+4+1, signed by the
+    /// claim key over the digest, saved with its AIR request before anything is
+    /// sent. Fails if the outputs are not the binary digits of `due_units`, the
+    /// signature is over something else, or the claim is not saved.
+    #[test]
+    fn a_claim_is_the_binary_split_signed_by_the_claim_key_and_saved() {
+        let (mut w, dir) = wallet("build");
+        let psp = DidSecretKey::new();
+        let id = bought(&mut w, &psp, 797);
+        let ks = Keyset::new(5);
+        let built = w
+            .build_claim(&id, 0, &ks.window, &ks.pks, FIRST + 10)
+            .unwrap();
+        // 512 + 256 + 16 + 8 + 4 + 1 = 797
+        let amounts: Vec<u64> = built
+            .request
+            .outputs
+            .iter()
+            .map(|o| o.amount.units)
+            .collect();
+        assert_eq!(amounts, vec![512, 256, 16, 8, 4, 1]);
+        assert_eq!(amounts.iter().sum::<u64>(), 797);
+        assert_eq!(built.attempt, 1);
+        assert_eq!(built.request.keyset, ks.window.current_id);
+        let psp_did = ServiceDid::parse(&psp.public_key().to_string()).unwrap();
+        assert_eq!(built.hash, built.request.hash(&psp_did));
+        SECP256K1
+            .verify_schnorr(
+                &built.request.signature,
+                &built.request.digest(&psp_did),
+                &built.request.claim_did.x_only(),
+            )
+            .unwrap();
+        assert_eq!(
+            built.request.claim_did.to_hex(),
+            w.claim_keys()[0].claim_did
+        );
+        assert_eq!(
+            hex::encode(built.request.record_id),
+            record_state(&w, &id, 0).record_id
+        );
+        assert_eq!(serde_json::to_vec(&built.request).unwrap(), built.body);
+
+        // on disk before it is sent, with the request that carries it
+        let again = open_wallet(w.path()).unwrap();
+        let r = record_state(&again, &id, 0);
+        assert_eq!(r.attempts, 1);
+        let saved = r.request.unwrap();
+        assert_eq!(saved.body, hex::encode(&built.body));
+        assert_eq!((saved.epoch, saved.outputs.len()), (5, 6));
+        assert_eq!(again.air_requests().len(), 1);
+        let a = &again.air_requests()[0];
+        assert_eq!(a.kind, KIND_PSP_CLAIM);
+        assert_eq!(a.r, again.claim_keys()[0].claim_secret);
+        assert_eq!(a.body_hash, crate::air::body_hash(&built.body));
+        let send = again.claim_to_send(&id, 0).unwrap();
+        assert_eq!(send.body, built.body);
+        assert_eq!(send.keyset, ks.window.current_id);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A saved claim on the current keyset is never rebuilt, a claim on a newer
+    /// keyset is built (and replaces the old request) until `max_attempts`, and
+    /// never beyond. Fails if a resend rebuilds, or a fourth claim is built.
+    #[test]
+    fn a_claim_is_rebuilt_only_for_a_new_keyset_and_never_beyond_max_attempts() {
+        let (mut w, dir) = wallet("attempts");
+        let psp = DidSecretKey::new();
+        let id = bought(&mut w, &psp, 797);
+        let first = Keyset::new(5);
+        w.build_claim(&id, 0, &first.window, &first.pks, FIRST + 10)
+            .unwrap();
+        let e = expect::invalid(w.build_claim(&id, 0, &first.window, &first.pks, FIRST + 20));
+        assert!(
+            e.contains("still current. It is sent again as it is"),
+            "{e}"
+        );
+        assert_eq!(record_state(&w, &id, 0).attempts, 1);
+
+        let second = Keyset::new(6);
+        let built = w
+            .build_claim(&id, 0, &second.window, &second.pks, FIRST + 30)
+            .unwrap();
+        assert_eq!(built.attempt, 2);
+        assert_eq!(w.air_requests().len(), 1, "the old request is replaced");
+        let third = Keyset::new(7);
+        assert_eq!(
+            w.build_claim(&id, 0, &third.window, &third.pks, FIRST + 40)
+                .unwrap()
+                .attempt,
+            3
+        );
+        let fourth = Keyset::new(8);
+        let e = expect::invalid(w.build_claim(&id, 0, &fourth.window, &fourth.pks, FIRST + 50));
+        assert!(
+            e.contains("3 claim(s) were built already, and the PSP mint counts 3"),
+            "{e}"
+        );
+        assert_eq!(record_state(&w, &id, 0).attempts, 3);
+        assert_eq!(w.air_requests().len(), 1);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A claim is refused, and nothing saved, for a closed window, a done record,
+    /// keys that do not hash to the keyset, a keyset without a key for an output,
+    /// and an unknown record. Fails if any is built.
+    #[test]
+    fn a_claim_that_fails_a_check_is_not_saved() {
+        let (mut w, dir) = wallet("refused");
+        let psp = DidSecretKey::new();
+        let id = bought(&mut w, &psp, 797);
+        let ks = Keyset::new(5);
+        let e =
+            expect::invalid(w.build_claim(&id, 0, &ks.window, &ks.pks, FIRST + CLAIM_WINDOW_SECS));
+        assert!(
+            e.contains("the window closed at 2027-02-14 08:00 UTC, so nothing is built or sent"),
+            "{e}"
+        );
+        let other = Keyset::new(5);
+        let e = expect::mint(w.build_claim(&id, 0, &ks.window, &other.pks, FIRST + 10));
+        assert!(e.contains("are not those of its current keyset"), "{e}");
+        // a keyset with no key for 512
+        let mut short = Keyset::new(5);
+        short.pks.remove(&Amount::from_units(512));
+        short.window.current_id = sp_wire::keyset::keyset_id(&short.pks);
+        let e = expect::mint(w.build_claim(&id, 0, &short.window, &short.pks, FIRST + 10));
+        assert!(e.contains("has no key for 512 units"), "{e}");
+        expect::unknown(w.build_claim("nope", 0, &ks.window, &ks.pks, FIRST + 10));
+        expect::unknown(w.build_claim(&id, 9, &ks.window, &ks.pks, FIRST + 10));
+        assert!(w.air_requests().is_empty());
+        assert!(record_state(&w, &id, 0).request.is_none());
+        assert_eq!(record_state(&w, &id, 0).attempts, 0);
+
+        w.build_claim(&id, 0, &ks.window, &ks.pks, FIRST + 10)
+            .unwrap();
+        let reply = answer(&w, &id, 0, &ks);
+        w.apply_claim(&id, 0, &reply).unwrap();
+        let next = Keyset::new(6);
+        let e = expect::invalid(w.build_claim(&id, 0, &next.window, &next.pks, FIRST + 20));
+        assert!(e.contains("nothing is left to claim"), "{e}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The answer is applied once: six notes of 512, 256, 16, 8, 4 and 1 units
+    /// (797), stamped with the keyset and the epoch of the claim, the record done,
+    /// the request dropped. Fails if the notes are stamped with another epoch (a
+    /// fresh note would be rolled), or an answer applied twice adds notes.
+    #[test]
+    fn an_answer_stores_notes_stamped_with_the_signing_epoch_and_applies_once() {
+        let (mut w, dir) = wallet("apply");
+        let psp = DidSecretKey::new();
+        let id = bought(&mut w, &psp, 797);
+        let ks = Keyset::new(5);
+        w.build_claim(&id, 0, &ks.window, &ks.pks, FIRST + 10)
+            .unwrap();
+        let reply = answer(&w, &id, 0, &ks);
+        let Applied::Settled(s) = w.apply_claim(&id, 0, &reply).unwrap() else {
+            panic!("not settled");
+        };
+        // 512 + 256 + 16 + 8 + 4 + 1 = 797
+        assert_eq!(s.units, 797);
+        assert_eq!(s.claimed.len(), 6);
+        let mut amounts: Vec<u64> = w.notes().iter().map(|n| n.amount).collect();
+        amounts.sort_unstable();
+        assert_eq!(amounts, vec![1, 4, 8, 16, 256, 512]);
         for n in w.notes() {
             assert_eq!(n.kind, Kind::Psp);
-            let sk = &sks[&Amount::from_units(n.amount)];
-            assert!(bdhke::verify_message(
-                sk,
-                n.note.signature,
-                &n.note.nonce.as_hash_preimage()
-            ));
-            // the keyset that unblinded it is recorded
-            assert_eq!(
-                w.data().keysets.get(&n.id()).map(String::as_str),
-                Some(sp_wire::keyset::keyset_id(&pks).as_str())
-            );
+            assert_eq!(w.data().epochs[&n.id()], 5);
+            assert_eq!(w.data().keysets[&n.id()], ks.window.current_id);
         }
-        let again = open_wallet(w.path()).unwrap();
-        assert_eq!(again.notes().len(), 2);
-        assert!(again.pending_purchases().is_empty());
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn a_short_payment_closes_the_purchase_when_the_psp_reports_what_it_dropped() {
-        let (mut w, dir) = wallet("partial");
-        let mint = DidSecretKey::new();
-        let built = w.build_psp_payload(&[4, 1], &mint.public_key()).unwrap();
-        let (sks, pks) = psp_keys();
-        let all = sign_all(&w, &sks);
-        // the PSP signed only the 4 and kept the value of the 1
-        let c = claimed(
-            w.apply_delivery(&built.id, &record(&all[..1], &pks, 1, 0))
-                .unwrap(),
-        );
-        assert_eq!(c.claim.claimed_units, 4);
-        assert_eq!((c.skipped_units, c.unaccounted_units), (1, 0));
-        assert!(!c.key_kept);
-        assert!(w.pending_purchases().is_empty());
-        assert!(w.open_replies().is_empty());
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn a_credit_keeps_the_key_for_the_follow_up() {
-        let (mut w, dir) = wallet("credit");
-        let mint = DidSecretKey::new();
-        let built = w.build_psp_payload(&[4, 1], &mint.public_key()).unwrap();
-        let secret = w.pending_purchases()[0].reply_secret.clone();
-        let delivery_id = w.pending_purchases()[0].delivery_id.clone();
-        let (sks, pks) = psp_keys();
-        let sigs = sign_all(&w, &sks);
-        let c = claimed(
-            w.apply_delivery(&built.id, &record(&sigs, &pks, 0, 10))
-                .unwrap(),
-        );
-        assert_eq!(c.claim.claimed_units, 5);
-        assert_eq!(c.credit_cents, 10);
-        assert!(c.key_kept);
-        assert!(w.pending_purchases().is_empty(), "the notes are claimed");
-        let kept = open_wallet(w.path()).unwrap().open_replies().to_vec();
-        assert_eq!(kept.len(), 1);
-        assert_eq!(kept[0].id, built.id);
-        assert_eq!(kept[0].delivery_id, delivery_id);
-        assert_eq!(kept[0].reply_secret, secret);
-        assert_eq!(kept[0].credit_cents, 10);
-        // the record named no window, so the wallet's own is used
-        let now = addr::now_secs();
-        assert!(kept[0].open_until >= now + OPEN_KEY_FALLBACK_SECS - 60);
-        assert!(kept[0].open_until <= now + OPEN_KEY_FALLBACK_SECS + 60);
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn a_credit_keeps_the_key_until_the_window_the_record_names() {
-        let (mut w, dir) = wallet("credit-window");
-        let mint = DidSecretKey::new();
-        let built = w.build_psp_payload(&[4, 1], &mint.public_key()).unwrap();
-        let (sks, pks) = psp_keys();
-        let sigs = sign_all(&w, &sks);
-        let outcome = windowed(record(&sigs, &pks, 0, 10), 1_800_000_000);
-        w.apply_delivery(&built.id, &outcome).unwrap();
-        assert_eq!(w.open_replies()[0].open_until, 1_800_000_000);
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn outputs_neither_signed_nor_reported_dropped_keep_the_key() {
-        let (mut w, dir) = wallet("unaccounted");
-        let mint = DidSecretKey::new();
-        let built = w.build_psp_payload(&[4, 1], &mint.public_key()).unwrap();
-        let (sks, pks) = psp_keys();
-        let all = sign_all(&w, &sks);
-        // one output has no signature and the PSP does not say it dropped it
-        let c = claimed(
-            w.apply_delivery(&built.id, &record(&all[..1], &pks, 0, 0))
-                .unwrap(),
-        );
-        assert_eq!(c.unaccounted_units, 1);
-        assert!(c.key_kept);
-        assert_eq!(w.open_replies()[0].unaccounted_units, 1);
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn applying_the_same_record_twice_changes_nothing() {
-        let (mut w, dir) = wallet("twice");
-        let mint = DidSecretKey::new();
-        let built = w.build_psp_payload(&[4, 1], &mint.public_key()).unwrap();
-        let (sks, pks) = psp_keys();
-        let sigs = sign_all(&w, &sks);
-        let outcome = record(&sigs, &pks, 0, 10);
-        w.apply_delivery(&built.id, &outcome).unwrap();
-        let (version, notes, kept) = (w.version(), w.notes().len(), w.open_replies().len());
-        assert_eq!(
-            w.apply_delivery(&built.id, &outcome).unwrap(),
-            Delivered::AlreadyDone
-        );
-        assert_eq!(
-            w.apply_delivery("not a purchase", &outcome).unwrap(),
-            Delivered::AlreadyDone
-        );
-        assert_eq!(w.version(), version, "nothing was written");
-        assert_eq!((w.notes().len(), w.open_replies().len()), (notes, kept));
-        assert_eq!(w.balance().psp, 5);
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    fn rejected(open_until: u64) -> Outcome {
-        Outcome::Refused(Refused {
-            reason: "a blind nonce in the request was already signed".to_string(),
-            paid_sats: 5_000,
-            paid_cents: 50,
-            open_until,
-            rules: Some(rules(SEND_CORRECTED_REQUEST, 5, open_until)),
-        })
-    }
-
-    fn held(open_until: u64) -> Outcome {
-        Outcome::Held(Held {
-            reason: "the payment is short".to_string(),
-            paid_sats: 1_000,
-            paid_cents: 10,
-            requested_units: 5,
-            over_under_bps: -8_000,
-            open_until,
-            rules: Some(rules(SEND_CORRECTED_REQUEST, 5, open_until)),
-        })
-    }
-
-    fn open_of(delivered: Delivered) -> OpenPurchase {
-        match delivered {
-            Delivered::Open(o) => o,
-            other => panic!("{other:?}"),
-        }
-    }
-
-    #[test]
-    fn a_rejection_keeps_the_purchase_and_its_key_open_with_what_was_paid() {
-        let (mut w, dir) = wallet("rejected");
-        let mint = DidSecretKey::new();
-        let built = w.build_psp_payload(&[4, 1], &mint.public_key()).unwrap();
-        let secret = w.pending_purchases()[0].reply_secret.clone();
-        let outcome = rejected(1_800_000_000);
-        let open = open_of(w.apply_delivery(&built.id, &outcome).unwrap());
-        assert_eq!(open.kind, OpenKind::Rejected);
-        assert_eq!(
-            open.reason,
-            "a blind nonce in the request was already signed"
-        );
-        assert_eq!((open.paid_sats, open.paid_cents), (5_000, 50));
-        assert_eq!(open.open_until, 1_800_000_000);
-        // kept, with the same key, marked open; no notes
-        let [p] = w.pending_purchases() else {
-            panic!("the purchase is kept");
-        };
-        assert_eq!(p.open.as_ref(), Some(&open));
-        assert_eq!(p.reply_secret, secret);
-        assert_eq!(p.outputs.len(), 2);
-        assert!(w.notes().is_empty() && w.open_replies().is_empty());
-        // saved
-        assert_eq!(
-            open_wallet(w.path()).unwrap().pending_purchases()[0].open,
-            p.open
-        );
-        // the same record again changes nothing, and writes nothing
-        let version = w.version();
-        assert_eq!(
-            w.apply_delivery(&built.id, &outcome).unwrap(),
-            Delivered::AlreadyDone
-        );
-        assert_eq!(w.version(), version);
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn a_held_payment_keeps_the_purchase_open_and_says_how_short_it_was() {
-        let (mut w, dir) = wallet("held");
-        let mint = DidSecretKey::new();
-        let built = w.build_psp_payload(&[4, 1], &mint.public_key()).unwrap();
-        let open = open_of(w.apply_delivery(&built.id, &held(1_800_000_000)).unwrap());
-        assert_eq!(open.kind, OpenKind::Held);
-        assert_eq!((open.paid_sats, open.paid_cents), (1_000, 10));
-        assert_eq!((open.requested_units, open.over_under_bps), (5, -8_000));
-        assert_eq!(w.pending_purchases()[0].open.as_ref(), Some(&open));
-        assert!(w.notes().is_empty());
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn signatures_can_still_be_claimed_for_a_purchase_that_was_open() {
-        let (mut w, dir) = wallet("open-then-signed");
-        let mint = DidSecretKey::new();
-        let built = w.build_psp_payload(&[4, 1], &mint.public_key()).unwrap();
-        w.apply_delivery(&built.id, &held(1_800_000_000)).unwrap();
-        let (sks, pks) = psp_keys();
-        let sigs = sign_all(&w, &sks);
-        let c = claimed(
-            w.apply_delivery(&built.id, &record(&sigs, &pks, 0, 0))
-                .unwrap(),
-        );
-        assert_eq!(c.claim.claimed_units, 5);
-        assert!(w.pending_purchases().is_empty());
-        assert_eq!(w.balance().psp, 5);
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn closing_deletes_open_purchases_and_their_keys_at_the_end_of_the_window_only() {
-        let (mut w, dir) = wallet("close");
-        let mint = DidSecretKey::new();
-        let a = w.build_psp_payload(&[1], &mint.public_key()).unwrap();
-        let b = w.build_psp_payload(&[2], &mint.public_key()).unwrap();
-        let c = w.build_psp_payload(&[4], &mint.public_key()).unwrap();
-        // a is held until 1,000, b rejected until 2,000, c has no record yet
-        w.apply_delivery(&a.id, &held(1_000)).unwrap();
-        w.apply_delivery(&b.id, &rejected(2_000)).unwrap();
-
-        let version = w.version();
-        assert!(w.close_expired(999).unwrap().is_empty());
-        assert_eq!(w.version(), version, "nothing due, nothing written");
-
-        // the end of the window itself closes it (the PSP forfeits at the same time)
-        assert_eq!(
-            lost_ids(&w.close_expired(1_000).unwrap()),
-            vec![a.id.clone()]
-        );
-        let ids: Vec<&str> = w
-            .pending_purchases()
-            .iter()
-            .map(|p| p.id.as_str())
-            .collect();
-        assert_eq!(ids, vec![b.id.as_str(), c.id.as_str()]);
-
-        // a purchase with no record yet is never closed by the clock
-        assert_eq!(
-            lost_ids(&w.close_expired(u64::MAX - 1).unwrap()),
-            vec![b.id.clone()]
-        );
-        let ids: Vec<&str> = w
-            .pending_purchases()
-            .iter()
-            .map(|p| p.id.as_str())
-            .collect();
-        assert_eq!(ids, vec![c.id.as_str()]);
-        assert!(!w.pending_purchases()[0].reply_secret.is_empty());
-        assert_eq!(open_wallet(w.path()).unwrap().pending_purchases().len(), 1);
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn closing_deletes_kept_reply_keys_when_their_window_has_passed() {
-        let (mut w, dir) = wallet("close-keys");
-        let reply = |id: &str, open_until: u64| OpenReply {
-            id: id.into(),
-            delivery_id: "dd".repeat(32),
-            mint_did_pubkey: "03".repeat(33),
-            reply_secret: "ee".repeat(32),
-            credit_cents: 10,
-            unaccounted_units: 0,
-            open_until,
-            rules: Some(rules(SEND_CREDIT_CLAIM, 1, open_until)),
-            reconcile: ReconcileState::default(),
-        };
-        w.update(|d| {
-            d.open_replies.push(reply("early", 1_000));
-            d.open_replies.push(reply("late", 5_000));
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!(
-            lost_ids(&w.close_expired(2_000).unwrap()),
-            vec!["early".to_string()]
-        );
-        let kept: Vec<(&str, u64)> = w
-            .open_replies()
-            .iter()
-            .map(|r| (r.id.as_str(), r.open_until))
-            .collect();
-        assert_eq!(kept, vec![("late", 5_000)]);
-        assert!(w.close_expired(4_999).unwrap().is_empty());
-        assert_eq!(
-            lost_ids(&w.close_expired(5_000).unwrap()),
-            vec!["late".to_string()]
-        );
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn the_credit_the_psp_owes_is_summed_over_open_credits_in_psp_units_and_usd_cents() {
-        let (mut w, dir) = wallet("owed-credit");
-        let nothing = w.pending_psp_credit(0);
-        assert_eq!((nothing.cents, nothing.units, nothing.purchases), (0, 0, 0));
-        assert_eq!(
-            (nothing.psp().as_str(), nothing.usd().as_str()),
-            ("0", "0.00")
-        );
-        assert_eq!(nothing.balance_line(), None);
-
-        // a purchase that was overpaid by 1.00 USD, through the real record path,
-        // with the PSP's window open until 5000: the claim is for 10 units
-        let mint = DidSecretKey::new();
-        let built = w.build_psp_payload(&[4, 1], &mint.public_key()).unwrap();
-        let (sks, pks) = psp_keys();
-        let sigs = sign_all(&w, &sks);
-        w.apply_delivery(&built.id, &windowed(record(&sigs, &pks, 0, 100), 5_000))
-            .unwrap();
-        let one = w.pending_psp_credit(4_999);
-        assert_eq!((one.cents, one.units, one.purchases), (100, 10, 1));
-        assert_eq!((one.psp().as_str(), one.usd().as_str()), ("10", "1.00"));
-        assert_eq!(
-            one.balance_line().as_deref(),
-            Some(
-                "10 PSP (1.00 USD) (pending): credit the PSP owes for 1 purchase(s), not counted above until it is claimed"
-            )
-        );
-
-        // a second credit of 12 cents whose claim is for 1 unit (the PSP rounds,
-        // the wallet does not), and a key kept for outputs only (no credit)
-        let reply = |id: &str, credit_cents: u64, due_units: u64, open_until: u64| OpenReply {
-            id: id.into(),
-            delivery_id: "dd".repeat(32),
-            mint_did_pubkey: "03".repeat(33),
-            reply_secret: "ee".repeat(32),
-            credit_cents,
-            unaccounted_units: 1,
-            open_until,
-            rules: (credit_cents > 0).then(|| rules(SEND_CREDIT_CLAIM, due_units, open_until)),
-            reconcile: ReconcileState::default(),
-        };
-        w.update(|d| {
-            d.open_replies.push(reply("small", 12, 1, 9_000));
-            d.open_replies.push(reply("outputs-only", 0, 0, 9_000));
-            Ok(())
-        })
-        .unwrap();
-        let both = w.pending_psp_credit(4_999);
-        assert_eq!((both.cents, both.units, both.purchases), (112, 11, 2));
-        assert_eq!((both.psp().as_str(), both.usd().as_str()), ("11", "1.12"));
-
-        // the first window closes at 5000; only the second is still owed
-        let later = w.pending_psp_credit(5_000);
-        assert_eq!((later.cents, later.units, later.purchases), (12, 1, 1));
-        assert_eq!((later.psp().as_str(), later.usd().as_str()), ("1", "0.12"));
-        // after the second window, nothing is owed
-        assert_eq!(w.pending_psp_credit(9_000).purchases, 0);
-
-        // a credit of 8 cents is 0 units at the PSP's default rounding: the line
-        // says so as it is, and the wallet rounds nothing
-        let eight = PspCredit {
-            cents: 8,
-            units: 0,
-            purchases: 1,
-        };
-        assert_eq!(
-            eight.balance_line().as_deref(),
-            Some(
-                "0 PSP (0.08 USD) (pending): credit the PSP owes for 1 purchase(s), not counted above until it is claimed"
-            )
-        );
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn a_bad_record_changes_nothing() {
-        let (mut w, dir) = wallet("bad-record");
-        let mint = DidSecretKey::new();
-        let built = w.build_psp_payload(&[4, 1], &mint.public_key()).unwrap();
-        let (sks, pks) = psp_keys();
-        let all = sign_all(&w, &sks);
-        let version = w.version();
-        let unchanged = |w: &Wallet| {
-            assert_eq!(w.version(), version);
-            assert_eq!(w.pending_purchases()[0].outputs.len(), 2);
-            assert!(w.notes().is_empty() && w.open_replies().is_empty());
-        };
-
-        // a pair that matches no pending output, before a valid one
-        let stranger = (
-            BlindNonce(SecretKey::new(&mut rand::rngs::OsRng).public_key(SECP256K1)),
-            all[1].1,
-        );
-        let with_stranger = record(&[all[0], stranger], &pks, 0, 0);
-        assert!(matches!(
-            w.apply_delivery(&built.id, &with_stranger),
-            Err(WalletError::Unknown(_))
-        ));
-        unchanged(&w);
-
-        // the same pair twice
-        let twice = record(&[all[0], all[0]], &pks, 0, 0);
-        assert!(w.apply_delivery(&built.id, &twice).is_err());
-        unchanged(&w);
-
-        // a keyset with no key for an amount
-        let mut no_keys = pks.clone();
-        no_keys.remove(&Amount::from_units(1));
-        assert!(matches!(
-            w.apply_delivery(&built.id, &record(&all, &no_keys, 0, 0)),
-            Err(WalletError::Mint(_))
-        ));
-        unchanged(&w);
-
-        // keys that are not those the keyset id names (the id is taken from the
-        // key of the smallest amount)
-        let Outcome::Signed(mut forged) = record(&all, &pks, 0, 0) else {
-            unreachable!()
-        };
-        let other = SecretKey::new(&mut rand::rngs::OsRng).public_key(SECP256K1);
-        forged
-            .keysets
-            .keysets
-            .get_mut(&forged.keyset)
-            .unwrap()
-            .insert(1, other);
-        assert!(matches!(
-            w.apply_delivery(&built.id, &Outcome::Signed(forged)),
-            Err(WalletError::Mint(_))
-        ));
-        unchanged(&w);
-
-        // a record that does not carry the keys of the keyset it names
-        let Outcome::Signed(mut missing) = record(&all, &pks, 0, 0) else {
-            unreachable!()
-        };
-        missing.keyset = "0000000000000000".to_string();
-        assert!(matches!(
-            w.apply_delivery(&built.id, &Outcome::Signed(missing)),
-            Err(WalletError::Mint(_))
-        ));
-        unchanged(&w);
-
-        // a signature that is not a curve point
-        let Outcome::Signed(mut junk) = record(&all, &pks, 0, 0) else {
-            unreachable!()
-        };
-        junk.signatures[0].signature = "zz".to_string();
-        assert!(w.apply_delivery(&built.id, &Outcome::Signed(junk)).is_err());
-        unchanged(&w);
-
-        // and the good record still works afterwards
-        let c = claimed(
-            w.apply_delivery(&built.id, &record(&all, &pks, 0, 0))
-                .unwrap(),
-        );
-        assert_eq!(c.claim.claimed_units, 5);
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn a_purchase_can_be_discarded_before_it_is_paid() {
-        let (mut w, dir) = wallet("discard");
-        let mint = DidSecretKey::new();
-        let built = w.build_psp_payload(&[1], &mint.public_key()).unwrap();
-        let other = w.build_psp_payload(&[2], &mint.public_key()).unwrap();
-        let version = w.version();
-        let e = expect::unknown(w.discard_purchase("nope"));
-        assert!(e.contains("no pending purchase nope"), "{e}");
-        assert_eq!(w.version(), version, "a refused discard writes nothing");
-        assert_eq!(w.pending_purchases().len(), 2);
-        w.discard_purchase(&built.id).unwrap();
-        let ids = |w: &Wallet| -> Vec<String> {
-            w.pending_purchases().iter().map(|p| p.id.clone()).collect()
-        };
-        assert_eq!(ids(&w), vec![other.id.clone()]);
-        // gone from the file, not only from memory
-        let reopened = open_wallet(w.path()).unwrap();
-        assert_eq!(ids(&reopened), vec![other.id.clone()]);
-        // and a second discard of the same purchase is refused
-        let e = expect::unknown(w.discard_purchase(&built.id));
-        assert!(e.contains(&built.id), "{e}");
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    // ---- the minimum purchase -------------------------------------------------
-
-    #[test]
-    fn a_purchase_below_the_minimum_is_refused_naming_the_setting_and_nothing_is_saved() {
-        let dir = scratch("minimum");
-        let mut w = open_wallet(&dir.join("wallet.json")).unwrap();
-        let key = DidSecretKey::new().public_key();
-        assert_eq!(DEFAULT_MIN_PURCHASE, 50);
-        assert_eq!(w.psp_min_purchase(), 50, "the default");
-        // 49 in total, however it is split
-        for outputs in [vec![32, 16, 1], vec![1; 49], vec![16, 16, 16, 1]] {
-            let e = expect::invalid(w.build_psp_payload(&outputs, &key));
-            assert!(e.contains("below the minimum of 50 PSP"), "{e}");
-            assert!(e.contains("psp.min_purchase"), "{e}");
-            assert!(e.contains("ECASH_PSP_MIN_PURCHASE"), "{e}");
-            assert!(e.contains("100 PSP is a realistic purchase"), "{e}");
-        }
-        assert!(w.pending_purchases().is_empty(), "nothing was saved");
-        assert!(!w.path().exists(), "nothing was written");
-        // 50 is accepted
-        assert!(w.build_psp_payload(&[32, 16, 2], &key).is_ok());
-        assert_eq!(w.pending_purchases().len(), 1);
-        // a lower setting is honoured, and the line moves with it
-        w.set_psp_min_purchase(10).unwrap();
-        assert!(w.build_psp_payload(&[8, 2], &key).is_ok());
-        let e = expect::invalid(w.build_psp_payload(&[8, 1], &key));
-        assert!(e.contains("below the minimum of 10 PSP"), "{e}");
-        // 0 is not a minimum
-        let e = expect::invalid(w.set_psp_min_purchase(0));
-        assert!(e.contains("psp.min_purchase"), "{e}");
-        assert_eq!(
-            w.psp_min_purchase(),
-            10,
-            "the refused value changed nothing"
-        );
-        // the check is the same one the command line runs before any network use
-        assert!(check_outputs(&[32, 16, 1], None, 50).is_err());
-        assert!(check_outputs(&[32, 16, 2], None, 50).is_ok());
-        // a bad size is refused for itself before the total is looked at
-        let e = expect::invalid(check_outputs(&[3], None, 50));
-        assert!(e.contains("not a PSP note size"), "{e}");
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn the_one_time_use_warning_is_the_text_the_brief_names() {
-        assert_eq!(
-            ONE_TIME_USE,
-            "ONE-TIME USE: pay this payload exactly once. A second payment carrying the same payload buys nothing and its funds are lost."
-        );
-    }
-
-    // ---- reconciliation ---------------------------------------------------
-
-    fn state(w: &Wallet) -> String {
-        serde_json::to_string(&w.snapshot()).unwrap()
-    }
-
-    fn keysets_of(pks: &BTreeMap<Amount, PublicKey>) -> KeysetsResponse {
-        let id = sp_wire::keyset::keyset_id(pks);
-        let mut keysets = BTreeMap::new();
-        keysets.insert(id.clone(), pks.iter().map(|(a, k)| (a.units, *k)).collect());
-        KeysetsResponse {
-            current: id,
-            previous: None,
-            keysets,
-        }
-    }
-
-    /// A purchase of [4, 1] that the PSP holds, under `rules`.
-    fn open_held(w: &mut Wallet, mint: &DidSecretKey, rules: ReconcileRules) -> String {
-        let built = w.build_psp_payload(&[4, 1], &mint.public_key()).unwrap();
-        let outcome = Outcome::Held(Held {
-            reason: "the payment is short".to_string(),
-            paid_sats: 1_000,
-            paid_cents: 10,
-            requested_units: 5,
-            over_under_bps: -8_000,
-            open_until: rules.open_until,
-            rules: Some(rules),
-        });
-        w.apply_delivery(&built.id, &outcome).unwrap();
-        built.id
-    }
-
-    fn signer(w: &Wallet, id: &str) -> Keypair {
-        let p = w.pending_purchases().iter().find(|p| p.id == id).unwrap();
-        let key = addr::secret_from_hex(&p.reply_secret).unwrap();
-        let secret = SecretKey::from_slice(&key.to_array()).unwrap();
-        Keypair::from_secret_key(SECP256K1, &secret)
-    }
-
-    fn resign(request: &mut ReconcileRequest, keypair: &Keypair) {
-        request.signature = SECP256K1.sign_schnorr(&request.digest(), keypair);
-    }
-
-    fn saved_of(w: &Wallet, id: &str) -> ReconcileState {
-        let p = w.pending_purchases().iter().find(|p| p.id == id).unwrap();
-        p.open.as_ref().unwrap().reconcile.clone()
-    }
-
-    /// What the PSP answers once it accepts the saved request of `id`.
-    fn answer(
-        w: &Wallet,
-        id: &str,
-        sks: &BTreeMap<Amount, SecretKey>,
-        pks: &BTreeMap<Amount, PublicKey>,
-    ) -> ReconcileResponse {
-        let saved = saved_of(w, id).request.unwrap();
-        let keysets = keysets_of(pks);
-        ReconcileResponse {
-            keyset: keysets.current.clone(),
-            signatures: saved
-                .outputs
-                .iter()
-                .map(|o| SignedOutput {
-                    blind_nonce: o.blind_nonce.0.to_string(),
-                    signature: bdhke::sign_message(
-                        &sks[&Amount::from_units(o.amount)],
-                        &o.blind_nonce.0,
-                    )
-                    .to_string(),
-                })
-                .collect(),
-            keysets,
-            issued_units: saved.outputs.iter().map(|o| o.amount).sum(),
-            fee_units: 0,
-            read_prepaid_units: 0,
-            write_prepaid_units: 0,
-            kept_cents: 0,
-            given_cents: 0,
-        }
-    }
-
-    #[test]
-    fn a_record_that_opens_a_window_but_carries_no_rules_is_a_mint_error_and_stores_nothing() {
-        let (mut w, dir) = wallet("no-rules");
-        let mint = DidSecretKey::new();
-        let built = w.build_psp_payload(&[4, 1], &mint.public_key()).unwrap();
-        let before = state(&w);
-
-        let Outcome::Held(mut held) = held(5_000) else {
-            unreachable!()
-        };
-        held.rules = None;
-        let Outcome::Refused(mut refused) = rejected(5_000) else {
-            unreachable!()
-        };
-        refused.rules = None;
-        for outcome in [Outcome::Held(held), Outcome::Refused(refused)] {
-            let e = expect::mint(w.apply_delivery(&built.id, &outcome));
-            assert!(e.contains("carries no rules"), "{e}");
-            assert_eq!(state(&w), before, "nothing was stored");
-        }
-
-        // a credit with no rules: the notes are not claimed either
-        let (sks, pks) = psp_keys();
-        let sigs = sign_all(&w, &sks);
-        let Outcome::Signed(mut signed) = record(&sigs, &pks, 0, 10) else {
-            unreachable!()
-        };
-        signed.rules = None;
-        let e = expect::mint(w.apply_delivery(&built.id, &Outcome::Signed(signed)));
-        assert!(e.contains("carries no rules"), "{e}");
-        assert_eq!(state(&w), before, "no notes, no kept key");
-        assert!(w.notes().is_empty() && w.open_replies().is_empty());
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn a_request_is_signed_checked_and_saved_with_its_air_request_in_one_write() {
-        let (mut w, dir) = wallet("build");
-        let mint = DidSecretKey::new();
-        let id = open_held(&mut w, &mint, rules(SEND_CORRECTED_REQUEST, 20, 1_000));
-        let (_, pks) = psp_keys();
-        let keysets = keysets_of(&pks);
-        let version = w.version();
-
-        let built = w.build_reconcile(&id, &keysets, 100).unwrap();
-        assert_eq!(w.version(), version + 1, "one write");
-        assert_eq!(built.attempt, 1);
-        // 20 units in notes of at most 8 (the PSP's largest): 8 + 8 + 4
-        let amounts: Vec<u64> = built
-            .request
-            .outputs
-            .iter()
-            .map(|o| o.amount.units)
-            .collect();
-        assert_eq!(amounts, vec![8, 8, 4]);
-        assert_eq!(built.request.keyset, keysets.current);
-        let p = &w.pending_purchases()[0];
-        assert_eq!(hex::encode(built.request.reply_did.as_bytes()), p.reply_did);
-        assert_eq!(hex::encode(built.request.purchase), p.delivery_id);
-        // it passes the check, and the bytes are the JSON of the request
-        let did = built.request.reply_did;
-        check_reconcile(
-            &built.request,
-            &p.open.as_ref().unwrap().rules,
-            &keysets,
-            &did,
-            &built.request.purchase,
-            100,
-        )
-        .unwrap();
-        assert_eq!(
-            serde_json::from_slice::<ReconcileRequest>(&built.body).unwrap(),
-            built.request
-        );
-        assert_eq!(built.hash, built.request.hash());
-
-        // saved with the purchase: bytes, hash, keyset and the blinding factors
-        let state = saved_of(&w, &id);
-        let saved = state.request.unwrap();
-        assert_eq!(saved.body, hex::encode(&built.body));
-        assert_eq!(saved.hash, built.hash);
-        assert_eq!(saved.keyset, keysets.current);
-        let nonces: Vec<_> = saved.outputs.iter().map(|o| o.blind_nonce).collect();
-        let sent: Vec<_> = built
-            .request
-            .outputs
-            .iter()
-            .map(|o| o.blind_nonce)
-            .collect();
-        assert_eq!(nonces, sent);
-        assert_eq!(
-            (state.attempts, state.unanswered, state.told_lost),
-            (1, false, false)
-        );
-        // and with the AIR request that carries it: R is the reply key
-        let [air] = w.air_requests() else {
-            panic!("one AIR request");
-        };
-        assert_eq!(air.kind, KIND_PSP_RECONCILE);
-        assert_eq!(air.r, p.reply_secret);
-        assert_eq!(air.body_hash, crate::air::body_hash(&built.body));
-        assert_eq!(air.mint, did_hex(&mint));
-        assert!(air.slots.is_empty(), "nothing was written to AIR yet");
-        // on disk
-        let again = open_wallet(w.path()).unwrap();
-        assert_eq!(again.air_requests(), w.air_requests());
-        assert_eq!(saved_of(&again, &id).request.unwrap().hash, built.hash);
-
-        // the saved request is sent again, never rebuilt, while its keyset is live
-        let before = self::state(&w);
-        let e = expect::invalid(w.build_reconcile(&id, &keysets, 100));
-        assert!(e.contains("still live"), "{e}");
-        assert_eq!(self::state(&w), before);
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    fn did_hex(mint: &DidSecretKey) -> String {
-        hex::encode(addr::key_to_bytes(&mint.public_key()))
-    }
-
-    #[test]
-    fn nothing_is_built_that_the_rules_do_not_allow() {
-        let (mut w, dir) = wallet("refused-builds");
-        let mint = DidSecretKey::new();
-        let (_, pks) = psp_keys();
-        let keysets = keysets_of(&pks);
-
-        let unchanged =
-            |w: &mut Wallet, id: &str, keysets: &KeysetsResponse, now: u64, want: &str| {
-                let before = state(w);
-                let e = w.build_reconcile(id, keysets, now).unwrap_err().to_string();
-                assert!(e.contains(want), "{e}");
-                assert_eq!(state(w), before, "nothing was saved");
-                assert!(w.air_requests().is_empty(), "nothing will be sent");
-            };
-
-        let nothing_due = open_held(&mut w, &mint, rules(SEND_CORRECTED_REQUEST, 0, 1_000));
-        unchanged(&mut w, &nothing_due, &keysets, 100, "nothing is due");
-        let ok = open_held(&mut w, &mint, rules(SEND_CORRECTED_REQUEST, 5, 1_000));
-        unchanged(&mut w, &ok, &keysets, 1_000, "window closed");
-        unchanged(&mut w, &ok, &keysets, 5_000, "window closed");
-        unchanged(&mut w, "no such payment", &keysets, 100, "no open payment");
-        // the PSP's rules name something this wallet does not send for a held payment
-        let other = open_held(&mut w, &mint, rules(SEND_CREDIT_CLAIM, 5, 1_000));
-        unchanged(&mut w, &other, &keysets, 100, "this wallet sends");
-        // a request the check refuses: the rules name another kind
-        let mut kind = rules(SEND_CORRECTED_REQUEST, 5, 1_000);
-        kind.kind = 14;
-        let wrong_kind = open_held(&mut w, &mint, kind);
-        unchanged(
-            &mut w,
-            &wrong_kind,
-            &keysets,
-            100,
-            "request kind 14, not 15",
-        );
-        // more notes than one request may carry: 8 * 1001 units in notes of 8
-        let many = open_held(
-            &mut w,
-            &mint,
-            rules(SEND_CORRECTED_REQUEST, 8 * 1_001, 1_000),
-        );
-        unchanged(&mut w, &many, &keysets, 100, "carries at most 1000");
-        // keys that are not those the keyset's id names
-        let mut forged = keysets.clone();
-        forged.keysets.get_mut(&forged.current).unwrap().insert(
-            1,
-            SecretKey::new(&mut rand::rngs::OsRng).public_key(SECP256K1),
-        );
-        unchanged(&mut w, &ok, &forged, 100, "not those of keyset");
-        // rules that allow no request at all
-        let mut none = rules(SEND_CORRECTED_REQUEST, 5, 1_000);
-        none.max_attempts = 0;
-        let no_attempts = open_held(&mut w, &mint, none);
-        unchanged(&mut w, &no_attempts, &keysets, 100, "No other is built");
-        // the good one is still buildable, so none of that changed anything
-        w.build_reconcile(&ok, &keysets, 100).unwrap();
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn the_check_refuses_each_rule_a_request_breaks_and_names_a_wallet_bug() {
-        let (mut w, dir) = wallet("check");
-        let mint = DidSecretKey::new();
-        let id = open_held(&mut w, &mint, rules(SEND_CORRECTED_REQUEST, 5, 1_000));
-        let (_, pks) = psp_keys();
-        let keysets = keysets_of(&pks);
-        let built = w.build_reconcile(&id, &keysets, 100).unwrap();
-        let (good, did, purchase) = (
-            built.request.clone(),
-            built.request.reply_did,
-            built.request.purchase,
-        );
-        let rules_ = rules(SEND_CORRECTED_REQUEST, 5, 1_000);
-        let keypair = signer(&w, &id);
-        let run = |req: &ReconcileRequest, r: &ReconcileRules, k: &KeysetsResponse, now: u64| {
-            check_reconcile(req, r, k, &did, &purchase, now)
-        };
-        run(&good, &rules_, &keysets, 100).unwrap();
-
-        let refused = |result: Result<(), WalletError>, why: &str| {
-            let e = expect::invalid(result);
-            assert!(e.contains("bug in the wallet"), "{e}");
-            assert!(e.contains("nothing was saved and nothing was sent"), "{e}");
-            assert!(e.contains(why), "{why}: {e}");
-        };
-
-        // the rules: kind 15, and before the window's end
-        let mut r = rules_.clone();
-        r.kind = 14;
-        refused(run(&good, &r, &keysets, 100), "not 15");
-        refused(run(&good, &rules_, &keysets, 1_000), "the window closed at");
-        refused(run(&good, &rules_, &keysets, 2_000), "the window closed at");
-        // the total
-        let mut r = rules_.clone();
-        r.due_units = 6;
-        refused(
-            run(&good, &r, &keysets, 100),
-            "add up to 5, the rules say 6",
-        );
-
-        // who it is for
-        let mut req = good.clone();
-        req.reply_did = addr::key_to_did(&DidSecretKey::new().public_key());
-        resign(&mut req, &keypair);
-        refused(run(&req, &rules_, &keysets, 100), "another reply DID");
-        let mut req = good.clone();
-        req.purchase = [7; 32];
-        resign(&mut req, &keypair);
-        refused(run(&req, &rules_, &keysets, 100), "another purchase id");
-        // the signature
-        let mut req = good.clone();
-        let other = Keypair::from_secret_key(SECP256K1, &SecretKey::new(&mut rand::rngs::OsRng));
-        resign(&mut req, &other);
-        refused(run(&req, &rules_, &keysets, 100), "does not verify");
-        let mut req = good.clone();
-        req.outputs.pop();
-        refused(run(&req, &rules_, &keysets, 100), "does not verify");
-
-        // the keyset
-        let (_, other_pks) = psp_keys();
-        let rotated = keysets_of(&other_pks);
-        refused(
-            run(&good, &rules_, &rotated, 100),
-            "neither the PSP's current keyset",
-        );
-        // a keyset that is the previous one is live
-        let mut with_previous = rotated.clone();
-        with_previous.previous = Some(keysets.current.clone());
-        with_previous.keysets.insert(
-            keysets.current.clone(),
-            keysets.keysets[&keysets.current].clone(),
-        );
-        run(&good, &rules_, &with_previous, 100).unwrap();
-
-        // the outputs
-        let mut req = good.clone();
-        req.outputs.clear();
-        resign(&mut req, &keypair);
-        refused(run(&req, &rules_, &keysets, 100), "no outputs");
-        let mut req = good.clone();
-        req.outputs[0].amount = Amount::from_units(3);
-        resign(&mut req, &keypair);
-        refused(run(&req, &rules_, &keysets, 100), "not a power of two");
-        let mut req = good.clone();
-        req.outputs[0].amount = Amount::from_units(16);
-        resign(&mut req, &keypair);
-        refused(
-            run(&req, &rules_, &keysets, 100),
-            "above the PSP's largest note",
-        );
-        let mut req = good.clone();
-        req.outputs[1] = req.outputs[0].clone();
-        resign(&mut req, &keypair);
-        refused(run(&req, &rules_, &keysets, 100), "repeats a blind nonce");
-        let mut req = good.clone();
-        req.outputs = (0..1_001)
-            .map(|_| PendingOutput::new(1).mint_output())
-            .collect();
-        resign(&mut req, &keypair);
-        refused(run(&req, &rules_, &keysets, 100), "at most 1000");
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn a_second_request_is_built_once_when_the_keyset_has_left_the_live_set() {
-        let (mut w, dir) = wallet("second");
-        let mint = DidSecretKey::new();
-        let id = open_held(&mut w, &mint, rules(SEND_CORRECTED_REQUEST, 5, 1_000));
-        let (_, pks) = psp_keys();
-        let first = keysets_of(&pks);
-        let one = w.build_reconcile(&id, &first, 100).unwrap();
-
-        // the PSP rotated twice: the first request's keyset is gone
-        let (_, pks2) = psp_keys();
-        let second = keysets_of(&pks2);
-        let two = w.build_reconcile(&id, &second, 200).unwrap();
-        assert_eq!(two.attempt, 2);
-        assert_eq!(two.request.keyset, second.current);
-        assert_ne!(two.hash, one.hash, "a new request, with new outputs");
-        let saved = saved_of(&w, &id);
-        assert_eq!(saved.attempts, 2);
-        assert_eq!(saved.request.unwrap().hash, two.hash);
-        let [air] = w.air_requests() else {
-            panic!("the first request's AIR request was replaced");
-        };
-        assert_eq!(air.body_hash, crate::air::body_hash(&two.body));
-
-        // never a third, whatever the keysets
-        let (_, pks3) = psp_keys();
-        let before = state(&w);
-        let e = expect::invalid(w.build_reconcile(&id, &keysets_of(&pks3), 300));
-        assert!(e.contains("2 request(s) were built already"), "{e}");
-        assert_eq!(state(&w), before);
-
-        // and the rules' own count caps it: one attempt allowed, one built
-        let mut one_only = rules(SEND_CORRECTED_REQUEST, 5, 1_000);
-        one_only.max_attempts = 1;
-        let id = open_held(&mut w, &mint, one_only);
-        w.build_reconcile(&id, &first, 100).unwrap();
-        let e = expect::invalid(w.build_reconcile(&id, &second, 100));
-        assert!(e.contains("the rules allow 1"), "{e}");
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn an_answer_is_applied_once_and_its_notes_are_the_ones_the_psp_signed() {
-        let (mut w, dir) = wallet("apply");
-        let mint = DidSecretKey::new();
-        let id = open_held(&mut w, &mint, rules(SEND_CORRECTED_REQUEST, 20, 1_000));
-        let (sks, pks) = psp_keys();
-        w.build_reconcile(&id, &keysets_of(&pks), 100).unwrap();
-        let response = answer(&w, &id, &sks, &pks);
-
-        let settled = match w.apply_reconcile(&id, &response).unwrap() {
-            Applied::Settled(s) => s,
-            other => panic!("{other:?}"),
-        };
-        assert_eq!(
-            (settled.units, settled.claimed.len(), settled.credit),
-            (20, 3, false)
-        );
-        assert_eq!(w.balance().psp, 20);
-        for n in w.notes() {
-            let sk = &sks[&Amount::from_units(n.amount)];
-            assert!(bdhke::verify_message(
-                sk,
-                n.note.signature,
-                &n.note.nonce.as_hash_preimage()
-            ));
-            assert_eq!(
-                w.data().keysets.get(&n.id()),
-                Some(&sp_wire::keyset::keyset_id(&pks))
-            );
-        }
-        // the purchase, its key, the saved request and the AIR request are gone
-        assert!(w.pending_purchases().is_empty());
+        let r = record_state(&w, &id, 0);
+        assert!(r.done && r.request.is_none());
         assert!(w.air_requests().is_empty());
-        assert!(w.data().reconciled.contains(&id));
-        assert!(w.data().finished.contains(&id));
-        assert!(w.open_reconciliations(100).is_empty());
-
-        // the same answer again adds nothing and writes nothing
-        let (version, notes) = (w.version(), w.notes().len());
+        assert_eq!(w.apply_claim(&id, 0, &reply).unwrap(), Applied::AlreadyDone);
+        assert_eq!(w.notes().len(), 6);
+        // after a restart too
+        let mut again = open_wallet(w.path()).unwrap();
         assert_eq!(
-            w.apply_reconcile(&id, &response).unwrap(),
+            again.apply_claim(&id, 0, &reply).unwrap(),
             Applied::AlreadyDone
         );
-        assert_eq!((w.version(), w.notes().len()), (version, notes));
-        assert_eq!(w.balance().psp, 20);
-        // saved
-        assert_eq!(open_wallet(w.path()).unwrap().balance().psp, 20);
+        assert_eq!(again.notes().len(), 6);
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// A bad answer stores nothing and keeps the saved claim. Fails if a wrong
+    /// keyset, a wrong count, a swapped output, a short `issued_units`, keys that
+    /// do not hash to the id, or a signature that is not a point is accepted.
     #[test]
-    fn a_credit_claim_is_settled_the_same_way_and_the_pending_line_goes() {
-        let (mut w, dir) = wallet("apply-credit");
-        let mint = DidSecretKey::new();
-        let built = w.build_psp_payload(&[4, 1], &mint.public_key()).unwrap();
-        let (sks, pks) = psp_keys();
-        let sigs = sign_all(&w, &sks);
-        // 94 cents owed; the PSP's rules say the claim is for 9 units
-        let mut outcome = windowed(record(&sigs, &pks, 0, 94), 5_000);
-        if let Outcome::Signed(s) = &mut outcome {
-            s.rules = Some(rules(SEND_CREDIT_CLAIM, 9, 5_000));
-        }
-        w.apply_delivery(&built.id, &outcome).unwrap();
-        assert_eq!(
-            w.pending_psp_credit(100).balance_line().as_deref(),
-            Some(
-                "9 PSP (0.94 USD) (pending): credit the PSP owes for 1 purchase(s), not counted above until it is claimed"
-            )
-        );
-        let listed = w.open_reconciliations(100);
-        assert_eq!(listed.len(), 1);
-        let open = &listed[0];
-        assert_eq!(
-            (open.send.as_str(), open.due_units, open.credit_cents),
-            (SEND_CREDIT_CLAIM, 9, 94)
-        );
-        assert_eq!(open.state, ReconcileStatus::Due);
-
-        let (sks2, pks2) = psp_keys();
-        let built = w
-            .build_reconcile(&built.id, &keysets_of(&pks2), 100)
-            .unwrap();
-        let amounts: Vec<u64> = built
-            .request
-            .outputs
-            .iter()
-            .map(|o| o.amount.units)
-            .collect();
-        assert_eq!(amounts, vec![8, 1]);
-        // the answer
-        let saved = w.open_replies()[0].reconcile.request.clone().unwrap();
-        let keysets = keysets_of(&pks2);
-        let response = ReconcileResponse {
-            keyset: keysets.current.clone(),
-            signatures: saved
-                .outputs
-                .iter()
-                .map(|o| SignedOutput {
-                    blind_nonce: o.blind_nonce.0.to_string(),
-                    signature: bdhke::sign_message(
-                        &sks2[&Amount::from_units(o.amount)],
-                        &o.blind_nonce.0,
-                    )
-                    .to_string(),
-                })
-                .collect(),
-            keysets,
-            issued_units: 9,
-            fee_units: 0,
-            read_prepaid_units: 0,
-            write_prepaid_units: 0,
-            kept_cents: 4,
-            given_cents: 0,
-        };
-        match w.apply_reconcile(&built.id, &response).unwrap() {
-            Applied::Settled(s) => assert_eq!((s.units, s.credit), (9, true)),
-            other => panic!("{other:?}"),
-        }
-        assert_eq!(w.balance().psp, 5 + 9);
-        assert!(w.open_replies().is_empty());
-        assert_eq!(w.pending_psp_credit(100).balance_line(), None);
-        assert!(w.air_requests().is_empty());
-        assert!(w.data().reconciled.contains(&built.id));
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn a_bad_answer_is_a_mint_error_that_stores_nothing_and_keeps_the_key() {
+    fn a_bad_answer_stores_nothing() {
         let (mut w, dir) = wallet("bad-answer");
-        let mint = DidSecretKey::new();
-        let id = open_held(&mut w, &mint, rules(SEND_CORRECTED_REQUEST, 20, 1_000));
-        let (sks, pks) = psp_keys();
-        w.build_reconcile(&id, &keysets_of(&pks), 100).unwrap();
-        let good = answer(&w, &id, &sks, &pks);
-        let before = state(&w);
+        let psp = DidSecretKey::new();
+        let id = bought(&mut w, &psp, 797);
+        let ks = Keyset::new(5);
+        w.build_claim(&id, 0, &ks.window, &ks.pks, FIRST + 10)
+            .unwrap();
+        let good = answer(&w, &id, 0, &ks);
 
-        let mut variants: Vec<(&str, ReconcileResponse)> = Vec::new();
-        let mut r = good.clone();
-        r.keyset = "0000000000000000".into();
-        variants.push(("keyset", r));
-        let mut r = good.clone();
-        r.keysets.keysets.get_mut(&good.keyset).unwrap().insert(
-            1,
-            SecretKey::new(&mut rand::rngs::OsRng).public_key(SECP256K1),
+        let mut wrong_keyset = good.clone();
+        wrong_keyset.keyset = "ab".repeat(8);
+        let e = expect::mint(w.apply_claim(&id, 0, &wrong_keyset));
+        assert!(
+            e.contains("it was signed by keyset abababababababab"),
+            "{e}"
         );
-        variants.push(("keys that do not hash to the id", r));
-        let mut r = good.clone();
-        r.signatures.pop();
-        variants.push(("signature count", r));
-        let mut r = good.clone();
-        r.signatures.push(r.signatures[0].clone());
-        variants.push(("one signature too many", r));
-        let mut r = good.clone();
-        r.signatures.swap(0, 2);
-        variants.push(("signatures out of order", r));
-        let mut r = good.clone();
-        r.issued_units = 19;
-        variants.push(("issued units", r));
-        let mut r = good.clone();
-        r.signatures[1].signature = "zz".into();
-        variants.push(("not a point", r));
-        for (what, response) in variants {
-            let e = expect::mint(w.apply_reconcile(&id, &response));
-            assert!(
-                e.contains("Nothing was stored and the key is kept"),
-                "{what}: {e}"
-            );
-            assert_eq!(state(&w), before, "{what}: nothing changed");
-        }
-        assert_eq!(w.balance().psp, 0);
-        // the right answer still settles it afterwards
+
+        let mut short = good.clone();
+        short.signatures.pop();
+        let e = expect::mint(w.apply_claim(&id, 0, &short));
+        assert!(e.contains("it has 5 signature(s) for 6 output(s)"), "{e}");
+
+        let mut swapped = good.clone();
+        swapped.signatures.swap(0, 1);
+        let e = expect::mint(w.apply_claim(&id, 0, &swapped));
+        assert!(e.contains("signature 0 is for another output"), "{e}");
+
+        let mut under = good.clone();
+        under.issued_units = 796;
+        let e = expect::mint(w.apply_claim(&id, 0, &under));
+        assert!(
+            e.contains("it issued 796 units, the record says 797"),
+            "{e}"
+        );
+
+        let mut forged_keys = good.clone();
+        let other = Keyset::new(5);
+        forged_keys.keysets.keysets.insert(
+            good.keyset.clone(),
+            other.listing().keysets.into_values().next().unwrap(),
+        );
+        let e = expect::mint(w.apply_claim(&id, 0, &forged_keys));
+        assert!(e.contains("are not those of keyset"), "{e}");
+
+        let mut not_a_point = good.clone();
+        not_a_point.signatures[2].signature = "00".repeat(33);
+        let e = expect::mint(w.apply_claim(&id, 0, &not_a_point));
+        assert!(e.contains("signature 2: not a curve point"), "{e}");
+
+        let mut unlisted = good.clone();
+        unlisted.keysets.keysets.clear();
+        let e = expect::mint(w.apply_claim(&id, 0, &unlisted));
+        assert!(e.contains("does not carry the keys of keyset"), "{e}");
+
+        assert!(w.notes().is_empty());
+        let r = record_state(&w, &id, 0);
+        assert!(!r.done && r.request.is_some());
+        assert_eq!(w.air_requests().len(), 1);
+        // the good answer still settles it
         assert!(matches!(
-            w.apply_reconcile(&id, &good).unwrap(),
+            w.apply_claim(&id, 0, &good).unwrap(),
             Applied::Settled(_)
         ));
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// An answer for a record with no claim saved settles nothing, and an answer
+    /// for a record the wallet does not have is `AlreadyDone`. Fails if notes are
+    /// stored without a saved claim.
     #[test]
-    fn an_answer_to_a_payment_with_no_saved_request_is_refused() {
-        let (mut w, dir) = wallet("no-request");
-        let mint = DidSecretKey::new();
-        let id = open_held(&mut w, &mint, rules(SEND_CORRECTED_REQUEST, 5, 1_000));
-        let (sks, pks) = psp_keys();
-        let other = open_held(&mut w, &mint, rules(SEND_CORRECTED_REQUEST, 5, 1_000));
-        w.build_reconcile(&other, &keysets_of(&pks), 100).unwrap();
-        let response = answer(&w, &other, &sks, &pks);
-        let before = state(&w);
-        let e = expect::unknown(w.apply_reconcile(&id, &response));
-        assert!(e.contains("no reconciliation request was built"), "{e}");
-        assert_eq!(state(&w), before);
+    fn an_answer_with_no_saved_claim_settles_nothing() {
+        let (mut w, dir) = wallet("no-claim");
+        let psp = DidSecretKey::new();
+        let id = bought(&mut w, &psp, 797);
+        let ks = Keyset::new(5);
+        w.build_claim(&id, 0, &ks.window, &ks.pks, FIRST + 10)
+            .unwrap();
+        let reply = answer(&w, &id, 0, &ks);
+        w.give_up_claim(&id, 0).unwrap();
+        let e = expect::unknown(w.apply_claim(&id, 0, &reply));
+        assert!(e.contains("no claim was built for record 0"), "{e}");
+        assert_eq!(
+            w.apply_claim("nope", 0, &reply).unwrap(),
+            Applied::AlreadyDone
+        );
+        assert!(w.notes().is_empty());
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// The note sizes (W6): 1, 2^40 and 2^63 are accepted; 0, 3 and 2^63-1 are
+    /// refused; there is no largest size. Fails if a cap on the size comes back.
     #[test]
-    fn open_payments_are_listed_with_where_each_stands() {
-        let (mut w, dir) = wallet("listing");
-        let mint = DidSecretKey::new();
-        let (_, pks) = psp_keys();
-        let due = open_held(&mut w, &mint, rules(SEND_CORRECTED_REQUEST, 5, 1_000));
-        let none = open_held(&mut w, &mint, rules(SEND_CORRECTED_REQUEST, 0, 1_000));
-        let late = open_held(&mut w, &mint, rules(SEND_CORRECTED_REQUEST, 5, 50));
+    fn a_note_size_is_valid_if_it_is_a_power_of_two() {
+        for ok in [1u64, 2, 1 << 40, 1 << 63] {
+            check_denomination(ok).unwrap();
+            check_outputs(&[ok]).unwrap();
+        }
+        for bad in [0u64, 3, (1 << 63) - 1, u64::MAX] {
+            let e = expect::invalid(check_denomination(bad));
+            assert_eq!(
+                e,
+                format!("{bad} is not a PSP note size: use a power of two")
+            );
+        }
+        let e = expect::invalid(check_outputs(&[]));
+        assert_eq!(e, "a claim needs at least one output");
+        let e = expect::invalid(check_outputs(&[4, 6]));
+        assert_eq!(e, "6 is not a PSP note size: use a power of two");
+    }
+
+    /// The split of what is due: the binary digits, largest first, at most 64.
+    #[test]
+    fn the_split_is_the_binary_digits_of_what_is_due() {
+        assert_eq!(split_due(0), Vec::<u64>::new());
+        assert_eq!(split_due(1), vec![1]);
+        // 512 + 256 + 16 + 8 + 4 + 1 = 797
+        assert_eq!(split_due(797), vec![512, 256, 16, 8, 4, 1]);
+        // 2^40 + 4 + 1
+        assert_eq!(split_due((1 << 40) + 5), vec![1 << 40, 4, 1]);
+        assert_eq!(split_due((1 << 63) + 1), vec![1 << 63, 1]);
+        assert_eq!(split_due(u64::MAX).len(), 64);
+    }
+
+    /// Where an open record stands. Fails if a claim the PSP mint did not answer
+    /// after every allowed attempt is still called `Sent`.
+    #[test]
+    fn an_open_claim_says_whether_it_is_due_sent_or_refused() {
+        let (mut w, dir) = wallet("status");
+        let psp = DidSecretKey::new();
+        let id = bought(&mut w, &psp, 797);
+        let now = FIRST + 10;
+        let open = w.open_claims(now);
+        assert_eq!(open.len(), 1);
+        assert_eq!(
+            (open[0].status, open[0].attempts, open[0].max_attempts),
+            (ClaimStatus::Due, 0, 3)
+        );
+        assert_eq!(open[0].psp, psp.public_key().to_string());
+        assert_eq!((open[0].txid.as_str(), open[0].due_units), ("aa", 797));
+        assert_eq!(open[0].window_ends, 1_802_592_000);
+        for epoch in 5..8 {
+            let ks = Keyset::new(epoch);
+            w.build_claim(&id, 0, &ks.window, &ks.pks, now).unwrap();
+        }
+        assert_eq!(w.open_claims(now)[0].status, ClaimStatus::Sent);
+        w.note_unanswered(&id, 0, true).unwrap();
+        assert_eq!(w.open_claims(now)[0].status, ClaimStatus::Refused);
+        assert_eq!(w.open_claims(now)[0].attempts, 3);
+        w.note_unanswered(&id, 0, false).unwrap();
+        assert_eq!(w.open_claims(now)[0].status, ClaimStatus::Sent);
+        assert!(!w.open_claims(now)[0].told_lost);
+        w.note_told_lost(&id, 0).unwrap();
+        w.note_told_lost(&id, 0).unwrap();
+        assert!(w.open_claims(now)[0].told_lost);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The words of a loss, with the date and the units.
+    #[test]
+    fn a_refused_claim_is_told_with_its_attempts_date_and_units() {
+        let (mut w, dir) = wallet("words");
+        let psp = DidSecretKey::new();
+        let id = bought(&mut w, &psp, 797);
+        let loss = w.refused_loss(&id, 0).unwrap();
+        assert_eq!(loss.kind, LossKind::Refused);
+        assert_eq!(
+            loss.not_accepted(3),
+            format!(
+                "purchase {id}, record 0 (payment aa): refused. The PSP mint did not accept the claim (it answers an accepted claim only) after 3 attempt(s). Unless it answers by 2027-02-14 08:00 UTC, the payment (797 PSP) is lost"
+            )
+        );
+        assert!(w.refused_loss(&id, 4).is_none());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A purchase that was never paid can be forgotten; one that does not exist
+    /// cannot.
+    #[test]
+    fn an_unpaid_purchase_can_be_discarded() {
+        let (mut w, dir) = wallet("discard");
+        let psp = DidSecretKey::new();
+        let id = w.build_psp_payload(&psp.public_key()).unwrap().id;
+        let e = expect::unknown(w.discard_purchase("nope"));
+        assert_eq!(e, "no purchase nope");
+        w.discard_purchase(&id).unwrap();
+        assert!(w.claim_keys().is_empty());
+        assert!(open_wallet(w.path()).unwrap().claim_keys().is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A copy saved before a claim was settled is merged in after the key was
+    /// closed and deleted: the key and its saved claim come back, the resend is
+    /// answered from the PSP mint's stored answer, and none of the notes it names
+    /// is added again, the spent ones nor the held ones. Fails if a spent note is
+    /// re-added or the balance changes.
+    #[test]
+    fn a_stale_copy_resent_never_brings_back_spent_notes() {
+        let (mut w, dir) = wallet("stale-copy");
+        let psp = DidSecretKey::new();
+        let id = bought(&mut w, &psp, 797);
+        let ks = Keyset::new(5);
+        w.build_claim(&id, 0, &ks.window, &ks.pks, FIRST + 10)
+            .unwrap();
+        let stale = w.snapshot();
+        let reply = answer(&w, &id, 0, &ks);
+        assert!(matches!(
+            w.apply_claim(&id, 0, &reply).unwrap(),
+            Applied::Settled(_)
+        ));
+        assert_eq!(w.notes().len(), 6);
+        // spend the 512 and the 256 (they leave the wallet), keep the rest
         w.update(|d| {
-            d.open_replies.push(OpenReply {
-                id: "key-only".into(),
-                delivery_id: "dd".repeat(32),
-                mint_did_pubkey: "03".repeat(33),
-                reply_secret: "ee".repeat(32),
-                credit_cents: 0,
-                unaccounted_units: 1,
-                open_until: 1_000,
-                rules: None,
-                reconcile: ReconcileState::default(),
-            });
+            d.notes.retain(|n| n.amount < 256);
             Ok(())
         })
         .unwrap();
-        let states = |w: &Wallet, now: u64| -> Vec<(String, ReconcileStatus)> {
-            w.open_reconciliations(now)
-                .into_iter()
-                .map(|o| (o.id, o.state))
-                .collect()
-        };
-        // a key kept for outputs only has nothing to send, so it is not listed;
-        // `late` is closed at 100
-        assert_eq!(
-            states(&w, 10),
-            vec![
-                (due.clone(), ReconcileStatus::Due),
-                (none.clone(), ReconcileStatus::NothingDue),
-                (late.clone(), ReconcileStatus::Due)
-            ]
+        let held = |w: &Wallet| -> u64 { w.notes().iter().map(|n| n.amount).sum() };
+        assert_eq!(held(&w), 29);
+        // the record is done and its window closes: the key is deleted
+        assert!(
+            w.close_expired(FIRST + CLAIM_WINDOW_SECS)
+                .unwrap()
+                .is_empty()
         );
-        assert_eq!(states(&w, 100).len(), 2, "the closed window is not listed");
+        assert!(w.claim_keys().is_empty());
 
-        w.build_reconcile(&due, &keysets_of(&pks), 10).unwrap();
-        assert_eq!(states(&w, 10)[0], (due.clone(), ReconcileStatus::Sent));
-        // one unanswered try is not yet "not accepted": a second request is allowed
-        w.note_unanswered(&due, true).unwrap();
-        assert_eq!(states(&w, 10)[0].1, ReconcileStatus::Sent);
-        // the second request, built because the keyset is gone, is the last one
-        let (_, pks2) = psp_keys();
-        w.build_reconcile(&due, &keysets_of(&pks2), 10).unwrap();
-        assert_eq!(states(&w, 10)[0].1, ReconcileStatus::Sent);
-        w.note_unanswered(&due, true).unwrap();
-        assert_eq!(states(&w, 10)[0].1, ReconcileStatus::Lost);
-        let listed = &w.open_reconciliations(10)[0];
-        assert_eq!((listed.attempts, listed.max_attempts), (2, 3));
-        assert_eq!(
-            (listed.paid_sats, listed.paid_cents, listed.open_until),
-            (1_000, 10, 1_000)
+        w.merge_from(&stale).unwrap();
+        let r = record_state(&w, &id, 0);
+        assert!(
+            !r.done && r.request.is_some(),
+            "the stale copy's claim is back"
         );
-        assert_eq!(listed.due_units, 5);
-        // answered again (a late reply, say): the mark is cleared
-        w.note_unanswered(&due, false).unwrap();
-        assert_eq!(states(&w, 10)[0].1, ReconcileStatus::Sent);
-        // a mark that is as recorded writes nothing
-        let version = w.version();
-        w.note_unanswered(&due, false).unwrap();
-        w.note_told_lost(&none).unwrap();
-        let told = w.version();
-        assert_eq!(told, version + 1);
-        w.note_told_lost(&none).unwrap();
-        assert_eq!(w.version(), told);
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn the_same_record_keeps_the_request_built_for_it_and_another_record_drops_it() {
-        let (mut w, dir) = wallet("same-record");
-        let mint = DidSecretKey::new();
-        let built = w.build_psp_payload(&[4, 1], &mint.public_key()).unwrap();
-        let first = held(5_000);
-        w.apply_delivery(&built.id, &first).unwrap();
-        let (_, pks) = psp_keys();
-        let request = w
-            .build_reconcile(&built.id, &keysets_of(&pks), 100)
-            .unwrap();
-
-        // the PSP's record read again: nothing changes, the request stays
-        let version = w.version();
-        assert_eq!(
-            w.apply_delivery(&built.id, &first).unwrap(),
-            Delivered::AlreadyDone
-        );
-        assert_eq!(w.version(), version);
-        assert_eq!(saved_of(&w, &built.id).request.unwrap().hash, request.hash);
-
-        // another record with the same rules replaces the words and keeps it
-        let Outcome::Held(mut again) = held(5_000) else {
-            unreachable!()
-        };
-        again.reason = "still short".into();
-        w.apply_delivery(&built.id, &Outcome::Held(again)).unwrap();
-        assert_eq!(saved_of(&w, &built.id).request.unwrap().hash, request.hash);
-        assert_eq!(w.air_requests().len(), 1);
-
-        // a record with other rules: the request was built for rules that are
-        // gone, so it and its AIR request are dropped
-        let Outcome::Held(mut changed) = held(5_000) else {
-            unreachable!()
-        };
-        changed.rules = Some(rules(SEND_CORRECTED_REQUEST, 6, 5_000));
-        w.apply_delivery(&built.id, &Outcome::Held(changed))
-            .unwrap();
-        assert_eq!(saved_of(&w, &built.id), ReconcileState::default());
+        assert_eq!(w.notes().len(), 4);
+        // the resend gets the stored answer: the same signatures
+        assert_eq!(answer(&w, &id, 0, &ks), reply);
+        assert_eq!(w.apply_claim(&id, 0, &reply).unwrap(), Applied::AlreadyDone);
+        assert_eq!(held(&w), 29, "no spent note is back");
+        assert_eq!(w.notes().len(), 4, "no held note is twice");
+        assert_eq!(w.balance(), {
+            let mut again = open_wallet(w.path()).unwrap();
+            assert_eq!(
+                again.apply_claim(&id, 0, &reply).unwrap(),
+                Applied::AlreadyDone
+            );
+            again.balance()
+        });
+        let r = record_state(&w, &id, 0);
+        assert!(r.done && r.request.is_none() && r.others.is_empty());
         assert!(w.air_requests().is_empty());
+        // and the key is closed again
+        assert!(
+            w.close_expired(FIRST + CLAIM_WINDOW_SECS)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(w.claim_keys().is_empty());
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// A claim key with no record is dropped `days` after it was made, only when
+    /// the pickup found no record for it (`checked`), and is said once as unpaid.
+    /// Fails if it is dropped a second early, kept after, dropped with 0 days, or
+    /// a key with a record or one not checked is dropped.
     #[test]
-    fn a_closed_window_says_plainly_that_the_funds_are_lost_with_the_amount() {
-        let (mut w, dir) = wallet("lost-words");
-        let mint = DidSecretKey::new();
-        let id = open_held(&mut w, &mint, rules(SEND_CORRECTED_REQUEST, 5, 1_000));
-        let (_, pks) = psp_keys();
-        w.build_reconcile(&id, &keysets_of(&pks), 10).unwrap();
-        let key = w.pending_purchases()[0].reply_secret.clone();
-        // and a credit that was never claimed
-        let built = w.build_psp_payload(&[4, 1], &mint.public_key()).unwrap();
-        let (sks, pks) = psp_keys();
-        // the PSP signs this purchase's outputs only, not the held purchase's
-        let sigs: Vec<_> = sign_all(&w, &sks)
-            .into_iter()
-            .filter(|(nonce, _)| {
-                w.pending_purchases()
-                    .iter()
-                    .filter(|p| p.id == built.id)
-                    .flat_map(|p| &p.outputs)
-                    .any(|o| o.blind_nonce == *nonce)
-            })
-            .collect();
-        w.apply_delivery(&built.id, &windowed(record(&sigs, &pks, 0, 94), 2_000))
+    fn an_unpaid_key_expires_after_its_days_and_never_with_zero() {
+        let (mut w, dir) = wallet("unpaid-expiry");
+        let psp = DidSecretKey::new();
+        let unpaid = w.build_psp_payload(&psp.public_key()).unwrap().id;
+        let paid = bought(&mut w, &psp, 797);
+        let unread = w.build_psp_payload(&psp.public_key()).unwrap().id;
+        let made = w.claim_keys().iter().map(|k| k.created_at).max().unwrap();
+        assert!(made > 0);
+        let ends = |id: &str| {
+            w.claim_keys()
+                .iter()
+                .find(|k| k.id == id)
+                .unwrap()
+                .created_at
+                + DEFAULT_UNPAID_KEY_DAYS * DAY_SECS
+        };
+        let at = ends(&unpaid);
+        let checked = vec![unpaid.clone(), paid.clone()];
+        assert_eq!(DEFAULT_UNPAID_KEY_DAYS, 90);
+
+        assert!(w.expire_unpaid(at - 1, 90, &checked).unwrap().is_empty());
+        assert_eq!(w.claim_keys().len(), 3, "kept before 90 days");
+        assert!(
+            w.expire_unpaid(at + 10 * DAY_SECS, 0, &checked)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(w.expire_unpaid(u64::MAX, 0, &checked).unwrap().is_empty());
+        assert_eq!(w.claim_keys().len(), 3, "0 keeps it for ever");
+
+        let lost = w.expire_unpaid(at, 90, &checked).unwrap();
+        assert_eq!(
+            lost,
+            vec![Loss {
+                id: unpaid.clone(),
+                index: 0,
+                txid: String::new(),
+                due_units: 0,
+                kind: LossKind::Unpaid,
+                window_ends: at,
+            }]
+        );
+        assert_eq!(lost[0].said(), lost[0].unpaid());
+        assert!(lost[0].unpaid().starts_with(&format!(
+            "purchase {unpaid}: the PSP mint has written no record for it, and it expired at "
+        )));
+        assert!(lost[0].unpaid().contains("the funds are lost"));
+        let ids: Vec<&str> = w.claim_keys().iter().map(|k| k.id.as_str()).collect();
+        assert!(!ids.contains(&unpaid.as_str()));
+        assert!(
+            ids.contains(&paid.as_str()),
+            "a key with a record keeps its rules"
+        );
+        assert!(ids.contains(&unread.as_str()), "a key not read is kept");
+        assert!(
+            w.expire_unpaid(at, 90, &checked).unwrap().is_empty(),
+            "said once"
+        );
+        assert_eq!(open_wallet(w.path()).unwrap().claim_keys().len(), 2);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Two copies built two claims for one record and were merged: both are kept.
+    /// The PSP mint signed the other one: applying it settles the record, drops
+    /// the main one and every AIR request, and nothing is told lost. A refused
+    /// other is dropped alone. Fails if a saved claim is lost in the merge, the
+    /// record is done before one is applied, or a loss is said.
+    #[test]
+    fn two_merged_claims_for_one_record_settle_once_with_the_signed_one() {
+        let (mut a, dir) = wallet("two-claims");
+        let psp = DidSecretKey::new();
+        let id = bought(&mut a, &psp, 797);
+        let b_path = dir.join("copy.json");
+        fs::copy(a.path(), &b_path).unwrap();
+        let mut b = open_wallet(&b_path).unwrap();
+        let ks = Keyset::new(5);
+        a.build_claim(&id, 0, &ks.window, &ks.pks, FIRST + 10)
             .unwrap();
+        b.build_claim(&id, 0, &ks.window, &ks.pks, FIRST + 20)
+            .unwrap();
+        let a_claim = record_state(&a, &id, 0).request.unwrap();
+        let b_claim = record_state(&b, &id, 0).request.unwrap();
+        assert_ne!(a_claim.hash, b_claim.hash);
 
-        let losses = w.close_expired(2_000).unwrap();
-        assert_eq!(lost_ids(&losses), vec![id.clone(), built.id.clone()]);
-        let held_text = losses[0].forfeited();
-        for want in [
-            "forfeited",
-            "the funds are lost",
-            "1000 sat, 0.10 USD",
-            "1970-01-01 00:16 UTC",
-            "key are deleted",
-            &id,
-        ] {
-            assert!(held_text.contains(want), "{want}: {held_text}");
-        }
-        assert!(!held_text.contains("may"), "no hedging: {held_text}");
-        let credit_text = losses[1].forfeited();
-        for want in [
-            "forfeited",
-            "the funds are lost",
-            "a credit of 0.94 USD",
-            "1970-01-01 00:33 UTC",
-            "key is deleted",
-        ] {
-            assert!(credit_text.contains(want), "{want}: {credit_text}");
-        }
-        // the keys, the saved request and its AIR request are gone
-        assert!(w.pending_purchases().is_empty() && w.open_replies().is_empty());
-        assert!(w.air_requests().iter().all(|a| a.r != key));
-        assert!(w.air_requests().is_empty());
-        assert!(w.open_reconciliations(0).is_empty());
-        // and nothing is left to close
-        let version = w.version();
-        assert!(w.close_expired(u64::MAX - 1).unwrap().is_empty());
-        assert_eq!(w.version(), version);
+        // the same copy twice is one claim
+        let mut same = open_wallet(a.path()).unwrap();
+        same.merge_from(&a.snapshot()).unwrap();
+        assert!(record_state(&same, &id, 0).others.is_empty());
+
+        a.merge_from(&b.snapshot()).unwrap();
+        a.merge_from(&b.snapshot()).unwrap();
+        let r = record_state(&a, &id, 0);
+        assert_eq!(r.request.as_ref().unwrap().hash, a_claim.hash);
+        assert_eq!(r.others, vec![b_claim.clone()], "both kept, once each");
+        assert!(!r.done);
+        assert_eq!(a.other_claims(&id, 0), vec![b_claim.hash.clone()]);
+        assert!(a.claim_to_send_of(&id, 0, Some(&b_claim.hash)).is_ok());
+
+        // the PSP mint signed b's claim: it settles the record
+        let reply = answer_to(&b_claim, 797, &ks);
+        let Applied::Settled(s) = a
+            .apply_claim_to(&id, 0, Some(&b_claim.hash), &reply)
+            .unwrap()
+        else {
+            panic!("not settled");
+        };
+        assert_eq!(s.units, 797);
+        assert_eq!(a.notes().iter().map(|n| n.amount).sum::<u64>(), 797);
+        let r = record_state(&a, &id, 0);
+        assert!(r.done && r.request.is_none() && r.others.is_empty());
+        assert!(a.other_claims(&id, 0).is_empty());
+        assert!(a.air_requests().is_empty());
+        assert_eq!(
+            a.apply_claim(&id, 0, &answer_to(&a_claim, 797, &ks))
+                .unwrap(),
+            Applied::AlreadyDone
+        );
+        assert!(
+            a.close_expired(FIRST + CLAIM_WINDOW_SECS)
+                .unwrap()
+                .is_empty(),
+            "nothing lost"
+        );
+
+        // a refused other is dropped and the main one is kept
+        let mut c = open_wallet(&b_path).unwrap();
+        c.merge_from(&same.snapshot()).unwrap();
+        let other = c.other_claims(&id, 0);
+        assert_eq!(other.len(), 1);
+        c.drop_other_claim(&id, 0, &other[0]).unwrap();
+        let r = record_state(&c, &id, 0);
+        assert!(r.others.is_empty() && r.request.is_some() && !r.done);
         fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn the_words_for_a_payment_nothing_can_settle_say_the_funds_are_lost() {
-        let loss = Loss {
-            id: "ab".repeat(32),
-            kind: LossKind::Rejected,
-            paid_sats: 123_456,
-            paid_cents: 994,
-            credit_cents: 0,
-            open_until: 951_782_400,
-        };
-        let nothing = loss.nothing_due();
-        for want in [
-            "the PSP's fees take the whole amount",
-            "123456 sat, 9.94 USD",
-            "2000-02-29 00:00 UTC",
-            "no request is sent",
-            "the funds are lost",
-        ] {
-            assert!(nothing.contains(want), "{want}: {nothing}");
-        }
-        let refused = loss.not_accepted(2);
-        for want in [
-            "the request was not accepted by the PSP",
-            "after 2 attempt(s)",
-            "123456 sat, 9.94 USD",
-            "forfeited at 2000-02-29 00:00 UTC",
-            "the funds are lost",
-        ] {
-            assert!(refused.contains(want), "{want}: {refused}");
-        }
-        let credit = Loss {
-            kind: LossKind::Credit,
-            credit_cents: 8,
-            ..loss
-        };
-        assert!(credit.nothing_due().contains("a credit of 0.08 USD"));
     }
 }

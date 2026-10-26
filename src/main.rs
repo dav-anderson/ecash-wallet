@@ -27,37 +27,31 @@ ecash-wallet [--wallet FILE] [--config FILE] [--regtest|--signet|--testnet] <com
   FSP mints too are asked over AIR, so every fsp command needs the air.fsp
   entry of its service (see the end of this text).
 
-  buy-psp --mint-key HEX [--sync] AMOUNT...
+  buy-psp --mint-key HEX
       Make the encrypted payload for a PSP purchase and print it as hex, for
-      the OP_RETURN. AMOUNT is each note's size in PSP (a power of two), and
-      together they must come to at least psp.min_purchase (50 PSP by default;
-      a smaller purchase is refused, before anything is sent, because the PSP's
-      fees can eat it whole; 100 PSP is a realistic purchase). The payload names
-      the PSP's current keyset. With --sync the wallet asks the PSP for it over
-      AIR first; without, it uses the one last seen (and sends nothing). Each
-      purchase gets a one-off reply key of its own, kept in the wallet file, so
-      the PSP cannot link two purchases. The payload is ONE-TIME USE: pay it
-      exactly once. A second payment carrying the same payload buys nothing and
-      its funds are lost.
+      the OP_RETURN. No amount is given: the payload is the purchase's claim key
+      and nothing more, and the PSP mint decides what the payment is worth when
+      it handles it. Each purchase gets a throwaway claim key of its own, kept in
+      the wallet file, so the PSP mint cannot link two purchases. Pay the payload
+      once: a second payment to it is still owed to you and claimed with the
+      first, but it links the two. We recommend a PSP purchase of at least $5
+      (50 PSP): the PSP mint's fees come out of what a payment buys, so a
+      smaller payment can buy little or nothing. Nothing enforces it.
   claim-psp [--wait SECONDS]
-      Pick up the notes of every pending purchase, and settle what the PSP
-      holds or owes. When the PSP handles a payment it writes a record to the
-      AIR server: the signatures, or that it holds the payment, or the reason it
-      rejected the purchase, with what it received, or a credit it owes. This
-      reads each purchase's record, checks the PSP's signature and claims the
-      notes, waiting up to SECONDS (default 60) for records that are not there
-      yet and saying which are not. Needs air.server and air.host. Any other
-      command also picks up what is already there when it starts. There is
-      nothing to paste.
-      A payment the PSP holds or rejects, and a credit it owes, are settled by a
-      reconciliation request the wallet builds from the PSP's rules and sends
-      itself, here and once at the start of any other command, until the
-      window the record names closes: it saves the request before it sends it,
-      and sends the same request again while the PSP has not answered. If the
-      payment is not settled by then the PSP forfeits it and the funds are
-      lost; the wallet says so, with the amount, and deletes the purchase and
-      the key. When the PSP's fees take the whole amount nothing can be issued,
-      nothing is sent, and the wallet says the payment is lost.
+      Read what the PSP mint owes for your purchases and claim it. When the PSP
+      mint has handled a payment it writes an owed record to the AIR server. This
+      reads each purchase's records (a purchase may have several: one for each
+      payment to its payload), waiting up to SECONDS (default 60) for a purchase
+      whose first record is not there yet, and claims the notes of each record
+      with a claim it builds and sends itself: it saves the claim before it sends
+      it, and sends the same claim again while the PSP mint has not answered. One
+      line is printed for each record: claimed N units, waiting, expired or
+      refused. A record must be claimed within 30 days of the wallet first
+      reading it; after that the PSP mint keeps the payment, the wallet says so
+      with the units, and deletes the purchase's key once every record of it is
+      past its window. Needs air.server and air.host. Any other command also
+      picks up and claims what is already there when it starts. There is nothing
+      to paste.
   exchange --service DID --psp N [--amounts A,B,C] [--resume ID]
       Exchange at least N PSP for ESP bound to a service (its 33-byte AIR DID,
       66 hex characters). The smallest exchange is 1 PSP. The mint's exchange is exact, so the
@@ -319,6 +313,44 @@ fn take_network(args: &mut Args) -> Result<&'static str, WalletError> {
 /// call to the PSP or the ESP made with them empty fails, naming what is missing.
 static AIR: std::sync::OnceLock<AirSettings> = std::sync::OnceLock::new();
 
+/// `psp.unpaid_key_days` of this run, set once in `run`.
+static UNPAID_KEY_DAYS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+/// `psp.unpaid_key_days` of this run (the default before `run` sets it).
+fn unpaid_key_days() -> u64 {
+    UNPAID_KEY_DAYS
+        .get()
+        .copied()
+        .unwrap_or(ecash_wallet::psp::DEFAULT_UNPAID_KEY_DAYS)
+}
+
+/// Drop the claim keys that the pickup just found with no record and that are
+/// older than `psp.unpaid_key_days`, and say so once for each. Returns the ids
+/// dropped.
+fn expire_unpaid(
+    wallet: &mut Wallet,
+    picked: &[ecash_wallet::mint_info::PickedUp],
+    prefix: &str,
+) -> Vec<String> {
+    let checked: Vec<String> = picked
+        .iter()
+        .filter(|p| p.no_record)
+        .map(|p| p.id.clone())
+        .collect();
+    match wallet.expire_unpaid(now_secs(), unpaid_key_days(), &checked) {
+        Ok(lost) => {
+            for loss in &lost {
+                eprintln!("{prefix}WARNING: {}", loss.said());
+            }
+            lost.into_iter().map(|l| l.id).collect()
+        }
+        Err(e) => {
+            eprintln!("{prefix}unpaid purchases not expired, retried on the next run: {e}");
+            Vec::new()
+        }
+    }
+}
+
 /// The `[air]` settings of this run (empty before `run` sets them).
 fn air_settings() -> AirSettings {
     AIR.get().cloned().unwrap_or_default()
@@ -369,9 +401,8 @@ fn esp_base(wallet: &mut Wallet) -> Result<String, WalletError> {
 }
 
 /// The steps every command that uses the wallet starts with, and that use the
-/// network: the FSP mints are checked, what the PSP has delivered is picked up,
-/// the PSP's reconciliations are settled, and the PSP and ESP key sets are kept
-/// live. A command takes a `Startup` and runs it once its own arguments have been
+/// network: the FSP mints are checked, what the PSP mint owes is picked up and
+/// claimed, and the PSP and ESP key sets are kept live. A command takes a `Startup` and runs it once its own arguments have been
 /// read and checked (a command that forgot to would leave the value unused, which
 /// the compiler warns about), so a user error never waits on the network.
 #[must_use = "a command runs the startup steps once its arguments are checked"]
@@ -385,109 +416,92 @@ impl Startup {
     /// Run the startup steps.
     fn run(self, wallet: &mut Wallet) {
         startup_fsp_sync(wallet);
-        startup_psp_pickup(wallet);
-        startup_psp_reconcile(wallet);
+        startup_psp(wallet);
         startup_rotation_sync(wallet);
     }
 
-    /// The same without the reconciliation, for `claim-psp`, which settles the
-    /// PSP's payments itself after it has waited for their records and says
-    /// every result.
+    /// The same without the pickup and the claim, for `claim-psp`, which reads
+    /// and claims the PSP mint's records itself, waits for the first record of a
+    /// purchase and says every result. The windows that have closed are still
+    /// closed first.
     fn run_for_claim(self, wallet: &mut Wallet) {
         startup_fsp_sync(wallet);
-        startup_psp_pickup(wallet);
+        close_expired_psp(wallet);
         startup_rotation_sync(wallet);
     }
 }
 
 fn buy_psp(wallet: &mut Wallet, mut args: Args, start: Startup) -> Result<(), WalletError> {
-    let mint_key = args
-        .flag("--mint-key")?
-        .ok_or_else(|| WalletError::Invalid("--mint-key HEX is required".into()))?;
-    let sync = args.switch("--sync");
-    if args.flag("--reply-did")?.is_some() {
+    if args.switch("--sync") {
         return Err(WalletError::Invalid(
-            "--reply-did was removed: every purchase makes a one-off reply key of its own (so the PSP cannot link two purchases) and keeps its secret in the wallet file. The PSP's delivery is picked up with `claim-psp`"
+            "--sync was removed: the payload names no keyset and buy-psp asks the PSP mint nothing, so there is nothing to sync. `claim-psp` reads the PSP mint's current keyset when it claims"
                 .into(),
         ));
     }
-    let amounts = args
-        .rest()
-        .iter()
-        .map(|a| number(a, "an amount"))
-        .collect::<Result<Vec<_>, _>>()?;
+    if args.flag("--reply-did")?.is_some() {
+        return Err(WalletError::Invalid(
+            "--reply-did was removed: every purchase makes a throwaway claim key of its own (so the PSP mint cannot link two purchases) and keeps its secret in the wallet file. What the PSP mint owes is picked up and claimed with `claim-psp`"
+                .into(),
+        ));
+    }
+    let mint_key = args
+        .flag("--mint-key")?
+        .ok_or_else(|| WalletError::Invalid("--mint-key HEX is required".into()))?;
+    if args.0.first().is_some_and(|a| a.parse::<u64>().is_ok()) {
+        return Err(WalletError::Invalid(format!(
+            "buy-psp takes no AMOUNT any more: the payload is the purchase's claim key alone, and the PSP mint decides what the payment is worth. It is run as: {}",
+            run_as("buy-psp")
+        )));
+    }
+    args.done()?;
     let mint_key = sp_wire::seal::parse_public_key(&mint_key)
         .map_err(|e| WalletError::Invalid(e.to_string()))?;
-    // Every flag is read before the PSP is asked anything: a user error never
-    // depends on the network. That includes a purchase below psp.min_purchase.
-    ecash_wallet::psp::check_outputs(
-        &amounts,
-        wallet.psp_max_denomination(),
-        wallet.psp_min_purchase(),
-    )
-    .map_err(|e| WalletError::Invalid(format!("buy-psp: {e}")))?;
+    // Every flag is read before the network is used: a user error never depends
+    // on it.
     start.run(wallet);
-    if sync {
-        let base = psp_base(wallet)?;
-        let air = air_settings();
-        let w = ecash_wallet::mint_info::psp_window(wallet, &air)?;
-        wallet.note_live_keysets(&base, &w)?;
-        ecash_wallet::mint_info::sync_psp_limits(wallet, &air)?;
-    }
-    let built = wallet.build_psp_payload(&amounts, &mint_key)?;
+    let built = wallet.build_psp_payload(&mint_key)?;
     eprintln!("purchase {}", built.id);
-    eprintln!("{}", ecash_wallet::psp::ONE_TIME_USE);
+    eprintln!("{}", ecash_wallet::psp::PAY_ONCE);
     eprintln!(
-        "{} bytes. Put the hex below in an OP_RETURN and pay the PSP. When the PSP settles it delivers the notes over AIR: `claim-psp` waits for them, and any command picks them up when it starts if they are there.",
+        "{} bytes. Put the hex below in an OP_RETURN of a Bitcoin payment to the PSP mint's wallet. Once the payment has its confirmations the PSP mint writes what you are owed over AIR: `claim-psp` reads it and claims your notes, and any command does so when it starts. Each payment's record must be claimed within 30 days of the PSP mint writing it.",
         built.payload.len()
     );
+    eprintln!("{}", ecash_wallet::psp::RECOMMENDED_PURCHASE);
     println!("{}", hex::encode(&built.payload));
     Ok(())
 }
 
-/// How long `claim-psp` waits for the PSP's records, in seconds, when `--wait`
-/// does not say.
+/// How long `claim-psp` waits for the PSP mint's first record of a purchase, in
+/// seconds, when `--wait` does not say.
 const PICKUP_WAIT_SECS: u64 = 60;
 
-/// One line about one purchase's pickup.
-fn pickup_line(p: &ecash_wallet::mint_info::PickedUp) -> String {
-    use ecash_wallet::mint_info::Pickup;
+/// The lines about one purchase's pickup: each cell that did not open, a record
+/// with nothing due, and a purchase that could not be read. A record that was read
+/// is said by its claim, and a purchase with no record yet only when `waiting` asks
+/// (`claim-psp` does; a start does not mention it).
+fn pickup_lines(p: &ecash_wallet::mint_info::PickedUp, waiting: bool) -> Vec<String> {
     let id = &p.id;
-    match &p.what {
-        Pickup::Claimed(c) => {
-            let mut line = format!(
-                "purchase {id}: claimed {} PSP in {} note(s)",
-                c.claim.claimed_units,
-                c.claim.claimed.len()
-            );
-            if c.skipped_units > 0 {
-                line.push_str(&format!(
-                    "; the payment was short, so the PSP did not sign {} unit(s) and kept their value",
-                    c.skipped_units
-                ));
-            }
-            if c.credit_cents > 0 {
-                line.push_str(&format!(
-                    "; you overpaid, and the PSP owes you a credit of {}.{:02} USD. The wallet claims it with a reconciliation request, and keeps the purchase's key until it is settled",
-                    c.credit_cents / 100,
-                    c.credit_cents % 100
-                ));
-            }
-            if c.unaccounted_units > 0 {
-                line.push_str(&format!(
-                    "; {} unit(s) were neither signed nor reported as dropped. The purchase's key is kept",
-                    c.unaccounted_units
-                ));
-            }
-            line
-        }
-        Pickup::Open(o) => open_line(id, o, true),
-        Pickup::StillOpen(o) => open_line(id, o, false),
-        Pickup::NotThere => format!(
-            "purchase {id}: not delivered yet. The PSP settles a payment at 6 confirmations and then writes the record; run `claim-psp` again later"
-        ),
-        Pickup::Bad(why) => format!("purchase {id}: {why}"),
+    let mut lines = Vec::new();
+    for (index, why) in &p.skipped {
+        lines.push(format!(
+            "purchase {id}: record {index} was skipped, and the next record is read: {why}"
+        ));
     }
+    for r in p.new.iter().filter(|r| r.due_units == 0) {
+        lines.push(format!(
+            "purchase {id}, record {} (payment {}): nothing is due. The PSP mint's fees take the whole payment, so nothing can be claimed and the payment is lost",
+            r.index, r.txid
+        ));
+    }
+    if let Some(why) = &p.problem {
+        lines.push(format!("purchase {id}: not read: {why}"));
+    }
+    if waiting && p.no_record {
+        lines.push(format!(
+            "purchase {id}: no record from the PSP mint yet. It writes the record once the payment has its confirmations; run `claim-psp` again later"
+        ));
+    }
+    lines
 }
 
 /// Seconds since the Unix epoch.
@@ -498,123 +512,80 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// One line about a purchase the PSP is holding or rejected. `new` is true when
-/// the record was just read.
-fn open_line(id: &str, o: &ecash_wallet::store::OpenPurchase, new: bool) -> String {
-    use ecash_wallet::store::OpenKind;
-    let what = match o.kind {
-        OpenKind::Held => format!(
-            "the PSP is holding the payment ({}). It received {} sat ({}.{:02} USD) for {} unit(s)",
-            o.reason,
-            o.paid_sats,
-            o.paid_cents / 100,
-            o.paid_cents % 100,
-            o.requested_units
-        ),
-        OpenKind::Rejected => format!(
-            "the PSP rejected it ({}). It received {} sat ({}.{:02} USD)",
-            o.reason,
-            o.paid_sats,
-            o.paid_cents / 100,
-            o.paid_cents % 100
-        ),
-    };
-    let lead = if new { "" } else { "still open: " };
-    format!(
-        "purchase {id}: {lead}{what}. Nothing was signed. The purchase and its key are kept open until {}, and the wallet sends the PSP a reconciliation request for it. If it is not settled by then the PSP forfeits the payment and the funds are lost",
-        format_utc(o.open_until)
-    )
-}
-
-/// One line about one payment's reconciliation.
-fn reconcile_line(r: &ecash_wallet::mint_info::ReconcileReport) -> String {
-    use ecash_wallet::mint_info::Reconciled;
-    let id = &r.id;
+/// One line about one record's claim.
+fn claim_line(r: &ecash_wallet::mint_info::ClaimReport) -> String {
+    use ecash_wallet::mint_info::ClaimOutcome;
+    let (id, index) = (&r.id, r.index);
     match &r.what {
-        Reconciled::Settled(s) => format!(
-            "purchase {id}: the PSP accepted the {}: {} PSP received in {} note(s)",
-            if s.credit {
-                "credit claim"
-            } else {
-                "corrected request"
-            },
+        ClaimOutcome::Claimed(s) => format!(
+            "purchase {id}, record {index}: claimed {} units in {} note(s)",
             s.units,
             s.claimed.len()
         ),
-        Reconciled::NothingDue(loss) => loss.nothing_due(),
-        Reconciled::Waiting {
+        ClaimOutcome::Waiting {
             attempts,
-            open_until,
+            window_ends,
         } => format!(
-            "purchase {id}: the reconciliation request ({attempts} built) is sent and the PSP has not answered. The same request is sent again at the next start, until {}",
-            format_utc(*open_until)
+            "purchase {id}, record {index}: waiting: the claim ({attempts} built) is sent and the PSP mint has not answered. The same claim is sent again at the next start, until {}",
+            format_utc(*window_ends)
         ),
-        Reconciled::NotAccepted { loss, attempts } => loss.not_accepted(*attempts),
-        Reconciled::NotSent(why) => format!("purchase {id}: not sent: {why}"),
-        Reconciled::Failed(why) => {
-            format!("purchase {id}: not settled, tried again at the next start: {why}")
-        }
+        ClaimOutcome::NotAccepted { loss, attempts } => loss.not_accepted(*attempts),
+        ClaimOutcome::NotSent(why) => format!("purchase {id}, record {index}: not sent: {why}"),
+        ClaimOutcome::Failed(why) => format!(
+            "purchase {id}, record {index}: not claimed, tried again at the next start: {why}"
+        ),
     }
 }
 
-/// Settle the PSP's open payments (see `mint_info::psp_reconcile`), checking the
-/// PSP's network first when there is something to send. What has nothing due is
-/// said even when the PSP cannot be reached.
-fn reconcile_psp(
+/// Claim the PSP mint's owed records (see `mint_info::psp_claim`), checking the
+/// PSP mint's network first when there is something to send.
+fn claim_records(
     wallet: &mut Wallet,
-) -> Result<Vec<ecash_wallet::mint_info::ReconcileReport>, WalletError> {
-    let mut reports = ecash_wallet::mint_info::psp_nothing_due(wallet)?;
-    let sendable = wallet
-        .open_reconciliations(now_secs())
-        .iter()
-        .any(|o| o.state != ecash_wallet::psp::ReconcileStatus::NothingDue);
-    if sendable {
-        air_settings().require().map_err(WalletError::Invalid)?;
-        psp_base(wallet)?;
-        reports.extend(ecash_wallet::mint_info::psp_reconcile(
-            wallet,
-            &air_settings(),
-        )?);
+) -> Result<Vec<ecash_wallet::mint_info::ClaimReport>, WalletError> {
+    if wallet.open_claims(now_secs()).is_empty() {
+        return Ok(Vec::new());
     }
-    Ok(reports)
+    air_settings().require().map_err(WalletError::Invalid)?;
+    psp_base(wallet)?;
+    ecash_wallet::mint_info::psp_claim(wallet, &air_settings())
 }
 
-/// At startup, and before anything is read: close the reconciliation window of
-/// the payments whose `open_until` has passed. Each one that still has a saved
-/// request gets it sent one last time, identical (the PSP answers it even after
-/// the deadline); an answer settles the payment. What is left is forgotten, with
-/// its key: the PSP forfeits a payment still open then, so nothing can come for
-/// it. A payment whose last resend could not be sent (the AIR settings are
-/// missing, or the AIR server cannot be reached) is not forgotten: it is kept
-/// and closed at the next start. Says what it settled, what it kept and what it
-/// deleted; changes nothing otherwise.
+/// At startup, and before anything is read: close the claim window of the records
+/// whose window has passed. Each one that still has a saved claim gets it sent one
+/// last time, identical (the PSP mint answers it even after the deadline); an
+/// answer settles the record. What is left is forgotten: the PSP mint keeps a
+/// payment that is still unclaimed then, so nothing can come for it, and a
+/// purchase's key goes once every record of it is past its window. A record whose
+/// last resend could not be sent (the AIR settings are missing, or the AIR server
+/// cannot be reached) is not forgotten: it is kept and closed at the next start.
+/// Says what it settled, what it kept and what it lost; changes nothing otherwise.
 fn close_expired_psp(wallet: &mut Wallet) {
-    use ecash_wallet::mint_info::Reconciled;
+    use ecash_wallet::mint_info::ClaimOutcome;
     match ecash_wallet::mint_info::psp_close_expired(wallet, &air_settings(), now_secs()) {
         Ok(closed) => {
             for r in &closed.reports {
                 match &r.what {
-                    Reconciled::Failed(why) => eprintln!(
-                        "psp: purchase {}: the last resend before the window closed failed: {why}",
-                        r.id
+                    ClaimOutcome::Failed(why) => eprintln!(
+                        "psp: purchase {}, record {}: the last resend before the window closed failed: {why}",
+                        r.id, r.index
                     ),
-                    _ => eprintln!("psp: {}", reconcile_line(r)),
+                    _ => eprintln!("psp: {}", claim_line(r)),
                 }
             }
             for r in &closed.kept {
-                let (Reconciled::Failed(why) | Reconciled::NotSent(why)) = &r.what else {
+                let (ClaimOutcome::Failed(why) | ClaimOutcome::NotSent(why)) = &r.what else {
                     continue;
                 };
                 eprintln!(
-                    "psp: purchase {}: its window has closed, and the last resend of its request could not be sent ({why}). The payment is kept, and the resend is tried again at the next start",
-                    r.id
+                    "psp: purchase {}, record {}: its window has closed, and the last resend of its claim could not be sent ({why}). The purchase is kept, and the resend is tried again at the next start",
+                    r.id, r.index
                 );
             }
             for loss in closed.lost {
-                eprintln!("psp: {}", loss.forfeited());
+                eprintln!("psp: {}", loss.said());
             }
         }
-        Err(e) => eprintln!("psp: closed purchases not deleted, retried on the next run: {e}"),
+        Err(e) => eprintln!("psp: closed records not deleted, retried on the next run: {e}"),
     }
 }
 
@@ -625,52 +596,70 @@ fn claim_psp(wallet: &mut Wallet, mut args: Args, start: Startup) -> Result<(), 
     };
     if args.flag("--file")?.is_some() || !args.0.is_empty() {
         return Err(WalletError::Invalid(
-            "claim-psp takes no signatures any more (no --file, no standard input, no pairs). The PSP writes each purchase's signatures to the AIR server and this command reads them: run it with nothing, or with --wait SECONDS"
+            "claim-psp takes no signatures any more (no --file, no standard input, no pairs). The PSP mint writes what each purchase is owed to the AIR server and this command reads it and claims it: run it with nothing, or with --wait SECONDS"
                 .into(),
         ));
     }
     start.run_for_claim(wallet);
-    if wallet.pending_purchases().is_empty() && wallet.open_reconciliations(now_secs()).is_empty() {
+    if wallet.claim_keys().is_empty() {
         println!("no pending purchases");
         return Ok(());
     }
-    // Only a purchase with a record still to read needs the PSP's address.
-    if wallet.pending_purchases().iter().any(|p| p.open.is_none()) {
-        psp_base(wallet)?;
-    }
+    air_settings().require().map_err(WalletError::Invalid)?;
+    psp_base(wallet)?;
     let picked = ecash_wallet::mint_info::psp_pickup(wallet, &air_settings(), wait)?;
-    let mut not_done = 0;
-    for p in &picked {
-        println!("{}", pickup_line(p));
-        if !matches!(
-            p.what,
-            ecash_wallet::mint_info::Pickup::Claimed(_)
-                | ecash_wallet::mint_info::Pickup::Open(_)
-                | ecash_wallet::mint_info::Pickup::StillOpen(_)
-        ) {
-            not_done += 1;
+    let expired = expire_unpaid(wallet, &picked, "");
+    let mut said = !expired.is_empty();
+    let mut no_record = 0;
+    for p in picked.iter().filter(|p| !expired.contains(&p.id)) {
+        for line in pickup_lines(p, true) {
+            println!("{line}");
+            said = true;
+        }
+        if p.no_record {
+            no_record += 1;
         }
     }
-    // What the pickup opened (and the credits) are settled now.
-    let mut unsettled = 0;
-    for r in reconcile_psp(wallet)? {
-        println!("{}", reconcile_line(&r));
-        if !matches!(
-            r.what,
-            ecash_wallet::mint_info::Reconciled::Settled(_)
-                | ecash_wallet::mint_info::Reconciled::NothingDue(_)
-        ) {
-            unsettled += 1;
+    let mut unclaimed = 0;
+    let reports = claim_records(wallet)?;
+    for r in &reports {
+        println!("{}", claim_line(r));
+        said = true;
+        if !matches!(r.what, ecash_wallet::mint_info::ClaimOutcome::Claimed(_)) {
+            unclaimed += 1;
         }
     }
-    if not_done > 0 {
+    // What is owed and was not claimed or said above (the AIR server could not be
+    // reached part way): with the date its window ends.
+    for open in wallet.open_claims(now_secs()) {
+        if reports
+            .iter()
+            .any(|r| r.id == open.id && r.index == open.index)
+        {
+            continue;
+        }
+        println!(
+            "purchase {}, record {} (payment {}): {} PSP owed, not claimed yet. It can be claimed until {}",
+            open.id,
+            open.index,
+            open.txid,
+            open.due_units,
+            format_utc(open.window_ends)
+        );
+        said = true;
+        unclaimed += 1;
+    }
+    if !said {
+        println!("nothing to claim");
+    }
+    if no_record > 0 {
         return Err(WalletError::Unknown(format!(
-            "{not_done} purchase(s) are not picked up (waited {wait} s)"
+            "{no_record} purchase(s) have no record from the PSP mint yet (waited {wait} s)"
         )));
     }
-    if unsettled > 0 {
+    if unclaimed > 0 {
         return Err(WalletError::Unknown(format!(
-            "{unsettled} payment(s) are not settled yet"
+            "{unclaimed} record(s) are not claimed yet"
         )));
     }
     Ok(())
@@ -1130,9 +1119,6 @@ fn balance(wallet: &mut Wallet, args: Args, start: Startup) -> Result<(), Wallet
     start.run(wallet);
     let b = wallet.balance();
     println!("psp  {}", b.psp);
-    if let Some(line) = wallet.pending_psp_credit(now_secs()).balance_line() {
-        println!("       {line}");
-    }
     println!("esp  {}", b.esp);
     for ((service, day), units) in &b.esp_by_terms {
         println!("       {units} for {service}, redeemable after day {day}");
@@ -1167,12 +1153,26 @@ fn balance(wallet: &mut Wallet, args: Args, start: Startup) -> Result<(), Wallet
         "notes {} ({} held for a pending request)",
         b.notes, b.reserved
     );
-    for p in wallet.pending_purchases() {
-        println!(
-            "pending purchase {} ({} output(s) unsigned)",
-            p.id,
-            p.outputs.len()
-        );
+    let now = now_secs();
+    for k in wallet.claim_keys() {
+        let owed: Vec<_> = k
+            .records
+            .iter()
+            .filter(|r| !r.done && r.is_open(now))
+            .collect();
+        if k.records.is_empty() {
+            println!(
+                "pending purchase {} (no record from the PSP mint yet)",
+                k.id
+            );
+        } else if !owed.is_empty() {
+            println!(
+                "pending purchase {} ({} PSP owed in {} record(s), not claimed yet)",
+                k.id,
+                owed.iter().map(|r| u128::from(r.due_units)).sum::<u128>(),
+                owed.len()
+            );
+        }
     }
     for p in wallet.pending_exchanges() {
         println!("pending exchange {}", p.id);
@@ -1641,8 +1641,13 @@ fn merge_command(wallet: &mut Wallet, args: Args, start: Startup) -> Result<(), 
     start.run(wallet);
     let r = wallet.merge_file(std::path::Path::new(path))?;
     println!(
-        "merged {path}: {} note(s) added, {} removed because the other copy spent them, {} pending request(s) added, {} ended; version {}",
-        r.notes_added, r.notes_removed, r.requests_added, r.requests_dropped, r.version
+        "merged {path}: {} note(s) added, {} removed because the other copy spent them, {} pending request(s) added, {} ended, {} purchase key(s) added; version {}",
+        r.notes_added,
+        r.notes_removed,
+        r.requests_added,
+        r.requests_dropped,
+        r.claim_keys_added,
+        r.version
     );
     println!("Save this wallet back to storage: it is now the current copy.");
     Ok(())
@@ -1691,61 +1696,55 @@ fn startup_rotation_sync(wallet: &mut Wallet) {
     }
 }
 
-/// At startup: delete what a closed window leaves, then pick up what the PSP has
-/// delivered for purchases that are waiting (one read, no waiting; `claim-psp`
-/// waits). A purchase that is not there yet, or is open from an earlier run, is
-/// not mentioned. A missing `air.server` or `air.host` is said, as a note.
-fn startup_psp_pickup(wallet: &mut Wallet) {
+/// At startup: delete what a closed window leaves, then read the next record of
+/// each purchase (one read, no waiting; `claim-psp` waits for the first record of
+/// a purchase) and claim what is owed. A purchase with no record yet, and a claim
+/// that is waiting for the PSP mint's answer, are not mentioned (the same claim is
+/// sent again at the next start). A missing `air.server` or `air.host` is said, as
+/// a note.
+fn startup_psp(wallet: &mut Wallet) {
     close_expired_psp(wallet);
-    let waiting = wallet
-        .pending_purchases()
-        .iter()
-        .filter(|p| p.open.is_none())
-        .count();
-    if waiting == 0 {
+    let purchases = wallet.claim_keys().len();
+    if purchases == 0 {
         return;
     }
     let air = air_settings();
     if let Err(e) = air.require() {
         eprintln!(
-            "psp: {waiting} purchase(s) are waiting for the PSP's delivery, which is not checked: {e}"
+            "psp: {purchases} purchase(s) are held, and the PSP mint's records for them are not checked: {e}"
         );
         return;
     }
     match ecash_wallet::mint_info::psp_pickup(wallet, &air, 0) {
         Ok(picked) => {
-            for p in &picked {
-                use ecash_wallet::mint_info::Pickup;
-                if !matches!(p.what, Pickup::NotThere | Pickup::StillOpen(_)) {
-                    eprintln!("psp: {}", pickup_line(p));
+            let expired = expire_unpaid(wallet, &picked, "psp: ");
+            for p in picked.iter().filter(|p| !expired.contains(&p.id)) {
+                for line in pickup_lines(p, false) {
+                    eprintln!("psp: {line}");
                 }
             }
         }
         Err(e) => {
-            eprintln!("psp: the PSP's deliveries were not checked, retried on the next run: {e}")
+            eprintln!("psp: the PSP mint's records were not checked, retried on the next run: {e}");
+            return;
         }
     }
-}
-
-/// At startup, right after the pickup: settle the PSP's open payments (a held or
-/// rejected purchase, a credit) with the reconciliation request each one's rules
-/// call for. Nothing is asked when none is open, and a payment that is waiting
-/// for the PSP's answer is not mentioned (the same request is sent again at the
-/// next start). A missing `air.server` or `air.host` is said, as a note.
-fn startup_psp_reconcile(wallet: &mut Wallet) {
-    match reconcile_psp(wallet) {
+    match claim_records(wallet) {
         Ok(reports) => {
             for r in &reports {
-                if !matches!(r.what, ecash_wallet::mint_info::Reconciled::Waiting { .. }) {
-                    eprintln!("psp: {}", reconcile_line(r));
+                if !matches!(
+                    r.what,
+                    ecash_wallet::mint_info::ClaimOutcome::Waiting { .. }
+                ) {
+                    eprintln!("psp: {}", claim_line(r));
                 }
             }
         }
         Err(e @ WalletError::Invalid(_)) => {
-            eprintln!("psp: the payments waiting to be settled were not checked: {e}")
+            eprintln!("psp: the records waiting to be claimed were not checked: {e}")
         }
         Err(e) => eprintln!(
-            "psp: the payments waiting to be settled were not checked, retried on the next run: {e}"
+            "psp: the records waiting to be claimed were not checked, retried on the next run: {e}"
         ),
     }
 }
@@ -2037,13 +2036,13 @@ fn run(raw: Vec<String>) -> Result<(), WalletError> {
     }
     let settings = loaded.settings;
     let _ = AIR.set(settings.air.clone());
+    let _ = UNPAID_KEY_DAYS.set(settings.psp_unpaid_key_days);
     // AIR on with a built-in PLACEHOLDER DID (the PSP's, the ESP's) must never
     // pass silently.
     for warning in settings.air.placeholder_warnings() {
         eprintln!("{warning}");
     }
     let mut wallet = Wallet::open(&path, network())?;
-    wallet.set_psp_min_purchase(settings.psp.min_purchase)?;
     // The startup steps use the network, so a command runs them itself once its
     // own arguments are read and checked: a user error never waits on the network.
     let start = Startup::new();

@@ -112,7 +112,9 @@ In T1, `curl -s http://127.0.0.1:3100/health` returns `"status":"ok"` and `"wire
 
 ### 5. Build the purchase payload (T4)
 
-Run this once. A second run makes a second pending purchase in the wallet file.
+Run this once. A second run makes a second purchase (a second claim key) in the wallet file.
+
+**Wire version 4 (sp-wire 0.6.0), not rerun.** A purchase has no amount: `buy-psp --mint-key HEX` makes a claim key of its own and a 33-byte payload, and prints the advice to pay it once and to buy at least $5 (50 PSP). The PSP mint writes an owed record, and `claim-psp` claims it (kind 15) for what is due after the fees. The sizes, counts and balances shown in steps 5 to 12 and 23 to 25 are from the wire version 3 run, when a purchase named its notes; they are not what wire version 4 prints (a payment of $0.50 buys little or nothing after the fees), and are marked not rerun until the walkthrough is run again with a payment of $5 (50 PSP) or more.
 
 ```
 cd ~/ecash-wallet
@@ -121,12 +123,11 @@ MINT_KEY=$(cd ~/psp-mint && cargo run -q -- --regtest pubkey)
 ESP_DID=$(cd ~/esp-mint && ESP_NETWORK=regtest cargo run -q -- pubkey)
 export ECASH_AIR_SERVER=$AIR_SERVER ECASH_AIR_HOST=127.0.0.1 ECASH_AIR_PSP_DID=$MINT_KEY ECASH_AIR_ESP_DID=$ESP_DID
 echo ${#MINT_KEY}
-# this walkthrough buys 5 PSP on purpose, below the 50 PSP default of psp.min_purchase
-HEX=$(ECASH_PSP_MIN_PURCHASE=5 cargo run -q -- --regtest buy-psp --mint-key $MINT_KEY 4 1)
+HEX=$(cargo run -q -- --regtest buy-psp --mint-key $MINT_KEY)
 echo ${#HEX}
 ```
 
-The wallet takes both mints' DIDs from the settings (the built-in ones are placeholders until the first SPI deploy). `esp-mint pubkey` takes its network from `ESP_NETWORK`: without it, it makes and prints a mainnet DID (and a mainnet key file under `~/.esp-mint/main`), which is the wrong DID here. It says its network on standard error and prints only the DID on standard output, so `$(…)` takes just the DID. Expected: `66` (the mint's public key in hex), then `purchase <id>` and `197 bytes. Put the hex below in an OP_RETURN and pay the PSP.` and a sentence saying the notes arrive over AIR (both on standard error, so they show on the screen but are not in `HEX`), then `394`. A payload of a 4 and a 1 is 197 bytes (the encryption adds 82), 394 hex characters (the 2026-10-22 run; the earlier 199 and 398 were for the old wire).
+The wallet takes both mints' DIDs from the settings (the built-in ones are placeholders until the first SPI deploy). `esp-mint pubkey` takes its network from `ESP_NETWORK`: without it, it makes and prints a mainnet DID (and a mainnet key file under `~/.esp-mint/main`), which is the wrong DID here. It says its network on standard error and prints only the DID on standard output, so `$(…)` takes just the DID. Expected: `66` (the mint's public key in hex), then, on standard error, `purchase <id>`, the advice to pay the payload once, the `N bytes. Put the hex below in an OP_RETURN of a Bitcoin payment to the PSP mint's wallet…` line and the recommendation of at least $5 (50 PSP); standard output, and so `HEX`, is the payload alone, twice the byte count in hex characters. The payload is the purchase's claim key and nothing else, so the size is not the 197 bytes of the wire version 3 run; the new size was **not run**.
 
 ### 6. Pay the PSP (T4)
 
@@ -256,7 +257,7 @@ There is no change line, because the 1 PSP note is exactly the amount asked for.
 
 - If `exchange` times out, run it again with `--resume <id>` (the id was printed). It sends the same request and gets the same answer, and nothing is burned twice.
 - The PSP writes each payer's signatures to a record only that payer can find, so `claim-psp` reads its own purchases' records and no one else's. Any wallet command also picks up a delivery when it starts, so the line above may be printed by the command that ran first, and `claim-psp` then says there is nothing pending.
-- A payment the PSP holds (paid, but short beyond its reconciliation target) or rejects is delivered too, so the wallet shows `the PSP is holding the payment` or `the PSP rejected it`, with what was paid and the time it stays open until, and keeps the purchase and its key. The wallet settles it by itself at every start, right after the pickup, with a reconciliation request (AIR kind 15) built from the rules in the PSP's record, and prints what came of it (this was built after the runs in this file and has not been run on regtest). When the time passes with the payment still open, the PSP forfeits it and the next wallet command says `The PSP forfeited the payment: the funds are lost`, with the amount, and deletes the purchase and the key. `buy-psp` also prints `ONE-TIME USE`: pay a payload once. The PSP's window is `PSP_RECONCILIATION_WINDOW_DAYS` (14); set `1` on the PSP to see it close sooner.
+- Under wire version 4 the PSP mint writes an owed record for every payment it settles (nothing is held or rejected for the wallet to settle by a request of its own), and the wallet claims it with a kind 15 claim signed by the purchase's claim key (built after the runs in this file and **not run** on regtest). A record's window is `sp_wire::psp::CLAIM_WINDOW_SECS` (30 days) from the wallet's first read of it, and is not a setting, so the close cannot be run in a short test. If the window closes with the record unclaimed, the next wallet command says the PSP mint keeps the payment and the funds are lost, with the amount, and deletes the claim key. `buy-psp` also tells the user to pay a payload once.
 - Test teardown: stop the servers with Ctrl-C in T2 and T3, and the node with `$CLI stop`. (Stopping is for this regtest only; on an SPI a mint is stopped only for an upgrade or for a setting that needs a restart, each a brief downtime that `spi upgrade` or `spi restart` warns about and asks you to confirm.)
 
 ## Regtest, restart on the new build
@@ -337,12 +338,11 @@ The pattern `esp-mint serve` matches a debug and a release build alike (`target/
 cd ~/ecash-wallet
 MINT_KEY=$(cd ~/psp-mint && cargo run -q -- --regtest pubkey 2>/dev/null)
 echo ${#MINT_KEY}
-# 3 PSP is below the 50 PSP default of psp.min_purchase; lowered for this command only
-HEX=$(ECASH_PSP_MIN_PURCHASE=3 cargo run -q -- --regtest buy-psp --mint-key $MINT_KEY 2 1)
+HEX=$(cargo run -q -- --regtest buy-psp --mint-key $MINT_KEY)
 echo ${#HEX}
 ```
 
-Expected: `66`, `purchase <id>`, `205 bytes. Put the hex below in an OP_RETURN and pay the PSP.` and a sentence saying the notes arrive over AIR, and `410` (a payload of a 2 and a 1 is 205 bytes, not the 197 of step 5). The purchase is 3 PSP and not 2 because of the dust limit: Bitcoin Core will not send an output below 294 sats (for this address type), which is about $0.24 at this price, so 2 PSP ($0.20) could only be paid by overpaying. 3 PSP ($0.30) is paid with 368 sats. `2>/dev/null` hides the banner `pubkey` prints on standard error.
+Expected: `66`, then on standard error `purchase <id>` and the same advice as step 5, and the payload in `HEX` (size **not run**). Bitcoin Core will not send an output below 294 sats (for this address type), which is about $0.24 at this price, so a payment of 3 PSP ($0.30) is paid with 368 sats. Under wire version 4 that payment is below the recommended $5: the PSP mint's fees come out of it, and the step is kept as the wire version 3 run recorded it. `2>/dev/null` hides the banner `pubkey` prints on standard error.
 
 ### 24. Pay and settle (T4)
 

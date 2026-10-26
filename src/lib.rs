@@ -12,13 +12,13 @@
 //!   service that FSP fees are paid to.
 //! - [`store`]: the note file, which holds each note with its spend key, amount
 //!   and terms, and the requests waiting for a reply.
-//! - [`psp`]: buying PSP (`build_psp_payload`, `apply_delivery`): each purchase has a
-//!   one-off reply key of its own, and the PSP delivers the signatures over AIR.
-//!   A purchase the PSP holds or rejects, and a credit it owes, is settled with a
-//!   reconciliation request (AIR kind 15) the wallet builds from the PSP's rules
-//!   (`build_reconcile`, `apply_reconcile`, `open_reconciliations`, and
-//!   `mint_info::psp_reconcile` for the whole step). `psp.min_purchase` is the
-//!   smallest purchase the wallet builds.
+//! - [`psp`]: buying PSP and claiming it (`build_psp_payload`, `apply_delivery`,
+//!   `build_claim`, `apply_claim`): each purchase has a throwaway claim key of its
+//!   own, and its payload is that key alone, with no amount. The PSP mint writes an
+//!   owed record for each payment over AIR, and the wallet claims it with a claim
+//!   (AIR kind 15) it builds when it claims, for exactly the units owed
+//!   (`mint_info::psp_pickup` and `mint_info::psp_claim` for the whole step). A
+//!   purchase of at least $5 (50 PSP) is recommended, and nothing enforces it.
 //! - [`split`]: ESP note sizes are powers of two; totals are split into them.
 //! - [`esp`]: exchanging PSP for ESP (`build_exchange`, `finish_exchange`).
 //! - [`transfer`]: the service taking in the ESP an FSP mint kept for it

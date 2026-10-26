@@ -9,19 +9,18 @@ mod common;
 use std::path::Path;
 use std::sync::Arc;
 
-use ecash_wallet::mint_info::{psp_post, psp_window, rotation_sync};
-use ecash_wallet::psp::Delivered;
+use ecash_wallet::mint_info::{
+    ClaimOutcome, psp_claim, psp_pickup, psp_post, psp_window, rotation_sync,
+};
 use ecash_wallet::store::{HandedNote, Handover, WalletData};
 use ecash_wallet::{Kind, Wallet, WalletError};
 use esp_mint::config::Config;
 use psp_mint::settle::Settlement;
 use secp256k1::{Keypair, SECP256K1};
 use sp_wire::ServiceDid;
-use sp_wire::air_request::delivery::Outcome;
-use sp_wire::seal::SecretKey as DidKey;
 
 use common::air::{EspAt, PspUp};
-use common::{EspMint, NoPsp, PspMint, T0 as T, esp_record, open_wallet, psp_record, scratch};
+use common::{EspMint, NoPsp, T0 as T, esp_record, open_wallet, psp_record, scratch};
 
 const H: u64 = 3600;
 /// Past the stagger window of a 1-hour period (0.5% = 18 s, and a swap time is
@@ -261,74 +260,73 @@ fn esp_rolls_over_keeping_its_service_and_day() {
     assert_eq!(w.swap_schedule_len(), 0);
 }
 
-/// Settle one purchase at the PSP's current set, as psp-mint's service does,
-/// and return what it stores for the payer: the outcome that goes to the payer's
-/// AIR record. 5,000 sats at $10,000 a BTC is exactly 5 PSP.
-fn settle_now(m: &PspMint, key: &DidKey, txid: &str, sats: u64, payload: Vec<u8>) -> Outcome {
-    let settled = m.pay(key, txid, sats, payload);
-    assert!(matches!(settled, Settlement::Issued(_)), "{settled:?}");
-    m.delivery_of(txid)
-}
-
 #[test]
-fn purchases_around_a_psp_rotation_are_claimed_with_the_keys_of_the_set_that_signed() {
+fn a_note_claimed_after_a_psp_rotation_is_on_the_current_set_and_is_not_rolled_over() {
     let dir = scratch("psp-claim");
     let m = PspUp::start(&dir.join("psp"), T);
-    // The first issuance starts the mint's rotation clock (at `T`): its first
-    // set rotates an hour after it.
-    m.note(1);
-    let mint_key = DidKey::new();
-    let mut w = open_wallet(&dir.join("w.json")).unwrap();
-    // Both purchases are prepared before the rotation; `a` is settled before
-    // it, `b` after it.
-    let a = w.build_psp_payload(&[64], &mint_key.public_key()).unwrap();
-    let b = w
-        .build_psp_payload(&[32, 16, 2], &mint_key.public_key())
-        .unwrap();
+    // A note of the first set, issued at `T`: that starts the mint's rotation
+    // clock, so its first set rotates an hour after it.
+    let old_note = m.note(2);
+    let mut w = m.wallet(&dir, "w", vec![old_note.clone()]);
+    let mint_key = m.at.key();
+    let build = w.build_psp_payload(&mint_key.public_key()).unwrap();
     let air = m.air();
     let old = psp_window(&mut w, &air).unwrap().current_id;
-    let out_a = settle_now(&m, &mint_key, "aa", 64_000, a.payload);
 
+    // 64,000 sats at $10,000 a BTC are 64 units, and the fees come off: 64 - 4 = 60
+    // are owed. The record is written before the rotation, the claim is made after
+    // it.
+    let settled = m.pay(&mint_key, "aa", 64_000, build.payload);
+    assert!(matches!(settled, Settlement::Owed(_)), "{settled:?}");
+    assert_eq!(m.deliver().delivered, 1);
     m.set_clock(T + H);
     let win = psp_window(&mut w, &air).unwrap();
+    assert_eq!((win.current_epoch, win.previous_epoch), (1, Some(0)));
     assert_ne!(win.current_id, old);
-    let out_b = settle_now(&m, &mint_key, "bb", 50_000, b.payload);
 
-    // Each record names the set that signed it ...
-    let named = |out: &Outcome| match out {
-        Outcome::Signed(s) => s.clone(),
-        other => panic!("expected signatures, got {other:?}"),
+    let found = psp_pickup(&mut w, &air, 0).unwrap();
+    assert_eq!(found[0].new.len(), 1);
+    let reports = psp_claim(&mut w, &air).unwrap();
+    let [report] = &reports[..] else {
+        panic!("one record: {reports:?}");
     };
-    assert_eq!(named(&out_a).keyset, old);
-    assert_eq!(named(&out_b).keyset, win.current_id);
-    // ... and carries that set's keys, so each is claimed from the record alone
-    // (no keys call): `a` with the old set's, though the current set is
-    // another.
-    for (id, out) in [(&a.id, &out_a), (&b.id, &out_b)] {
-        assert!(matches!(
-            w.apply_delivery(id, out).unwrap(),
-            Delivered::Claimed(_)
-        ));
+    // 32 + 16 + 8 + 4 = 60
+    assert!(matches!(&report.what, ClaimOutcome::Claimed(s) if s.units == 60));
+
+    // The claim names the set that is current when it is sent, so every fresh note
+    // is on it, stamped with its epoch; the first note is still on the old set.
+    let fresh: Vec<_> = w
+        .notes()
+        .iter()
+        .filter(|n| n.amount != 2)
+        .cloned()
+        .collect();
+    let mut sizes: Vec<u64> = fresh.iter().map(|n| n.amount).collect();
+    sizes.sort_unstable();
+    assert_eq!(sizes, vec![4, 8, 16, 32]);
+    for n in &fresh {
+        assert_eq!(w.psp_keyset_of(n).unwrap(), win.current_id);
+        assert_eq!(w.epoch_of(n), Some(1));
     }
-    assert_eq!(w.balance().psp, 114);
-    let by_amount = |units: u64| {
-        w.notes()
-            .iter()
-            .find(|n| n.amount == units)
-            .unwrap()
-            .clone()
-    };
-    assert_eq!(w.psp_keyset_of(&by_amount(64)).unwrap(), old);
-    assert_eq!(w.psp_keyset_of(&by_amount(32)).unwrap(), win.current_id);
-    // The notes are good: the previous-set note rolls over to the current set.
+    assert_eq!(w.psp_keyset_of(&old_note).unwrap(), old);
+    // The first note was never stamped (only a rollover pass stamps, and none has
+    // run yet): rotate.rs treats an unstamped note as previous-set.
+    assert_eq!(w.epoch_of(&old_note), None);
+    assert_eq!(w.balance().psp, 62);
+
+    // The rollover rolls the previous-set note and leaves the fresh ones alone.
     rotation_sync(&mut w, &air, Kind::Psp, &psp_record(&air)).unwrap();
     m.set_clock(T + H + LATER);
     let log = rotation_sync(&mut w, &air, Kind::Psp, &psp_record(&air)).unwrap();
     assert!(
-        log.iter().any(|l| l.contains("rolled over 1 note")),
+        log.iter().any(|l| l.contains("rolled over 1 note(s)")),
         "{log:?}"
     );
-    assert_eq!(w.balance().psp, 114);
+    assert!(m.spent(&old_note));
+    for n in &fresh {
+        assert!(!m.spent(n), "a fresh note of {} units was rolled", n.amount);
+    }
+    assert_eq!(w.balance().psp, 62);
 }
 
 #[test]

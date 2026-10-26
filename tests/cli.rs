@@ -149,7 +149,7 @@ fn notes_wallet(path: &Path, network: &str) {
 fn wallet_with_waiting_purchase(dir: &Path) -> PathBuf {
     let path = wallet_with_notes(dir);
     let mut w = Wallet::open(&path, NETWORK).unwrap();
-    w.build_psp_payload(&[32, 16, 2], &sp_wire::seal::SecretKey::new().public_key())
+    w.build_psp_payload(&sp_wire::seal::SecretKey::new().public_key())
         .unwrap();
     path
 }
@@ -180,7 +180,7 @@ fn the_removed_commands_say_what_replaced_them() {
 }
 
 #[test]
-fn buy_psp_refuses_a_missing_or_bad_key_a_bad_amount_and_the_removed_flag() {
+fn buy_psp_refuses_a_missing_or_bad_key_an_amount_and_the_removed_flags() {
     let dir = scratch("buy");
     let wallet = wallet_with_notes(&dir);
     let before = std::fs::read(&wallet).ok();
@@ -188,51 +188,48 @@ fn buy_psp_refuses_a_missing_or_bad_key_a_bad_amount_and_the_removed_flag() {
     refused(
         &wallet,
         &before,
-        &["buy-psp", "4"],
+        &["buy-psp"],
         &["--mint-key HEX is required"],
     );
     refused(
         &wallet,
         &before,
-        &["buy-psp", "--mint-key", "not-a-key", "4"],
+        &["buy-psp", "--mint-key", "not-a-key"],
         &["not a public key"],
+    );
+    // the payload names no amount, so an amount is refused, with what replaced it
+    refused(
+        &wallet,
+        &before,
+        &["buy-psp", "--mint-key", &key, "4"],
+        &[
+            "buy-psp takes no AMOUNT any more",
+            "the PSP mint decides what the payment is worth",
+        ],
     );
     refused(
         &wallet,
         &before,
         &["buy-psp", "--mint-key", &key, "four"],
-        &["an amount must be a whole number, got `four`"],
+        &["buy-psp: unexpected argument `four`"],
     );
-    refused(
-        &wallet,
-        &before,
-        &["buy-psp", "--mint-key", &key, "0"],
-        &["0 is not a PSP note size: use a power of two"],
-    );
-    // `--sync` asks the PSP over AIR, but only after every flag has been read:
-    // these are refused for their own faults, not for the missing AIR settings.
-    refused(
-        &wallet,
-        &before,
-        &["buy-psp", "--sync", "--mint-key", "not-a-key", "4"],
-        &["not a public key"],
-    );
+    // `--sync` is gone: the payload names no keyset, so there is nothing to sync
     refused(
         &wallet,
         &before,
         &["buy-psp", "--sync", "--mint-key", &key],
-        &["a purchase needs at least one output"],
+        &["--sync was removed", "claim-psp"],
     );
     refused(
         &wallet,
         &before,
-        &["buy-psp", "--sync", "--mint-key", &key, "0"],
-        &["0 is not a PSP note size: use a power of two"],
+        &["buy-psp", "--sync", "--mint-key", "not-a-key"],
+        &["--sync was removed"],
     );
     refused(
         &wallet,
         &before,
-        &["buy-psp", "--mint-key", &key, "--reply-did", "02ab", "4"],
+        &["buy-psp", "--mint-key", &key, "--reply-did", "02ab"],
         &["--reply-did was removed", "claim-psp"],
     );
 }
@@ -740,89 +737,25 @@ fn a_wallet_file_of_another_network_or_with_no_network_is_refused_and_left_alone
     );
 }
 
-#[test]
-fn buy_psp_below_the_minimum_is_refused_naming_the_setting_before_any_network() {
-    let dir = scratch("buy-minimum");
-    let wallet = wallet_with_notes(&dir);
-    let before = std::fs::read(&wallet).ok();
-    let key = mint_key_hex();
-    let below = [
-        "buy-psp: a purchase of 49 PSP is below the minimum of 50 PSP",
-        "psp.min_purchase",
-        "ECASH_PSP_MIN_PURCHASE",
-        "100 PSP is a realistic purchase",
-    ];
-    refused(
-        &wallet,
-        &before,
-        &["buy-psp", "--mint-key", &key, "32", "16", "1"],
-        &below,
-    );
-    // the total is what counts, however it is split
-    refused(
-        &wallet,
-        &before,
-        &["buy-psp", "--mint-key", &key, "16", "16", "16", "1"],
-        &below,
-    );
-    // `--sync` asks the PSP, but only after the amounts have been checked: this
-    // wallet has no AIR settings, and it is the minimum that is named
-    refused(
-        &wallet,
-        &before,
-        &["buy-psp", "--sync", "--mint-key", &key, "32", "16", "1"],
-        &below,
-    );
-    // a higher setting moves the line
-    refused_env(
-        &wallet,
-        &before,
-        &[("ECASH_PSP_MIN_PURCHASE", "60")],
-        &["buy-psp", "--mint-key", &key, "32", "16", "2"],
-        &[
-            "a purchase of 50 PSP is below the minimum of 60 PSP",
-            "psp.min_purchase",
-        ],
-    );
-    // and so does one in the config file
-    let config = dir.join("config.toml");
-    std::fs::write(&config, "[psp]\nmin_purchase = 64\n").unwrap();
-    let path = config.to_string_lossy().to_string();
-    refused(
-        &wallet,
-        &before,
-        &[
-            "--config",
-            &path,
-            "buy-psp",
-            "--mint-key",
-            &key,
-            "32",
-            "16",
-            "2",
-        ],
-        &["a purchase of 50 PSP is below the minimum of 64 PSP"],
-    );
-}
+/// What `buy-psp` says about the size of a purchase, written out: a change to the
+/// words is a change to this line.
+const RECOMMENDATION: &str = "We recommend a PSP purchase of at least $5 (50 PSP): the PSP mint's fees come out of what a payment buys, so a smaller payment can buy little or nothing. This is a recommendation; nothing enforces it.";
+
+/// What `buy-psp` says about paying the payload, written out.
+const PAY_ONCE_TEXT: &str = "Pay this payload once. Each purchase has a key of its own so the PSP mint cannot link your purchases; a second payment to the same payload is still owed to you and claimed with the first, but it links the two.";
 
 #[test]
-fn buy_psp_prints_the_one_time_use_warning_with_the_purchase_id_and_the_hex() {
+fn buy_psp_says_pay_once_and_recommends_five_dollars_and_nothing_enforces_it() {
     let dir = scratch("buy-warning");
     // no wallet file yet: nothing is waiting, so nothing is asked of the network
     let wallet = dir.join("wallet.json");
     let key = mint_key_hex();
-    let r = run(&wallet, &["buy-psp", "--mint-key", &key, "32", "16", "2"]);
+    let r = run(&wallet, &["buy-psp", "--mint-key", &key]);
     assert!(r.ok, "{}", r.stderr);
-    let warning = ecash_wallet::psp::ONE_TIME_USE;
-    assert!(r.stderr.contains(warning), "{}", r.stderr);
-    // the purchase's id is said, then the warning, then the payload on stdout
     let w = Wallet::open(&wallet, NETWORK).unwrap();
-    let [purchase] = w.pending_purchases() else {
+    let [purchase] = w.claim_keys() else {
         panic!("one purchase was saved");
     };
-    let id_at = r.stderr.find(&format!("purchase {}", purchase.id));
-    let warning_at = r.stderr.find(warning);
-    assert!(id_at.is_some() && id_at < warning_at, "{}", r.stderr);
     let hex_out = r.stdout.trim();
     assert!(
         !hex_out.is_empty() && hex::decode(hex_out).is_ok(),
@@ -833,65 +766,69 @@ fn buy_psp_prints_the_one_time_use_warning_with_the_purchase_id_and_the_hex() {
         1,
         "standard output holds the hex and nothing else"
     );
+    // The lines, in order: the purchase, pay once, the bytes, the recommendation.
+    let bytes = format!(
+        "{} bytes. Put the hex below in an OP_RETURN of a Bitcoin payment to the PSP mint's wallet. Once the payment has its confirmations the PSP mint writes what you are owed over AIR: `claim-psp` reads it and claims your notes, and any command does so when it starts. Each payment's record must be claimed within 30 days of the PSP mint writing it.",
+        hex_out.len() / 2
+    );
+    let lines: Vec<&str> = r.stderr.lines().collect();
+    let at = |line: &str| lines.iter().position(|l| *l == line);
+    let id = at(&format!("purchase {}", purchase.id));
+    assert!(id.is_some(), "{}", r.stderr);
+    assert_eq!(at(PAY_ONCE_TEXT), id.map(|i| i + 1), "{}", r.stderr);
+    assert_eq!(at(&bytes), id.map(|i| i + 2), "{}", r.stderr);
+    assert_eq!(at(RECOMMENDATION), id.map(|i| i + 3), "{}", r.stderr);
+    // the claim key's secret is never printed
+    assert!(
+        !r.stderr.contains(&purchase.claim_secret) && !r.stdout.contains(&purchase.claim_secret)
+    );
 
-    // a lower setting is honoured: 4 PSP is a purchase when the minimum is 4
-    let r = run_env(
-        &wallet,
-        &[("ECASH_PSP_MIN_PURCHASE", "4")],
-        &["buy-psp", "--mint-key", &key, "4"],
-    );
+    // There is no minimum: a second purchase is built the same way, whatever the
+    // settings were (the setting that set one is gone).
+    let r = run(&wallet, &["buy-psp", "--mint-key", &key]);
     assert!(r.ok, "{}", r.stderr);
-    assert!(r.stderr.contains(warning), "{}", r.stderr);
-    assert_eq!(
-        Wallet::open(&wallet, NETWORK)
-            .unwrap()
-            .pending_purchases()
-            .len(),
-        2
+    assert!(
+        r.stderr.lines().any(|l| l == RECOMMENDATION),
+        "{}",
+        r.stderr
     );
-    // and 3 is not
-    let before = std::fs::read(&wallet).ok();
-    refused_env(
-        &wallet,
-        &before,
-        &[("ECASH_PSP_MIN_PURCHASE", "4")],
-        &["buy-psp", "--mint-key", &key, "2", "1"],
-        &["a purchase of 3 PSP is below the minimum of 4 PSP"],
-    );
+    let w = Wallet::open(&wallet, NETWORK).unwrap();
+    assert_eq!(w.claim_keys().len(), 2);
+    assert_ne!(w.claim_keys()[0].claim_did, w.claim_keys()[1].claim_did);
 }
 
+/// The words that refuse `psp.min_purchase`, written out.
+const MIN_PURCHASE_REMOVED: &str = "psp.min_purchase was removed in ecash-wallet 0.8.0: buy-psp takes no amounts, so there is no purchase size to check. We recommend a PSP purchase of at least $5 (50 PSP): the PSP mint's fees come out of what a payment buys, so a smaller payment can buy little or nothing. Nothing enforces it. Remove it";
+
 #[test]
-fn a_bad_psp_min_purchase_is_refused_by_the_settings_naming_it() {
-    let dir = scratch("min-purchase-bad");
+fn the_removed_psp_min_purchase_is_refused_with_the_removed_message() {
+    let dir = scratch("min-purchase-removed");
     let wallet = wallet_with_notes(&dir);
     let before = std::fs::read(&wallet).ok();
-    for bad in ["0", "-5", "many", "1.5"] {
+    // whatever the value was, it is refused: it is not read as a number
+    for value in ["20", "0", "many"] {
         refused_env(
             &wallet,
             &before,
-            &[("ECASH_PSP_MIN_PURCHASE", bad)],
+            &[("ECASH_PSP_MIN_PURCHASE", value)],
             &["balance"],
             &[
                 "settings:",
-                "ECASH_PSP_MIN_PURCHASE",
-                "psp.min_purchase",
-                "must be a whole number from 1 to",
+                "environment variable ECASH_PSP_MIN_PURCHASE: ",
+                MIN_PURCHASE_REMOVED,
             ],
         );
     }
     let config = dir.join("config.toml");
     let path = config.to_string_lossy().to_string();
-    std::fs::write(&config, "[psp]\nmin_purchase = 0\n").unwrap();
+    std::fs::write(&config, "[psp]\nmin_purchase = 64\n").unwrap();
     refused(
         &wallet,
         &before,
         &["--config", &path, "balance"],
-        &[
-            "settings:",
-            "psp.min_purchase",
-            "must be a whole number from 1 to",
-        ],
+        &["settings:", MIN_PURCHASE_REMOVED],
     );
+    // another key in the section is still just unknown
     std::fs::write(&config, "[psp]\nminimum = 5\n").unwrap();
     refused(
         &wallet,
@@ -914,8 +851,9 @@ fn a_usage_error_is_said_first_with_nothing_asked_of_the_network_before_it() {
     let r = run(&wallet, &["balance"]);
     assert!(r.ok, "{}", r.stderr);
     assert!(
-        r.stderr
-            .contains("psp: 1 purchase(s) are waiting for the PSP's delivery"),
+        r.stderr.contains(
+            "psp: 1 purchase(s) are held, and the PSP mint's records for them are not checked"
+        ),
         "{}",
         r.stderr
     );
@@ -924,16 +862,16 @@ fn a_usage_error_is_said_first_with_nothing_asked_of_the_network_before_it() {
     // is the first thing on stderr, and the wallet is as it was.
     let cases: Vec<(Vec<&str>, &str)> = vec![
         (
-            vec!["buy-psp", "--mint-key", &key, "32", "16", "1"],
-            "below the minimum of 50 PSP",
+            vec!["buy-psp", "--mint-key", &key, "32"],
+            "buy-psp takes no AMOUNT any more",
         ),
         (
             vec!["buy-psp", "--mint-key", &key, "four"],
-            "an amount must be a whole number, got `four`",
+            "buy-psp: unexpected argument `four`",
         ),
         (
             vec!["buy-psp", "--sync", "--mint-key", &key],
-            "a purchase needs at least one output",
+            "--sync was removed",
         ),
         (
             vec!["claim-psp", "--wait", "abc"],

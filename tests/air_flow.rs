@@ -29,7 +29,7 @@ use ecash_wallet::config::{AirSettings, BUILTIN_SPI_DID};
 use ecash_wallet::handoff::Standing;
 use ecash_wallet::mint_info::{
     check_handoff, complete_import, psp_keys, psp_keysets, psp_post, psp_window, reclaim_handoff,
-    rotation_sync, sync_psp_limits, verify_psp,
+    rotation_sync, verify_psp,
 };
 use ecash_wallet::store::{PendingAirRequest, StoredNote, WalletData};
 use ecash_wallet::{Kind, Wallet, WalletError};
@@ -572,13 +572,18 @@ const H: u64 = 3600;
 const LATER: u64 = 100;
 
 #[test]
-fn keys_keysets_rotation_limits_and_claim_keys_over_air_are_the_mints_own() {
+fn keys_keysets_and_rotation_over_air_are_the_mints_own() {
     let server = server();
     let (key, did) = mint_key();
     let dir = scratch("keys");
     let psp = real_psp(&dir);
     let state_dir = scratch("keys-state");
-    let listener = start_serving(&server, &key, &state_dir, psp.serve());
+    let listener = start_serving(
+        &server,
+        &key,
+        &state_dir,
+        psp.serve(addr::key_to_did(&key.public_key())),
+    );
     let air = air_settings(&server, &did, 10, 3);
 
     let mut wallet = open_wallet(&dir);
@@ -601,13 +606,11 @@ fn keys_keysets_rotation_limits_and_claim_keys_over_air_are_the_mints_own() {
     let window = psp_window(&mut wallet, &air).unwrap();
     assert_eq!(window.current_id, keysets.current);
 
-    // The note-size cap the wallet learns from the keys: the largest.
-    sync_psp_limits(&mut wallet, &air).unwrap();
-    assert_eq!(
-        wallet.psp_max_denomination(),
-        keys.keys().map(|a| a.units).max()
-    );
-    assert!(wallet.psp_max_denomination().is_some());
+    // A PSP keyset has a key for every power of two a note can have, 1 to 2^63:
+    // the wallet takes no largest note size from it.
+    assert_eq!(keys.len(), 64);
+    assert_eq!(keys.keys().map(|a| a.units).min(), Some(1));
+    assert_eq!(keys.keys().map(|a| a.units).max(), Some(1 << 63));
 
     // The rotation sync reads the window over AIR; a wallet with no PSP notes has
     // nothing to roll over.
@@ -619,8 +622,8 @@ fn keys_keysets_rotation_limits_and_claim_keys_over_air_are_the_mints_own() {
         "every request ended with its answer"
     );
     assert!(open_wallet(&dir).air_requests().is_empty());
-    // Nothing is cached: each of the five calls above was its own request.
-    wait_for_next(&state_dir, 5);
+    // Nothing is cached: each of the four calls above was its own request.
+    wait_for_next(&state_dir, 4);
     listener.stop().unwrap();
 }
 
@@ -650,7 +653,12 @@ fn a_kept_request_is_resumed_by_a_call_of_its_own_kind_only() {
     // The PSP starts and reads slot 0, where the keys request of the try was
     // written (the old mint-info request never was). The next keys call carries
     // on with the same keys request: it finds the reply and writes nothing.
-    let listener = start_serving(&server, &key, &state_dir, psp.serve());
+    let listener = start_serving(
+        &server,
+        &key,
+        &state_dir,
+        psp.serve(addr::key_to_did(&key.public_key())),
+    );
     wait_for_next(&state_dir, 1);
     let air = air_settings(&server, &did, 10, 3);
     assert!(!psp_keys(&mut wallet, &air).unwrap().is_empty());
@@ -754,7 +762,12 @@ fn a_psp_that_cannot_answer_says_so_at_once() {
     let dir = scratch("unavailable");
     let psp = real_psp(&dir);
     let state_dir = scratch("unavailable-state");
-    let listener = start_serving(&server, &key, &state_dir, psp.serve());
+    let listener = start_serving(
+        &server,
+        &key,
+        &state_dir,
+        psp.serve(addr::key_to_did(&key.public_key())),
+    );
     let a = psp.note(1);
     let mut wallet = psp.wallet(&dir, "w", vec![a.clone()]);
     let body = rollover_body(&[a], &psp.keyset());
@@ -805,7 +818,12 @@ fn a_rotation_rollover_goes_over_air_and_ends_with_the_notes_on_the_new_keyset()
     let dir = scratch("roll");
     let psp = real_psp(&dir);
     let state_dir = scratch("roll-state");
-    let listener = start_serving(&server, &key, &state_dir, psp.serve());
+    let listener = start_serving(
+        &server,
+        &key,
+        &state_dir,
+        psp.serve(addr::key_to_did(&key.public_key())),
+    );
     let air = air_settings(&server, &did, 10, 3);
 
     let (a, b) = (psp.note(4), psp.note(1));
@@ -867,7 +885,12 @@ fn a_rollover_resent_over_air_is_the_same_answer_and_a_kept_request_is_found_by_
     // rollover once. The same call, made again, finds the reply of its kept
     // request and writes nothing; the other call is still kept, untouched.
     let air = air_settings(&server, &did, 10, 3);
-    let listener = start_serving(&server, &key, &state_dir, psp.serve());
+    let listener = start_serving(
+        &server,
+        &key,
+        &state_dir,
+        psp.serve(addr::key_to_did(&key.public_key())),
+    );
     wait_for_next(&state_dir, 2);
     let first = psp_post(&mut w, &air, "rollover", &roll).unwrap();
     assert!(psp.spent(&a) && !psp.spent(&b));
@@ -914,7 +937,12 @@ fn refusals_over_air_are_the_wallets_errors() {
     };
     let psp = real_psp_with(&dir, limits);
     let state_dir = scratch("refused-state");
-    let listener = start_serving(&server, &key, &state_dir, psp.serve());
+    let listener = start_serving(
+        &server,
+        &key,
+        &state_dir,
+        psp.serve(addr::key_to_did(&key.public_key())),
+    );
     let air = air_settings(&server, &did, 10, 3);
     let (a, b) = (psp.note(1), psp.note(1));
     let mut w = psp.wallet(&dir, "w", vec![a.clone(), b.clone()]);
@@ -963,7 +991,12 @@ fn a_handoff_is_checked_swapped_and_reclaimed_over_air() {
     let dir = scratch("handoff");
     let psp = real_psp(&dir);
     let state_dir = scratch("handoff-state");
-    let listener = start_serving(&server, &key, &state_dir, psp.serve());
+    let listener = start_serving(
+        &server,
+        &key,
+        &state_dir,
+        psp.serve(addr::key_to_did(&key.public_key())),
+    );
     let air = air_settings(&server, &did, 10, 3);
 
     let (a, b, c) = (psp.note(4), psp.note(1), psp.note(2));

@@ -5,9 +5,9 @@
 //! The PSP's calls are **mint info** (what the mint's health report says,
 //! `wire_version` and `network`, which `verify_mint` reads before anything else
 //! is sent to a mint), **keys**, **keysets** and **rotation** and **rollover**
-//! and **check-state**, and the reconciliation request (**PSP_RECONCILE**, kind 15),
-//! which is sent with a reply key chosen by the caller ([`call_with_key`]) and
-//! whose body is saved before it is sent. The ESP's are mint info, **keysets**, **rotation**,
+//! and **check-state**, and the purchase claim (**PSP_CLAIM**, kind 15),
+//! which is sent with the purchase's claim key as `R`, chosen by the caller
+//! ([`call_with_key`]), and whose body is saved before it is sent. The ESP's are mint info, **keysets**, **rotation**,
 //! **fees**, **rollover**, **exchange** and **redeem**; the ESP has
 //! no keys call (the keys arrive in the replies). An **FSP mint's** are mint info,
 //! **keys**, **rotation**, **fees** and its two POSTs, **FSP issue** and **FSP
@@ -36,10 +36,10 @@
 //!   the same kind resumes it. A read is kept once per mint and kind; a call
 //!   with a body (rollover, check-state, exchange, redeem) once per
 //!   mint, kind and body (the SHA-256 of the body is kept with it), so a second
-//!   rollover is never mistaken for the first. A reconciliation request is kept
-//!   with the purchase's reply key as its `r` and is sent again as the identical
+//!   rollover is never mistaken for the first. A claim is kept
+//!   with the purchase's claim key as its `r` and is sent again as the identical
 //!   body; not hearing back is [`Sent::NoReply`], not an error, because the PSP
-//!   answers an accepted request only. The PSP and the ESP are two
+//!   mint answers an accepted claim only. The PSP and the ESP are two
 //!   mints, so their requests never meet, even for the same kind.
 //! - **A request ends** when it is answered and checked (an answer or a signed
 //!   refusal), or when a reply comes that fails a check (a write-once cell
@@ -86,7 +86,7 @@ use sp_wire::air_request::ask::{AskConfig, AskError, InFlight, Verified, ask};
 use sp_wire::air_request::client::{self, ServerRef, block_on_new_runtime};
 use sp_wire::air_request::{
     KIND_CHECK_STATE, KIND_EXCHANGE, KIND_FEES, KIND_FSP_ISSUE, KIND_FSP_SPEND, KIND_KEYS,
-    KIND_KEYSETS, KIND_MINT_INFO, KIND_PSP_RECONCILE, KIND_REDEEM, KIND_ROLLOVER, KIND_ROTATION,
+    KIND_KEYSETS, KIND_MINT_INFO, KIND_PSP_CLAIM, KIND_REDEEM, KIND_ROLLOVER, KIND_ROTATION,
     STATUS_UNAVAILABLE, VerifyError, addr, check_mint_info,
 };
 use sp_wire::seal::SecretKey;
@@ -125,7 +125,7 @@ fn what(kind: u8) -> &'static str {
         KIND_REDEEM => "redemption",
         KIND_FSP_ISSUE => "FSP issue",
         KIND_FSP_SPEND => "FSP spend",
-        KIND_PSP_RECONCILE => "PSP reconciliation",
+        KIND_PSP_CLAIM => "PSP claim",
         _ => "a request",
     }
 }
@@ -140,7 +140,7 @@ fn changes_state(kind: u8) -> bool {
             | KIND_REDEEM
             | KIND_FSP_ISSUE
             | KIND_FSP_SPEND
-            | KIND_PSP_RECONCILE
+            | KIND_PSP_CLAIM
     )
 }
 
@@ -396,13 +396,13 @@ pub enum Sent {
     /// is far larger than the other variant.
     Answered(Box<Verified>),
     /// Every try passed with no reply (the message says how many). The request is
-    /// kept in the wallet file. For a PSP reconciliation this is how a refused
-    /// request looks: the PSP answers an accepted request only.
+    /// kept in the wallet file. For a PSP claim this is how a refused claim
+    /// looks: the PSP mint answers an accepted claim only.
     NoReply(String),
 }
 
 /// [`call_with_body`] for a request whose one-off key `R` is given, not made: a
-/// PSP reconciliation is answered under the purchase's reply key, so the key a
+/// PSP claim is answered under the purchase's claim key, so the key a
 /// request is saved with before it is first sent is that key. The body is never
 /// changed.
 ///

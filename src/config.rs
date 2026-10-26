@@ -4,7 +4,7 @@
 //! unknown key, a wrong type or a bad value is refused with every problem listed,
 //! and `ecash-wallet config` prints the values in use and where each came from.
 //!
-//! The settings are about storage, AIR and the smallest PSP purchase.
+//! The settings are about storage, AIR and PSP purchases.
 //!
 //! # Storage policy
 //!
@@ -65,16 +65,22 @@
 //! so (one warning for each), the command line prints them at every start and
 //! in `config`, and the errors of a call that fails name it.
 //!
-//! # The smallest purchase (`[psp]`)
+//! # PSP purchases (`[psp]`)
 //!
-//! `psp.min_purchase` (`ECASH_PSP_MIN_PURCHASE`) is the smallest purchase the
-//! wallet builds, in PSP units: 50 by default, 1 or more. It is the wallet
-//! refusing to build the payload, and nothing about the PSP changes. The PSP's
-//! fees come out of what a payment buys, so a small purchase can be eaten whole
-//! and the payment lost; `buy-psp` and
-//! [`Wallet::build_psp_payload`](crate::Wallet::build_psp_payload) refuse a
-//! total below it, with a message that names the setting. Lowering it is not
-//! advised, and 100 PSP is a realistic purchase.
+//! `psp.unpaid_key_days` (`ECASH_PSP_UNPAID_KEY_DAYS`, 90, 0 to 3650): how long a
+//! purchase's claim key is kept while the PSP mint has written no record for it.
+//! After that it is dropped, with a warning, the first time the AIR server is
+//! read and still has no record ([`crate::psp::Wallet::expire_unpaid`]). 0 keeps
+//! such a key for ever. A payment made to the payload after its key was dropped
+//! is lost. A key that has records keeps its records' own rules.
+//!
+//! # Removed settings
+//!
+//! `psp.min_purchase` (`ECASH_PSP_MIN_PURCHASE`) is gone: `buy-psp` takes no
+//! amounts any more, so there is no purchase size for the wallet to check. A
+//! file or an environment that still sets it is refused, with [`REMOVED`]'s
+//! words, which also say that a PSP purchase of at least $5 (50 PSP) is
+//! recommended. Nothing enforces it.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -128,6 +134,21 @@ pub const ESP_PLACEHOLDER_WARNING: &str = "WARNING: the ESP's DID is the wallet'
 pub const FILE_NAME: &str = "config.toml";
 /// The environment variable that names a config file elsewhere (it must exist).
 pub const FILE_ENV: &str = "ECASH_CONFIG";
+
+/// The settings that were removed, with the environment variable each had and
+/// why it went: a file or an environment that still sets one is refused with
+/// these words, not with "unknown setting". `(key, variable, why)`.
+pub const REMOVED: &[(&str, &str, &str)] = &[(
+    "psp.min_purchase",
+    "ECASH_PSP_MIN_PURCHASE",
+    "buy-psp takes no amounts, so there is no purchase size to check. We recommend a PSP purchase of at least $5 (50 PSP): the PSP mint's fees come out of what a payment buys, so a smaller payment can buy little or nothing. Nothing enforces it",
+)];
+
+/// The words that refuse a removed setting: `{key} was removed in ecash-wallet
+/// 0.8.0: {why}. Remove it`.
+fn removed_message(key: &str, why: &str) -> String {
+    format!("{key} was removed in ecash-wallet 0.8.0: {why}. Remove it")
+}
 
 /// One setting, as documented.
 pub struct Spec {
@@ -213,18 +234,18 @@ pub const SPECS: &[Spec] = &[
         what: "How far the reply's issued_at (the mint's clock) may be from this wallet's clock before the reply is refused as stale. A reply that is older than this when it is read (a request kept from days ago) is dropped and the call starts a new request.",
     },
     Spec {
+        key: "psp.unpaid_key_days",
+        env: "ECASH_PSP_UNPAID_KEY_DAYS",
+        default: "90",
+        units: "days (0 to 3650)",
+        what: "How long a PSP purchase's claim key is kept while the PSP mint has written no record for it (the payload was never paid, or the payment never settled). After that many days from buy-psp the key is dropped, with a warning, the first time the AIR server is read and still has no record. A payment made to the payload after that is lost: nothing is left that can claim it. A key that has a record is kept by its records' own windows. 0: such a key is kept for ever.",
+    },
+    Spec {
         key: "air.timeout_secs",
         env: "ECASH_AIR_TIMEOUT_SECS",
         default: "10",
         units: "seconds (1 to 600)",
         what: "How long the AIR server may take to answer one Create or Read before that step fails.",
-    },
-    Spec {
-        key: "psp.min_purchase",
-        env: "ECASH_PSP_MIN_PURCHASE",
-        default: "50",
-        units: "PSP units (1 or more)",
-        what: "The smallest purchase the wallet builds, in PSP units (10 PSP to the US dollar). buy-psp and the library's payload builder refuse a total below it, before any network use, with a message that names this setting; nothing about the PSP changes. The PSP's fees come out of what a payment buys, so a small purchase can be eaten whole and the payment lost. Lowering it is not advised: 100 PSP is a realistic purchase.",
     },
 ];
 
@@ -491,28 +512,25 @@ impl AirSettings {
     }
 }
 
-/// The `[psp]` settings.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PspSettings {
-    /// The smallest purchase the wallet builds, in PSP units (`psp.min_purchase`,
-    /// 1 or more).
-    pub min_purchase: u64,
-}
-
-impl Default for PspSettings {
-    fn default() -> Self {
-        PspSettings {
-            min_purchase: crate::psp::DEFAULT_MIN_PURCHASE,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
     pub storage_wallet: StoragePolicy,
     pub storage_app: StoragePolicy,
     pub air: AirSettings,
-    pub psp: PspSettings,
+    /// `psp.unpaid_key_days`: days a claim key with no owed record is kept; 0 for
+    /// ever.
+    pub psp_unpaid_key_days: u64,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Settings {
+            storage_wallet: StoragePolicy::default(),
+            storage_app: StoragePolicy::default(),
+            air: AirSettings::default(),
+            psp_unpaid_key_days: crate::psp::DEFAULT_UNPAID_KEY_DAYS,
+        }
+    }
 }
 
 impl Settings {
@@ -536,7 +554,7 @@ impl Settings {
             "air.attempts" => self.air.attempts.to_string(),
             "air.max_skew_secs" => self.air.max_skew_secs.to_string(),
             "air.timeout_secs" => self.air.timeout_secs.to_string(),
-            "psp.min_purchase" => self.psp.min_purchase.to_string(),
+            "psp.unpaid_key_days" => self.psp_unpaid_key_days.to_string(),
             _ => return None,
         })
     }
@@ -601,7 +619,7 @@ impl Settings {
             "air.attempts" => self.air.attempts = number(key, value, 1, 10)? as u32,
             "air.max_skew_secs" => self.air.max_skew_secs = number(key, value, 1, 86_400)?,
             "air.timeout_secs" => self.air.timeout_secs = number(key, value, 1, 600)?,
-            "psp.min_purchase" => self.psp.min_purchase = number(key, value, 1, u64::MAX)?,
+            "psp.unpaid_key_days" => self.psp_unpaid_key_days = number(key, value, 0, 3650)?,
             other => return Err(format!("unknown setting `{other}`")),
         }
         Ok(())
@@ -719,6 +737,10 @@ fn parse_file(text: &str) -> Result<Vec<(String, String)>, Vec<String>> {
         };
         for (name, value) in body {
             let key = format!("{section}.{name}");
+            if let Some((_, _, why)) = REMOVED.iter().find(|(k, _, _)| *k == key) {
+                problems.push(removed_message(&key, why));
+                continue;
+            }
             if !SPECS.iter().any(|s| s.key == key) {
                 problems.push(format!("unknown setting `{key}`"));
                 continue;
@@ -802,6 +824,14 @@ pub fn load(
                 }
                 Err(e) => problems.push(format!("environment variable {}: {e}", spec.env)),
             }
+        }
+    }
+    for (key, var, why) in REMOVED {
+        if env(var).is_some_and(|v| !v.is_empty()) {
+            problems.push(format!(
+                "environment variable {var}: {}",
+                removed_message(key, why)
+            ));
         }
     }
     if problems.is_empty() {
@@ -1192,6 +1222,43 @@ mod tests {
         fs::remove_dir_all(&d).unwrap();
     }
 
+    /// `psp.unpaid_key_days` is 90 by default, set by the file or the
+    /// environment (which wins), 0 is accepted (for ever), and a value out of 0 to
+    /// 3650 or not a number is refused naming the setting.
+    #[test]
+    fn the_unpaid_key_days_default_to_90_and_are_checked() {
+        let d = dir("unpaid-days");
+        let l = load(&d, None, &no_env).unwrap();
+        assert_eq!(l.settings.psp_unpaid_key_days, 90);
+        assert_eq!(l.settings.get("psp.unpaid_key_days").as_deref(), Some("90"));
+
+        fs::write(d.join(FILE_NAME), "[psp]\nunpaid_key_days = 30\n").unwrap();
+        let l = load(&d, None, &no_env).unwrap();
+        assert_eq!(l.settings.psp_unpaid_key_days, 30);
+        assert_eq!(l.sources["psp.unpaid_key_days"], Source::File);
+        let l = load(&d, None, &env_of(&[("ECASH_PSP_UNPAID_KEY_DAYS", "0")])).unwrap();
+        assert_eq!(l.settings.psp_unpaid_key_days, 0, "0 keeps for ever");
+        assert_eq!(
+            l.sources["psp.unpaid_key_days"],
+            Source::Env("ECASH_PSP_UNPAID_KEY_DAYS")
+        );
+        let l = load(&d, None, &env_of(&[("ECASH_PSP_UNPAID_KEY_DAYS", "3650")])).unwrap();
+        assert_eq!(l.settings.psp_unpaid_key_days, 3650);
+
+        for value in ["3651", "-1", "soon"] {
+            let p = load(&d, None, &env_of(&[("ECASH_PSP_UNPAID_KEY_DAYS", value)])).unwrap_err();
+            assert!(
+                p.iter().any(|x| x.contains("ECASH_PSP_UNPAID_KEY_DAYS")
+                    && x.contains("psp.unpaid_key_days")),
+                "{value}: {p:?}"
+            );
+        }
+        fs::write(d.join(FILE_NAME), "[psp]\nunpaid_key_days = \"never\"\n").unwrap();
+        let p = load(&d, None, &no_env).unwrap_err();
+        assert!(p.iter().any(|x| x.contains("psp.unpaid_key_days")), "{p:?}");
+        fs::remove_dir_all(&d).unwrap();
+    }
+
     #[test]
     fn the_psp_and_the_esp_need_the_server_and_the_host_and_the_error_names_what_is_missing() {
         let mut air = AirSettings::default();
@@ -1219,79 +1286,48 @@ mod tests {
         assert_eq!(air.require(), Ok(()));
     }
 
-    #[test]
-    fn the_minimum_purchase_is_50_unless_the_file_or_the_environment_say_otherwise() {
-        let d = dir("min-purchase");
-        let l = load(&d, None, &no_env).unwrap();
-        assert_eq!(l.settings.psp.min_purchase, 50);
-        assert_eq!(
-            SPECS
-                .iter()
-                .find(|s| s.key == "psp.min_purchase")
-                .unwrap()
-                .default,
-            crate::psp::DEFAULT_MIN_PURCHASE.to_string(),
-            "the documented default is the wallet's"
-        );
-        assert!(!l.sources.contains_key("psp.min_purchase"));
-
-        fs::write(d.join(FILE_NAME), "[psp]\nmin_purchase = 20\n").unwrap();
-        let l = load(&d, None, &no_env).unwrap();
-        assert_eq!(l.settings.psp.min_purchase, 20);
-        assert_eq!(l.sources["psp.min_purchase"], Source::File);
-        // a string with a number in it is a number, as for the other settings
-        fs::write(d.join(FILE_NAME), "[psp]\nmin_purchase = \"7\"\n").unwrap();
-        assert_eq!(
-            load(&d, None, &no_env).unwrap().settings.psp.min_purchase,
-            7
-        );
-
-        // the environment wins, and a lower value than the default is honoured
-        let l = load(&d, None, &env_of(&[("ECASH_PSP_MIN_PURCHASE", "1")])).unwrap();
-        assert_eq!(l.settings.psp.min_purchase, 1);
-        assert_eq!(
-            l.sources["psp.min_purchase"],
-            Source::Env("ECASH_PSP_MIN_PURCHASE")
-        );
-        assert!(
-            l.describe().iter().any(|x| x
-                == "  psp.min_purchase = 1 PSP units (1 or more) (env ECASH_PSP_MIN_PURCHASE)")
-        );
-        // the documentation advises against lowering it
-        let what = SPECS
-            .iter()
-            .find(|s| s.key == "psp.min_purchase")
-            .unwrap()
-            .what;
-        assert!(what.contains("Lowering it is not advised"), "{what}");
-        assert!(what.contains("100 PSP is a realistic purchase"), "{what}");
-        fs::remove_dir_all(&d).unwrap();
-    }
+    /// The words that refuse `psp.min_purchase`, written out: a change to the
+    /// recommendation in them fails this test.
+    const MIN_PURCHASE_WHY: &str = "psp.min_purchase was removed in ecash-wallet 0.8.0: buy-psp takes no amounts, so there is no purchase size to check. We recommend a PSP purchase of at least $5 (50 PSP): the PSP mint's fees come out of what a payment buys, so a smaller payment can buy little or nothing. Nothing enforces it. Remove it";
 
     #[test]
-    fn a_bad_minimum_purchase_is_refused_and_named() {
-        let d = dir("min-purchase-bad");
-        for bad in ["0", "-5", "many", "1.5", "99999999999999999999999", " "] {
-            let p = load(&d, None, &env_of(&[("ECASH_PSP_MIN_PURCHASE", bad)]));
-            if bad == " " {
-                // whitespace is not a number either
-                assert!(p.is_err(), "{bad:?}");
-                continue;
-            }
-            let p = p.unwrap_err();
-            assert!(
-                p.iter().any(|x| x.contains("ECASH_PSP_MIN_PURCHASE")
-                    && x.contains("psp.min_purchase")
-                    && x.contains("must be a whole number from 1 to")),
-                "{bad}: {p:?}"
+    fn the_minimum_purchase_setting_is_refused_as_removed_in_the_file_and_the_environment() {
+        let d = dir("min-purchase-removed");
+        // not a setting any more
+        assert!(SPECS.iter().all(|s| s.key != "psp.min_purchase"));
+        assert!(SPECS.iter().all(|s| s.env != "ECASH_PSP_MIN_PURCHASE"));
+        assert_eq!(Settings::default().get("psp.min_purchase"), None);
+
+        for text in [
+            "[psp]\nmin_purchase = 20\n",
+            "[psp]\nmin_purchase = \"7\"\n",
+            "[psp]\nmin_purchase = 0\n",
+        ] {
+            fs::write(d.join(FILE_NAME), text).unwrap();
+            let p = load(&d, None, &no_env).unwrap_err();
+            assert_eq!(
+                p,
+                vec![format!(
+                    "{}: {MIN_PURCHASE_WHY}",
+                    d.join(FILE_NAME).display()
+                )],
+                "{text}"
             );
         }
-        fs::write(d.join(FILE_NAME), "[psp]\nmin_purchase = 0\n").unwrap();
-        let p = load(&d, None, &no_env).unwrap_err();
-        assert!(p.iter().any(|x| x.contains("psp.min_purchase")), "{p:?}");
-        fs::write(d.join(FILE_NAME), "[psp]\nmin_purchase = [1]\n").unwrap();
-        let p = load(&d, None, &no_env).unwrap_err();
-        assert!(p.iter().any(|x| x.contains("psp.min_purchase")), "{p:?}");
+        fs::remove_file(d.join(FILE_NAME)).unwrap();
+        for value in ["1", "50", "many"] {
+            let p = load(&d, None, &env_of(&[("ECASH_PSP_MIN_PURCHASE", value)])).unwrap_err();
+            assert_eq!(
+                p,
+                vec![format!(
+                    "environment variable ECASH_PSP_MIN_PURCHASE: {MIN_PURCHASE_WHY}"
+                )],
+                "{value}"
+            );
+        }
+        // an empty variable is not set
+        assert!(load(&d, None, &env_of(&[("ECASH_PSP_MIN_PURCHASE", "")])).is_ok());
+        // another key of the section is still just unknown
         fs::write(d.join(FILE_NAME), "[psp]\nminimum = 5\n").unwrap();
         let p = load(&d, None, &no_env).unwrap_err();
         assert!(

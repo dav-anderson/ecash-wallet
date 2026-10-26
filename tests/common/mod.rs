@@ -96,9 +96,29 @@ pub fn scratch(name: &str) -> PathBuf {
 
 // ---------------------------------------------------------------- the PSP mint
 
+/// The fee of the one kind 15 write (`claim.write_fee`), in PSP units, as the
+/// live system has it on.
+pub const WRITE_FEE: u64 = 2;
+
+/// The fee of each of the two reads (`delivery.read_fee`), in PSP units.
+pub const READ_FEE: u64 = 1;
+
+/// What the two reads and the write come to, which comes off every payment.
+pub const FEES: u64 = 2 * READ_FEE + WRITE_FEE;
+
+/// The psp-mint settings a test mint runs under: the fees are on, as they are in
+/// the live system (the units a payment owes are what it buys less
+/// [`FEES`]). The only payment settled with no fee is the genesis purchase.
+pub fn fees_on() -> psp_mint::config::Config {
+    let mut config = psp_mint::config::Config::defaults("");
+    config.claim_write_fee = WRITE_FEE;
+    config.delivery_read_fee = READ_FEE;
+    config
+}
+
 /// A PSP mint wired as `psp-mint serve` wires it: it rotates (1 hour to the first
 /// rotation, then every hour), its settlement records are shared the way the
-/// listener shares them with the scan, and it settles under the default policy.
+/// listener shares them with the scan, and it settles under [`fees_on`].
 ///
 /// `clock` is `0` for the system clock, or a fixed time a test moves with
 /// [`PspMint::set_clock`].
@@ -128,7 +148,7 @@ impl PspMint {
 
     /// As [`PspMint::open_at`], with these request ceilings.
     pub fn open_with(dir: &Path, clock: u64, limits: Limits) -> PspMint {
-        PspMint::build(dir, clock, limits, psp_mint::config::Config::defaults(""))
+        PspMint::build(dir, clock, limits, fees_on())
     }
 
     /// As [`PspMint::open_at`], with this psp-mint `Config`: the settlement
@@ -140,7 +160,7 @@ impl PspMint {
     }
 
     fn build(dir: &Path, clock: u64, limits: Limits, config: psp_mint::config::Config) -> PspMint {
-        let (rotor, logic) = Rotor::open_at(dir, Amount::from_units(1024), 1, 1, clock).unwrap();
+        let (rotor, logic) = Rotor::open_at(dir, 1, 1, clock).unwrap();
         let rot = Rotating::new(rotor, Rollovers::open(dir).unwrap());
         let records: SharedRecords = Arc::new(Mutex::new(
             Records::open(&dir.join("settlements.json")).unwrap(),
@@ -242,16 +262,12 @@ impl PspMint {
     /// previous set is signed by it.
     pub fn settle(&self, received: &Received, price_cents: u64) -> Settlement {
         let mut records = self.records.lock().unwrap();
-        let logic = self.state.logic.lock().unwrap();
-        let rotor = self.rot.rotor.lock().unwrap();
-        let previous = rotor.previous.as_ref().map(|(k, l)| (k.id.as_str(), l));
         settle::settle_ruled(
-            &logic,
-            previous,
             &mut records,
             received,
             &mut || Ok(price_cents),
             &self.policy,
+            sp_wire::air_request::addr::now_secs(),
         )
         .unwrap()
     }
@@ -267,6 +283,7 @@ impl PspMint {
                 confirmations: 6,
                 value_sats: sats,
                 payload: Some(payload),
+                block_time: Some(sp_wire::air_request::addr::now_secs()),
             }],
         );
         assert_eq!(ignored, 0, "the payload opens with the mint's DID key");

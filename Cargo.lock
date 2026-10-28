@@ -575,7 +575,7 @@ dependencies = [
 
 [[package]]
 name = "ecash-wallet"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "axum",
  "bdhke",
@@ -587,6 +587,7 @@ dependencies = [
  "psp-mint",
  "rand 0.8.8",
  "reqwest",
+ "rusqlite",
  "secp256k1 0.30.0",
  "serde",
  "serde_json",

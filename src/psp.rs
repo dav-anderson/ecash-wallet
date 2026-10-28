@@ -21,7 +21,9 @@
 //! PSP mint writes them. [`crate::mint_info::psp_pickup`] reads them: it opens
 //! each cell with [`Wallet::apply_delivery`], skips a cell that does not open (a
 //! mint error or a forged write) and says so, and stops at the first empty cell.
-//! Every start and every `claim-psp` reads the next empty cell of each key once.
+//! Every start and every `claim-psp` reads the next empty cell of each key once,
+//! each purchase on an AIR session of its own, in a random order, with a random
+//! pause between two purchases.
 //! A record says the units the payment is owed (`due_units`, whole PSP units
 //! after every fee), how long it stays claimable (`window_secs`,
 //! `sp_wire::psp::CLAIM_WINDOW_SECS`, 30 days) and how many claims the PSP mint

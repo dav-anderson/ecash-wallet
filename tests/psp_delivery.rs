@@ -17,9 +17,11 @@
 
 mod common;
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use ecash_wallet::config::AirSettings;
 use ecash_wallet::mint_info::{PickedUp, psp_pickup};
@@ -35,7 +37,7 @@ use sp_wire::air_request::delivery::{
     self as wire, ClaimTerms, EXPIRY_NOTICE, Outcome, Owed, SEND_PURCHASE_CLAIM, Written,
 };
 use sp_wire::psp::CLAIM_WINDOW_SECS;
-use sp_wire::seal::SecretKey as DidKey;
+use sp_wire::seal::{PublicKey, SecretKey as DidKey};
 
 use common::{FEES, PspMint, open_wallet, scratch};
 
@@ -150,6 +152,31 @@ fn owed(txid: &str, due_units: u64) -> Outcome {
             on_expiry: EXPIRY_NOTICE.to_string(),
         },
     })
+}
+
+/// The sessions on which the shared AIR server holds a read of `address` now: what
+/// the server itself keeps on disk (its storage file, which `local_server::start`
+/// names in `AIR_STORAGE`). The server keeps a row for each read it holds, with the
+/// session and the cell (`read_key`, the cell's key in AIR's own 64-byte encoding,
+/// after a length), until the cell is written.
+fn sessions_holding(address: &PublicKey) -> BTreeSet<Vec<u8>> {
+    let storage = std::env::var("AIR_STORAGE").expect("the local AIR server names its storage");
+    let db = rusqlite::Connection::open(storage).unwrap();
+    let mut rows = db
+        .prepare("SELECT session, read_key FROM requests WHERE read_key IS NOT NULL")
+        .unwrap();
+    let rows: Vec<(Vec<u8>, Vec<u8>)> = rows
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    rows.into_iter()
+        .filter(|(_, cell)| {
+            cell.len() >= 64
+                && matches!(PublicKey::from_bytes(&cell[cell.len() - 64..]), Ok(key) if key == *address)
+        })
+        .map(|(session, _)| session)
+        .collect()
 }
 
 /// A snapshot of the whole wallet file, for comparing before and after.
@@ -361,6 +388,100 @@ fn with_the_server_down_at_settlement_a_later_retry_delivers_exactly_one_record(
     let found = e.pickup(&server);
     assert_eq!(found[0].new.len(), 1);
     assert_eq!(found[0].new[0].due_units, 96);
+    fs::remove_dir_all(&e.dir).unwrap();
+}
+
+/// T1 and T2. Two purchases waiting for their records (`claim-psp`'s held reads)
+/// are each held on an AIR session of its own: the AIR server's own rows show each
+/// purchase's cell held, and on no session that holds the other's. Then the PSP mint
+/// writes both records, the one pickup stores each purchase's record once, and a
+/// second pickup finds nothing new and changes nothing. Fails if the pickup goes
+/// back to one connect for every purchase (the two cells are held on one session),
+/// or a purchase is dropped or read twice by the per-purchase loop or the shuffle.
+#[test]
+fn two_purchases_are_held_on_sessions_of_their_own_and_each_record_is_stored_once() {
+    let server = common::air::server();
+    let mut e = env("two-purchases");
+    let one = e.buy();
+    let two = e.buy();
+    let psp = addr::key_to_did(&e.mint_key.public_key());
+    let cell_0 = |id: &str| {
+        let key = e.wallet.claim_keys().iter().find(|k| k.id == id).unwrap();
+        wire::owed_address(&psp, &ServiceDid::parse(&key.claim_did).unwrap(), 0)
+    };
+    let cells = [cell_0(&one.id), cell_0(&two.id)];
+    // 100 - 4 = 96 and 50 - 4 = 46 units, settled and not written yet
+    e.settle("aa", 100_000, one.payload.clone());
+    e.settle("bb", 50_000, two.payload.clone());
+
+    let air = e.air(&server);
+    let deliverer = e.deliverer(&server);
+    let (wallet, records) = (&mut e.wallet, &e.psp.records);
+    let picked = thread::scope(|s| {
+        // `claim-psp --wait 120`: longer than the pause between two purchases
+        let pickup = s.spawn(move || psp_pickup(wallet, &air, 120));
+        // Each purchase's cell is held, the second one 1 to 30 seconds after the
+        // first: wait for both, at most 60 seconds.
+        let until = Instant::now() + Duration::from_secs(60);
+        let held = loop {
+            let held: Vec<BTreeSet<Vec<u8>>> = cells.iter().map(sessions_holding).collect();
+            if held.iter().all(|sessions| !sessions.is_empty()) {
+                break held;
+            }
+            assert!(
+                !pickup.is_finished(),
+                "the pickup ended before both cells were held"
+            );
+            assert!(
+                Instant::now() < until,
+                "the AIR server never held both purchases' cells: {held:?}"
+            );
+            thread::sleep(Duration::from_millis(50));
+        };
+        assert!(
+            held[0].is_disjoint(&held[1]),
+            "two purchases were read on one AIR session: {held:?}"
+        );
+        // the PSP mint writes both records: the held reads get them
+        let mut deliverer = deliverer;
+        let report = deliverer.pass_shared(records, Instant::now(), addr::now_secs());
+        assert_eq!((report.delivered, report.failed), (2, 0), "{report:?}");
+        pickup.join().unwrap().unwrap()
+    });
+
+    // in the order of the claim keys, whatever order they were read in
+    let ids: Vec<&str> = picked.iter().map(|p| p.id.as_str()).collect();
+    assert_eq!(ids, vec![one.id.as_str(), two.id.as_str()]);
+    let new: Vec<Vec<(u32, &str, u64)>> = picked
+        .iter()
+        .map(|p| {
+            let records = p.new.iter();
+            records
+                .map(|r| (r.index, r.txid.as_str(), r.due_units))
+                .collect()
+        })
+        .collect();
+    assert_eq!(new, vec![vec![(0, "aa", 96)], vec![(0, "bb", 46)]]);
+    assert!(
+        picked
+            .iter()
+            .all(|p| p.skipped.is_empty() && p.problem.is_none() && !p.no_record),
+        "{picked:?}"
+    );
+    let next: Vec<u32> = e.wallet.claim_keys().iter().map(|k| k.next_index).collect();
+    assert_eq!(next, vec![1, 1]);
+
+    // none twice: the next pickup reads nothing new and changes nothing
+    let before = snapshot_text(&e.wallet);
+    let again = e.pickup(&server);
+    assert_eq!(again.len(), 2);
+    assert!(
+        again
+            .iter()
+            .all(|p| p.new.is_empty() && p.skipped.is_empty()),
+        "{again:?}"
+    );
+    assert_eq!(snapshot_text(&e.wallet), before);
     fs::remove_dir_all(&e.dir).unwrap();
 }
 

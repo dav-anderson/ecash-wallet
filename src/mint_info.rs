@@ -42,8 +42,12 @@
 //! kind. An FSP mint's record is the service's DID in hex.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use mint_types::Amount;
+use rand::Rng;
+use rand::rngs::OsRng;
+use rand::seq::SliceRandom;
 use secp256k1::PublicKey;
 use sp_wire::ServiceDid;
 use sp_wire::air_request::client::{self, ServerRef, block_on_new_runtime};
@@ -131,6 +135,237 @@ pub struct PickedUp {
     pub problem: Option<String>,
 }
 
+/// The shortest pause between two purchases, in seconds: in [`psp_pickup`]
+/// between the AIR sessions of two purchases, and in [`psp_claim`] between the
+/// claims of two purchases. Fixed: there is no setting for it.
+const PURCHASE_GAP_MIN_SECS: u64 = 1;
+
+/// The longest pause between two purchases, in seconds (see
+/// [`PURCHASE_GAP_MIN_SECS`]).
+const PURCHASE_GAP_MAX_SECS: u64 = 30;
+
+/// One pause between two purchases: drawn uniformly from
+/// [`PURCHASE_GAP_MIN_SECS`] to [`PURCHASE_GAP_MAX_SECS`], to the millisecond,
+/// with the operating system's random numbers. Two purchases read or claimed one
+/// right after the other would tell the Issuer, who runs the AIR server, that
+/// they are one buyer's.
+fn purchase_gap() -> Duration {
+    Duration::from_millis(
+        OsRng.gen_range(PURCHASE_GAP_MIN_SECS * 1_000..=PURCHASE_GAP_MAX_SECS * 1_000),
+    )
+}
+
+/// The cells of one purchase that [`read_purchase`] reads: the PSP mint's DID and
+/// the purchase's claim DID give every one of them (`delivery::owed_address`).
+struct PurchaseCells {
+    /// The purchase's place in [`psp_pickup`]'s list.
+    job: usize,
+    psp: ServiceDid,
+    claim: ServiceDid,
+    /// The first cell to read: the claim key's `next_index`.
+    next: u32,
+    /// Whether the first read is held: the key holds no record yet.
+    hold: bool,
+}
+
+/// What a purchase's session sends back to [`pick_up_each`].
+enum Found {
+    /// The record in cell `index` of purchase `job`. The session reads the next
+    /// cell when `go_on` says `true`, and ends when it says `false`.
+    Record {
+        job: usize,
+        index: u32,
+        sealed: Vec<u8>,
+        go_on: tokio::sync::oneshot::Sender<bool>,
+    },
+    /// The purchase's session has ended: at an empty cell (`None`), or because
+    /// the AIR server could not be reached or read (`Some`, why).
+    Ended { job: usize, failed: Option<String> },
+}
+
+/// Read the owed records of ONE purchase, on an AIR session of its own. Every
+/// address read here is a cell of this one purchase (`cells`: its PSP mint, its
+/// claim DID, its indexes); never pass the cells of two purchases. The session
+/// is opened here and dropped here, so no other purchase's read can share it:
+/// one session reading the cells of two purchases would tell the Issuer, who
+/// runs the AIR server, that they are one buyer's. This is the only place the
+/// wallet reads delivery cells.
+///
+/// The cells are read in order from `cells.next`. Each record found is sent to
+/// [`pick_up_each`], which applies it, and the next cell is read only when that
+/// says so. The first read is held for `hold_secs` when `cells.hold` (0 reads
+/// once); every later one is read once. The session ends at the first empty
+/// cell.
+async fn read_purchase(
+    server: ServerRef,
+    cells: PurchaseCells,
+    read_secs: u64,
+    hold_secs: u64,
+    found: tokio::sync::mpsc::UnboundedSender<Found>,
+) {
+    let job = cells.job;
+    let read = async {
+        let client = client::connect(&server).await.map_err(|e| e.0)?;
+        let mut index = cells.next;
+        let mut wait = if cells.hold { hold_secs } else { 0 };
+        loop {
+            let address = delivery::owed_address(&cells.psp, &cells.claim, index);
+            let sealed = delivery::read_record(&client, &address, read_secs, wait)
+                .await
+                .map_err(|e| e.0)?;
+            wait = 0;
+            let Some(sealed) = sealed else {
+                return Ok(());
+            };
+            let (go_on, answer) = tokio::sync::oneshot::channel();
+            let sent = found.send(Found::Record {
+                job,
+                index,
+                sealed,
+                go_on,
+            });
+            if sent.is_err() || !matches!(answer.await, Ok(true)) {
+                return Ok(());
+            }
+            index += 1;
+        }
+    };
+    let failed: Option<String> = read.await.err();
+    // The receiver is gone only when the pickup has ended already.
+    let _ = found.send(Found::Ended { job, failed });
+}
+
+/// [`psp_pickup`]'s reads: one session per purchase ([`read_purchase`]), opened
+/// in the order of `jobs`, the first at once and each later one after a pause of
+/// its own ([`purchase_gap`]). The records found are applied here, one at a
+/// time, as they come. A purchase with no record yet is held until `wait_secs`
+/// after the start, counted from when its session is opened; one opened after
+/// that is read once.
+///
+/// A session that fails stops the opening of more: the purchases not opened yet
+/// get a [`PickedUp::problem`] and are read at the next start. When every session
+/// opened failed and no record was read, the AIR server could not be reached and
+/// that is the error.
+async fn pick_up_each(
+    wallet: &mut Wallet,
+    out: &mut [PickedUp],
+    jobs: Vec<(usize, String, PurchaseCells)>,
+    server: ServerRef,
+    read_secs: u64,
+    wait_secs: u64,
+    now: u64,
+) -> Result<(), WalletError> {
+    use tokio::time::Instant;
+    let start = Instant::now();
+    let deadline = start.checked_add(Duration::from_secs(wait_secs));
+    let mut purchases: Vec<(usize, String)> = Vec::with_capacity(jobs.len());
+    let mut waiting = std::collections::VecDeque::with_capacity(jobs.len());
+    for (at, id, cells) in jobs {
+        purchases.push((at, id));
+        waiting.push_back(cells);
+    }
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut tx = Some(tx);
+    let mut next_open = start;
+    let mut stopped: Option<String> = None;
+    let (mut opened, mut failed, mut read_any) = (0usize, 0usize, false);
+    let mut ended = vec![false; purchases.len()];
+    loop {
+        if stopped.is_some() || waiting.is_empty() {
+            // No session is opened any more: the channel closes when the last
+            // open one has ended.
+            tx = None;
+        }
+        let found = match &tx {
+            Some(sender) => match tokio::time::timeout_at(next_open, rx.recv()).await {
+                Ok(found) => found,
+                Err(_) => {
+                    let cells = waiting.pop_front().expect("a purchase is waiting");
+                    let hold_secs = deadline.map_or(wait_secs, |d| {
+                        d.saturating_duration_since(Instant::now()).as_secs()
+                    });
+                    tokio::spawn(read_purchase(
+                        server.clone(),
+                        cells,
+                        read_secs,
+                        hold_secs,
+                        sender.clone(),
+                    ));
+                    opened += 1;
+                    next_open = Instant::now() + purchase_gap();
+                    continue;
+                }
+            },
+            None => rx.recv().await,
+        };
+        let Some(found) = found else {
+            break;
+        };
+        match found {
+            Found::Record {
+                job,
+                index,
+                sealed,
+                go_on,
+            } => {
+                read_any = true;
+                let (at, id) = &purchases[job];
+                let more = match wallet.apply_delivery(id, index, &sealed, now) {
+                    Ok(crate::psp::Delivered::Stored(record)) => {
+                        out[*at].new.push(record);
+                        true
+                    }
+                    Ok(crate::psp::Delivered::AlreadyDone) => true,
+                    Err(WalletError::Mint(why)) => {
+                        out[*at].skipped.push((index, why));
+                        wallet.skip_record(id, index)?;
+                        true
+                    }
+                    Err(e) => {
+                        out[*at].problem = Some(e.to_string());
+                        false
+                    }
+                };
+                // The session is gone only when it has ended already.
+                let _ = go_on.send(more);
+            }
+            Found::Ended { job, failed: None } => ended[job] = true,
+            Found::Ended {
+                job,
+                failed: Some(why),
+            } => {
+                ended[job] = true;
+                failed += 1;
+                let why =
+                    format!("the PSP mint's records could not be read from the AIR server: {why}");
+                out[purchases[job].0].problem = Some(WalletError::Mint(why.clone()).to_string());
+                stopped.get_or_insert(why);
+            }
+        }
+    }
+    // A purchase whose session ended without a word (it panicked) was not read to
+    // its end: it must not look like a purchase with no record yet, which is
+    // dropped as unpaid after `psp.unpaid_key_days`.
+    for (job, (at, _)) in purchases.iter().enumerate() {
+        if !ended[job] && out[*at].problem.is_none() {
+            out[*at].problem =
+                Some("not read to its end this time, and read again at the next start".into());
+        }
+    }
+    let Some(why) = stopped else {
+        return Ok(());
+    };
+    if failed == opened && !read_any {
+        return Err(WalletError::Mint(why));
+    }
+    for cells in waiting {
+        out[purchases[cells.job].0].problem = Some(format!(
+            "not read this time, and read again at the next start: an earlier read failed ({why})"
+        ));
+    }
+    Ok(())
+}
+
 /// Read the next owed record of every claim key and apply what is there.
 ///
 /// Each key's records are the cells 0, 1, 2 and so on of the PSP mint, computed
@@ -140,31 +375,52 @@ pub struct PickedUp {
 /// signature is checked ([`Wallet::apply_delivery`]), skips a cell that does not
 /// open ([`PickedUp::skipped`]) and reads on, and stops at the first cell that is
 /// empty, which it will read again the next time. A key that holds no record yet
-/// is waited for, for `wait_secs` in all (0 reads once and returns); a key that
-/// holds records is read once. Reading again changes nothing: a cell that was
-/// applied or skipped is not read again.
+/// is waited for (0 reads once and returns); a key that holds records is read
+/// once. Reading again changes nothing: a cell that was applied or skipped is not
+/// read again.
+///
+/// **One AIR session per purchase.** Each claim key (purchase) is read on an AIR
+/// session of its own, and no session reads or holds the cells of two purchases:
+/// the Issuer runs the AIR server and would otherwise learn which purchases are
+/// one buyer's. The purchases are taken in a random order, and each session after
+/// the first is opened after a random pause of 1 to 30 seconds. So the call takes
+/// up to about 30 seconds for each purchase after the first, and blocks the
+/// calling thread for that long (an app may call it from a thread of its own).
+/// The sessions that wait run side by side: each waits until `wait_secs` after
+/// the call began, counted from when its session is opened, and one opened later
+/// than that is read once. The result is in the order of
+/// [`Wallet::claim_keys`], whatever order the purchases were read in.
 ///
 /// With no claim key nothing is asked of the network and the AIR settings are not
 /// needed. Otherwise they are, and a missing `air.server` or `air.host` is an
 /// error that names it. An unreachable AIR server is [`WalletError::Mint`] and
 /// changes nothing; a record that fails a check is that key's
-/// [`PickedUp::skipped`] and the others are still picked up.
+/// [`PickedUp::skipped`] and the others are still picked up. A read that fails
+/// after another purchase was read is that purchase's [`PickedUp::problem`], and
+/// the purchases not read yet are left for the next start (their `problem` says
+/// so).
 pub fn psp_pickup(
     wallet: &mut Wallet,
     air: &AirSettings,
     wait_secs: u64,
 ) -> Result<Vec<PickedUp>, WalletError> {
-    struct Job {
-        out: usize,
-        id: String,
-        psp: ServiceDid,
-        claim: ServiceDid,
-        next: u32,
-        had_records: bool,
-    }
+    pickup_of(wallet, air, wait_secs, None)
+}
+
+/// [`psp_pickup`] for every claim key (`only` is `None`), or for the one claim key
+/// `only` names ([`psp_one_purchase`]): then the result holds that key alone.
+fn pickup_of(
+    wallet: &mut Wallet,
+    air: &AirSettings,
+    wait_secs: u64,
+    only: Option<&str>,
+) -> Result<Vec<PickedUp>, WalletError> {
     let mut out: Vec<PickedUp> = Vec::new();
-    let mut jobs: Vec<Job> = Vec::new();
+    let mut jobs: Vec<(usize, String, PurchaseCells)> = Vec::new();
     for key in wallet.claim_keys() {
+        if only.is_some_and(|id| key.id != id) {
+            continue;
+        }
         out.push(PickedUp {
             id: key.id.clone(),
             new: Vec::new(),
@@ -172,22 +428,22 @@ pub fn psp_pickup(
             no_record: false,
             problem: None,
         });
-        let made = (|| -> Result<Job, String> {
+        let made = (|| -> Result<PurchaseCells, String> {
             let psp = ServiceDid::parse(&key.psp_did)
                 .map_err(|e| format!("the PSP mint key the purchase was sealed to: {e}"))?;
             let claim = ServiceDid::parse(&key.claim_did)
                 .map_err(|e| format!("the saved claim DID: {e}"))?;
-            Ok(Job {
-                out: out.len() - 1,
-                id: key.id.clone(),
+            Ok(PurchaseCells {
+                // set below, once the order is drawn
+                job: 0,
                 psp,
                 claim,
                 next: key.next_index,
-                had_records: !key.records.is_empty(),
+                hold: key.records.is_empty(),
             })
         })();
         match made {
-            Ok(job) => jobs.push(job),
+            Ok(cells) => jobs.push((out.len() - 1, key.id.clone(), cells)),
             Err(why) => {
                 let last = out.len() - 1;
                 out[last].problem = Some(why);
@@ -204,94 +460,26 @@ pub fn psp_pickup(
     let server = ServerRef { name, host };
     let read_secs = air.timeout_secs;
     let now = sp_wire::air_request::addr::now_secs();
-    let mut active: Vec<Job> = jobs;
-    let mut first_round = true;
-    while !active.is_empty() {
-        // Only a key with no record yet is waited for, and only in the first
-        // round: a key that has records is read once.
-        let hold: Vec<bool> = active
-            .iter()
-            .map(|j| first_round && !j.had_records)
-            .collect();
-        let addresses: Vec<_> = active
-            .iter()
-            .map(|j| delivery::owed_address(&j.psp, &j.claim, j.next))
-            .collect();
-        let waited: Vec<_> = addresses
-            .iter()
-            .zip(&hold)
-            .filter(|(_, h)| **h)
-            .map(|(a, _)| *a)
-            .collect();
-        let once: Vec<_> = addresses
-            .iter()
-            .zip(&hold)
-            .filter(|(_, h)| !**h)
-            .map(|(a, _)| *a)
-            .collect();
-        let read = block_on_new_runtime(|| async {
-            let client = client::connect(&server).await.map_err(|e| e.0)?;
-            let waited = if waited.is_empty() {
-                Vec::new()
-            } else {
-                delivery::read_records(&client, &waited, read_secs, wait_secs)
-                    .await
-                    .map_err(|e| e.0)?
-            };
-            let once = if once.is_empty() {
-                Vec::new()
-            } else {
-                delivery::read_records(&client, &once, read_secs, 0)
-                    .await
-                    .map_err(|e| e.0)?
-            };
-            Ok::<_, String>((waited, once))
-        })
-        .map_err(|e| WalletError::Mint(e.0))
-        .and_then(|r| {
-            r.map_err(|e| {
-                WalletError::Mint(format!(
-                    "the PSP mint's records could not be read from the AIR server: {e}"
-                ))
-            })
-        });
-        let (mut waited, mut once) = match read {
-            Ok((waited, once)) => (waited.into_iter(), once.into_iter()),
-            Err(e) if first_round => return Err(e),
-            Err(e) => {
-                for job in &active {
-                    out[job.out].problem = Some(e.to_string());
-                }
-                break;
-            }
-        };
-        first_round = false;
-        let mut next_round = Vec::new();
-        for (mut job, hold) in active.into_iter().zip(hold) {
-            let sealed = (if hold { waited.next() } else { once.next() }).flatten();
-            let Some(bytes) = sealed else {
-                continue;
-            };
-            match wallet.apply_delivery(&job.id, job.next, &bytes, now) {
-                Ok(crate::psp::Delivered::Stored(record)) => out[job.out].new.push(record),
-                Ok(crate::psp::Delivered::AlreadyDone) => {}
-                Err(WalletError::Mint(why)) => {
-                    out[job.out].skipped.push((job.next, why));
-                    wallet.skip_record(&job.id, job.next)?;
-                }
-                Err(e) => {
-                    out[job.out].problem = Some(e.to_string());
-                    continue;
-                }
-            }
-            job.next += 1;
-            job.had_records = true;
-            next_round.push(job);
-        }
-        active = next_round;
+    // A random order, not the order the purchases were made in. Each keeps its
+    // place in `jobs` (`PurchaseCells::job`), and `out` keeps the claim keys'.
+    let mut order = jobs;
+    order.shuffle(&mut OsRng);
+    let mut jobs: Vec<(usize, String, PurchaseCells)> = Vec::with_capacity(order.len());
+    for (job, (at, id, mut cells)) in order.into_iter().enumerate() {
+        cells.job = job;
+        jobs.push((at, id, cells));
     }
-    for (p, key) in out.iter_mut().zip(wallet.claim_keys()) {
-        p.no_record = key.records.is_empty() && p.problem.is_none();
+    {
+        let (wallet, out) = (&mut *wallet, &mut out[..]);
+        block_on_new_runtime(move || {
+            pick_up_each(wallet, out, jobs, server, read_secs, wait_secs, now)
+        })
+        .map_err(|e| WalletError::Mint(e.0))??;
+    }
+    for p in out.iter_mut() {
+        if let Some(key) = wallet.claim_keys().iter().find(|k| k.id == p.id) {
+            p.no_record = key.records.is_empty() && p.problem.is_none();
+        }
     }
     Ok(out)
 }
@@ -495,10 +683,33 @@ fn current_keys(
 /// to another one ([`ClaimOutcome::NotSent`]). A failed call is that record's
 /// [`ClaimOutcome::Failed`] and stops the others (the AIR server cannot be
 /// reached); the record is tried again at the next start.
+///
+/// **The purchases are taken in a random order**, each purchase's records in
+/// order, and before the first call for a purchase after the first one the wallet
+/// pauses for a random 1 to 30 seconds: claims of two purchases sent one right
+/// after the other would tell the Issuer they are one buyer's. Every call is on an
+/// AIR session of its own. So the call takes up to about 30 seconds for each
+/// purchase after the first, and blocks the calling thread for that long (an app
+/// may call it from a thread of its own). The reports are in the order the
+/// records were taken: each purchase's in index order, the purchases in the
+/// random order.
 pub fn psp_claim(wallet: &mut Wallet, air: &AirSettings) -> Result<Vec<ClaimReport>, WalletError> {
+    claim_of(wallet, air, None)
+}
+
+/// [`psp_claim`] for every purchase (`only` is `None`), or for the records of the
+/// one purchase `only` names ([`psp_one_purchase`]).
+fn claim_of(
+    wallet: &mut Wallet,
+    air: &AirSettings,
+    only: Option<&str>,
+) -> Result<Vec<ClaimReport>, WalletError> {
     use crate::psp::ClaimStatus;
     let now = sp_wire::air_request::addr::now_secs();
-    let to_do = wallet.open_claims(now);
+    let mut to_do = wallet.open_claims(now);
+    if let Some(id) = only {
+        to_do.retain(|o| o.id == id);
+    }
     let mut out = Vec::new();
     if to_do.is_empty() {
         return Ok(out);
@@ -514,107 +725,132 @@ pub fn psp_claim(wallet: &mut Wallet, air: &AirSettings) -> Result<Vec<ClaimRepo
             what,
         });
     };
+    // One list per purchase, each in the order of its records, and the purchases
+    // in a random order.
+    let mut purchases: Vec<Vec<crate::psp::OpenClaim>> = Vec::new();
     for open in to_do {
-        let (id, index) = (open.id.clone(), open.index);
-        if open.psp != psp {
-            push(
-                &mut out,
-                &id,
-                index,
-                ClaimOutcome::NotSent(format!(
-                    "purchase {id} was sealed to the PSP mint {}, but air.psp_did is {psp}. A claim is for the PSP mint the purchase was sent to, so nothing was sent",
-                    open.psp
-                )),
-            );
-            continue;
+        match purchases.iter_mut().find(|p| p[0].id == open.id) {
+            Some(records) => records.push(open),
+            None => purchases.push(vec![open]),
         }
-        // The other saved claims a merge kept go first: if the PSP mint signed one
-        // of them, the record is done with it and the main one is not sent.
-        match send_others(wallet, air, &id, index, false)? {
-            (Some(Step::Settled(settled)), _) => {
-                push(&mut out, &id, index, ClaimOutcome::Claimed(settled));
-                continue;
-            }
-            (Some(_), _) => continue,
-            (None, true) => {
+    }
+    purchases.shuffle(&mut OsRng);
+    let mut called = false;
+    'purchases: for records in purchases {
+        let mut this_called = false;
+        for open in records {
+            let (id, index) = (open.id.clone(), open.index);
+            if open.psp != psp {
                 push(
                     &mut out,
                     &id,
                     index,
-                    ClaimOutcome::Failed(
-                        "an other saved claim could not be sent: the AIR server cannot be reached"
-                            .into(),
-                    ),
+                    ClaimOutcome::NotSent(format!(
+                        "purchase {id} was sealed to the PSP mint {}, but air.psp_did is {psp}. A claim is for the PSP mint the purchase was sent to, so nothing was sent",
+                        open.psp
+                    )),
                 );
-                break;
-            }
-            (None, false) => {}
-        }
-        if open.status == ClaimStatus::Due {
-            let (window, keys) = match current_keys(wallet, air) {
-                Ok(read) => read,
-                Err(e) => {
-                    push(&mut out, &id, index, ClaimOutcome::Failed(e.to_string()));
-                    break;
-                }
-            };
-            if let Err(e) = wallet.build_claim(&id, index, &window, &keys, now) {
-                push(&mut out, &id, index, ClaimOutcome::Failed(e.to_string()));
                 continue;
             }
-        }
-        let mut step = send_saved(wallet, air, &id, index)?;
-        if matches!(step, Step::NoReply) {
-            // A claim the PSP mint refused gets no reply, so what is left to ask is
-            // whether the keyset the claim names is still the one it signs with.
-            if let Ok(window) = psp_window(wallet, air) {
-                let sent = wallet.claim_to_send(&id, index)?;
-                if window.current_id != sent.keyset {
-                    if let Ok(keys) = psp_keys(wallet, air)
-                        && wallet.build_claim(&id, index, &window, &keys, now).is_ok()
-                    {
-                        step = send_saved(wallet, air, &id, index)?;
-                    }
-                } else {
-                    step = send_saved(wallet, air, &id, index)?;
+            // A pause before this purchase's first call, when an earlier purchase made
+            // one: none before the first purchase, none between records of one.
+            if !this_called {
+                if called {
+                    std::thread::sleep(purchase_gap());
                 }
+                this_called = true;
+                called = true;
             }
-        }
-        match step {
-            Step::Settled(settled) => push(&mut out, &id, index, ClaimOutcome::Claimed(settled)),
-            Step::Already => {}
-            Step::NoReply => {
-                let open = wallet
-                    .open_claims(now)
-                    .into_iter()
-                    .find(|o| o.id == id && o.index == index);
-                match open {
-                    // nothing more can be built and nothing came back: said once
-                    Some(o) if o.status == ClaimStatus::Refused && !o.told_lost => {
-                        wallet.note_told_lost(&id, index)?;
-                        let loss = wallet.refused_loss(&id, index).expect("the record is open");
-                        let what = ClaimOutcome::NotAccepted {
-                            loss,
-                            attempts: o.attempts,
-                        };
-                        push(&mut out, &id, index, what);
-                    }
-                    Some(o) => push(
+            // The other saved claims a merge kept go first: if the PSP mint signed one
+            // of them, the record is done with it and the main one is not sent.
+            match send_others(wallet, air, &id, index, false)? {
+                (Some(Step::Settled(settled)), _) => {
+                    push(&mut out, &id, index, ClaimOutcome::Claimed(settled));
+                    continue;
+                }
+                (Some(_), _) => continue,
+                (None, true) => {
+                    push(
                         &mut out,
                         &id,
                         index,
-                        ClaimOutcome::Waiting {
-                            attempts: o.attempts,
-                            window_ends: o.window_ends,
-                        },
-                    ),
-                    None => {}
+                        ClaimOutcome::Failed(
+                            "an other saved claim could not be sent: the AIR server cannot be reached"
+                                .into(),
+                        ),
+                    );
+                    break 'purchases;
+                }
+                (None, false) => {}
+            }
+            if open.status == ClaimStatus::Due {
+                let (window, keys) = match current_keys(wallet, air) {
+                    Ok(read) => read,
+                    Err(e) => {
+                        push(&mut out, &id, index, ClaimOutcome::Failed(e.to_string()));
+                        break 'purchases;
+                    }
+                };
+                if let Err(e) = wallet.build_claim(&id, index, &window, &keys, now) {
+                    push(&mut out, &id, index, ClaimOutcome::Failed(e.to_string()));
+                    continue;
                 }
             }
-            Step::Failed { why, network } => {
-                push(&mut out, &id, index, ClaimOutcome::Failed(why));
-                if network {
-                    break;
+            let mut step = send_saved(wallet, air, &id, index)?;
+            if matches!(step, Step::NoReply) {
+                // A claim the PSP mint refused gets no reply, so what is left to ask is
+                // whether the keyset the claim names is still the one it signs with.
+                if let Ok(window) = psp_window(wallet, air) {
+                    let sent = wallet.claim_to_send(&id, index)?;
+                    if window.current_id != sent.keyset {
+                        if let Ok(keys) = psp_keys(wallet, air)
+                            && wallet.build_claim(&id, index, &window, &keys, now).is_ok()
+                        {
+                            step = send_saved(wallet, air, &id, index)?;
+                        }
+                    } else {
+                        step = send_saved(wallet, air, &id, index)?;
+                    }
+                }
+            }
+            match step {
+                Step::Settled(settled) => {
+                    push(&mut out, &id, index, ClaimOutcome::Claimed(settled))
+                }
+                Step::Already => {}
+                Step::NoReply => {
+                    let open = wallet
+                        .open_claims(now)
+                        .into_iter()
+                        .find(|o| o.id == id && o.index == index);
+                    match open {
+                        // nothing more can be built and nothing came back: said once
+                        Some(o) if o.status == ClaimStatus::Refused && !o.told_lost => {
+                            wallet.note_told_lost(&id, index)?;
+                            let loss = wallet.refused_loss(&id, index).expect("the record is open");
+                            let what = ClaimOutcome::NotAccepted {
+                                loss,
+                                attempts: o.attempts,
+                            };
+                            push(&mut out, &id, index, what);
+                        }
+                        Some(o) => push(
+                            &mut out,
+                            &id,
+                            index,
+                            ClaimOutcome::Waiting {
+                                attempts: o.attempts,
+                                window_ends: o.window_ends,
+                            },
+                        ),
+                        None => {}
+                    }
+                }
+                Step::Failed { why, network } => {
+                    push(&mut out, &id, index, ClaimOutcome::Failed(why));
+                    if network {
+                        break 'purchases;
+                    }
                 }
             }
         }
@@ -664,88 +900,137 @@ pub struct Closed {
 ///
 /// A record sealed to another PSP mint than `air.psp_did` has its claim given up
 /// with nothing sent.
+///
+/// **The purchases are taken in a random order**, each purchase's records in
+/// order, and before the first resend of each purchase after the first one the
+/// wallet pauses for a random 1 to 30 seconds, as [`psp_claim`] does: last resends
+/// of two purchases sent one right after the other would tell the Issuer they are
+/// one buyer's. Every resend is on an AIR session of its own. So the call takes up
+/// to about 30 seconds for each purchase after the first that has a resend to
+/// send, and blocks the calling thread for that long. [`Closed::reports`] and
+/// [`Closed::kept`] are in the order the records were taken.
 pub fn psp_close_expired(
     wallet: &mut Wallet,
     air: &AirSettings,
     now: u64,
+) -> Result<Closed, WalletError> {
+    close_of(wallet, air, now, None)
+}
+
+/// [`psp_close_expired`] for every purchase (`only` is `None`), or with the last
+/// resends of the one purchase `only` names ([`psp_one_purchase`]). Either way the
+/// close that needs no network ([`Wallet::close_expired`]) is made for every key:
+/// a record that still holds a saved claim is not lost or deleted by it, so
+/// another purchase's last resend waits for its own turn.
+fn close_of(
+    wallet: &mut Wallet,
+    air: &AirSettings,
+    now: u64,
+    only: Option<&str>,
 ) -> Result<Closed, WalletError> {
     let mut reports = Vec::new();
     let mut kept: Vec<ClaimReport> = Vec::new();
     let psp = Party::Psp.did(air).to_hex();
     let address = Party::Psp.address(air);
     let mut unreachable = false;
-    for (id, index, mint) in wallet.expired_claims(now) {
-        if mint != psp {
-            wallet.give_up_claim(&id, index)?;
+    // One list per purchase, each in the order of its records, and the purchases
+    // in a random order, as in `psp_claim`.
+    let mut purchases: Vec<Vec<(String, u32, String)>> = Vec::new();
+    for record in wallet.expired_claims(now) {
+        if only.is_some_and(|id| record.0 != id) {
             continue;
         }
-        let not_sent = |why: String| ClaimReport {
-            id: id.clone(),
-            index,
-            what: ClaimOutcome::NotSent(why),
-        };
-        if let Err(e) = &address {
-            kept.push(not_sent(format!(
-                "the saved claim was not sent one last time: {e}"
-            )));
-            continue;
+        match purchases.iter_mut().find(|p| p[0].0 == record.0) {
+            Some(records) => records.push(record),
+            None => purchases.push(vec![record]),
         }
-        if unreachable {
-            kept.push(not_sent(
-                "the saved claim was not sent one last time: an earlier call failed and the AIR server cannot be reached"
-                    .into(),
-            ));
-            continue;
-        }
-        match send_others(wallet, air, &id, index, true)? {
-            (Some(Step::Settled(settled)), _) => {
-                reports.push(ClaimReport {
+    }
+    purchases.shuffle(&mut OsRng);
+    let mut called = false;
+    for records in purchases {
+        let mut this_called = false;
+        for (id, index, mint) in records {
+            if mint != psp {
+                wallet.give_up_claim(&id, index)?;
+                continue;
+            }
+            let not_sent = |why: String| ClaimReport {
+                id: id.clone(),
+                index,
+                what: ClaimOutcome::NotSent(why),
+            };
+            if let Err(e) = &address {
+                kept.push(not_sent(format!(
+                    "the saved claim was not sent one last time: {e}"
+                )));
+                continue;
+            }
+            if unreachable {
+                kept.push(not_sent(
+                    "the saved claim was not sent one last time: an earlier call failed and the AIR server cannot be reached"
+                        .into(),
+                ));
+                continue;
+            }
+            // A pause before this purchase's first resend, when an earlier purchase
+            // sent one: none before the first purchase, none between records of one.
+            if !this_called {
+                if called {
+                    std::thread::sleep(purchase_gap());
+                }
+                this_called = true;
+                called = true;
+            }
+            match send_others(wallet, air, &id, index, true)? {
+                (Some(Step::Settled(settled)), _) => {
+                    reports.push(ClaimReport {
+                        id,
+                        index,
+                        what: ClaimOutcome::Claimed(settled),
+                    });
+                    continue;
+                }
+                (Some(_), _) => continue,
+                (None, true) => {
+                    unreachable = true;
+                    kept.push(ClaimReport {
+                        id: id.clone(),
+                        index,
+                        what: ClaimOutcome::Failed(
+                            "the last resend of an other saved claim could not be sent: the AIR server cannot be reached"
+                                .into(),
+                        ),
+                    });
+                    continue;
+                }
+                (None, false) => {}
+            }
+            if wallet.claim_to_send(&id, index).is_err() {
+                // only other saved claims were left, and none was answered
+                wallet.give_up_claim(&id, index)?;
+                continue;
+            }
+            match send_saved(wallet, air, &id, index)? {
+                Step::Settled(settled) => reports.push(ClaimReport {
                     id,
                     index,
                     what: ClaimOutcome::Claimed(settled),
-                });
-                continue;
-            }
-            (Some(_), _) => continue,
-            (None, true) => {
-                unreachable = true;
-                kept.push(ClaimReport {
-                    id: id.clone(),
-                    index,
-                    what: ClaimOutcome::Failed(
-                        "the last resend of an other saved claim could not be sent: the AIR server cannot be reached"
-                            .into(),
-                    ),
-                });
-                continue;
-            }
-            (None, false) => {}
-        }
-        if wallet.claim_to_send(&id, index).is_err() {
-            // only other saved claims were left, and none was answered
-            wallet.give_up_claim(&id, index)?;
-            continue;
-        }
-        match send_saved(wallet, air, &id, index)? {
-            Step::Settled(settled) => reports.push(ClaimReport {
-                id,
-                index,
-                what: ClaimOutcome::Claimed(settled),
-            }),
-            Step::Already => {}
-            Step::NoReply => wallet.give_up_claim(&id, index)?,
-            Step::Failed { why, network } => {
-                let report = ClaimReport {
-                    id: id.clone(),
-                    index,
-                    what: ClaimOutcome::Failed(why),
-                };
-                if network {
-                    unreachable = true;
-                    kept.push(report);
-                } else {
-                    wallet.give_up_claim(&id, index)?;
-                    reports.push(report);
+                }),
+                Step::Already => {}
+                Step::NoReply => wallet.give_up_claim(&id, index)?,
+                Step::Failed { why, network } => {
+                    let report = ClaimReport {
+                        id: id.clone(),
+                        index,
+                        what: ClaimOutcome::Failed(why),
+                    };
+                    if network {
+                        unreachable = true;
+                        kept.push(report);
+                    } else {
+                        wallet.give_up_claim(&id, index)?;
+                        reports.push(report);
+                    }
                 }
             }
         }
@@ -757,6 +1042,98 @@ pub fn psp_close_expired(
         kept,
         lost,
     })
+}
+
+/// What [`psp_one_purchase`] did: one purchase's close, pickup and claims.
+#[derive(Debug)]
+pub struct OnePurchase {
+    /// The purchase drawn (its claim key's id), or `None` when the wallet holds no
+    /// claim key and nothing was done.
+    pub id: Option<String>,
+    /// The close of the drawn purchase's records whose window has passed (its
+    /// last resends), and what the close without network reported lost for every
+    /// key, as [`psp_close_expired`] says it.
+    pub closed: Closed,
+    /// The drawn purchase's pickup ([`psp_pickup`], one purchase, no waiting):
+    /// `None` when it was not read (its key went with the close, or `air.server`
+    /// or `air.host` is not set), `Some(Err)` when the AIR server could not be
+    /// read.
+    pub picked: Option<Result<PickedUp, WalletError>>,
+    /// The claims of the drawn purchase's open records ([`psp_claim`], one
+    /// purchase): `None` when it was not read or has no open record, `Some(Err)`
+    /// when the PSP mint's wire version or network did not check out or a claim
+    /// could not be made.
+    pub claims: Option<Result<Vec<ClaimReport>, WalletError>>,
+    /// How many other purchases (claim keys) are held and were not touched: a
+    /// later call, or [`psp_pickup`] and [`psp_claim`], takes them.
+    pub others_pending: usize,
+}
+
+/// The quick start step for the PSP purchases, for an app and for the command
+/// line's start: **one** purchase, drawn at random (`OsRng`) among every claim key
+/// the wallet holds (each one's next cell still needs a read), has its closed
+/// windows' last resends sent ([`psp_close_expired`]), is picked up with no
+/// waiting ([`psp_pickup`]) and has its open records claimed ([`psp_claim`]), each
+/// call on an AIR session of its own and with no pause. The other purchases are not
+/// touched: [`OnePurchase::others_pending`] says how many, and a later call (one
+/// purchase each time) or [`psp_pickup`] and [`psp_claim`] (all of them, with a
+/// random pause of 1 to 30 seconds between two) take them. Handling one purchase
+/// per call is what keeps the Issuer, who runs the AIR server, from seeing two
+/// purchases read or claimed together, without making the caller wait out the
+/// pauses.
+///
+/// Before a claim is sent the PSP mint's wire version and network are checked
+/// ([`verify_psp`], against `expected_network`). With no claim key nothing is done
+/// and nothing is asked of the network. Without `air.server` and `air.host` only
+/// the close is made (its resends are kept, [`Closed::kept`]). An error is
+/// returned only when the wallet file could not be written in the close; a failed
+/// pickup or claim is in the result.
+pub fn psp_one_purchase(
+    wallet: &mut Wallet,
+    air: &AirSettings,
+    expected_network: &str,
+    now: u64,
+) -> Result<OnePurchase, WalletError> {
+    let ids: Vec<String> = wallet.claim_keys().iter().map(|k| k.id.clone()).collect();
+    let Some(id) = ids.choose(&mut OsRng).cloned() else {
+        return Ok(OnePurchase {
+            id: None,
+            closed: Closed {
+                reports: Vec::new(),
+                kept: Vec::new(),
+                lost: Vec::new(),
+            },
+            picked: None,
+            claims: None,
+            others_pending: 0,
+        });
+    };
+    let closed = close_of(wallet, air, now, Some(&id))?;
+    let held = |w: &Wallet| w.claim_keys().iter().any(|k| k.id == id);
+    let mut one = OnePurchase {
+        id: Some(id.clone()),
+        closed,
+        picked: None,
+        claims: None,
+        others_pending: 0,
+    };
+    if held(wallet) && Party::Psp.address(air).is_ok() {
+        let picked = pickup_of(wallet, air, 0, Some(&id)).and_then(|mut p| {
+            p.pop()
+                .ok_or_else(|| WalletError::Unknown(format!("purchase {id} was not read")))
+        });
+        let read = picked.is_ok();
+        one.picked = Some(picked);
+        let open = wallet.open_claims(now).iter().any(|o| o.id == id);
+        if read && open {
+            one.claims = Some(
+                verify_psp(wallet, air, expected_network)
+                    .and_then(|()| claim_of(wallet, air, Some(&id))),
+            );
+        }
+    }
+    one.others_pending = wallet.claim_keys().len() - usize::from(held(wallet));
+    Ok(one)
 }
 
 /// A POST to the PSP: `route` is `rollover` or `check-state`, `body` the request
@@ -1608,4 +1985,22 @@ fn reclaim_handoff_with(
     log.push(send_rollover(wallet, &rollover, &mut *post)?);
     let standing = check_handoff_with(wallet, id, &mut *post)?;
     Ok(Reclaim { standing, log })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The pause between two purchases is 1 to 30 seconds, fixed in code. Fails if
+    /// either bound is changed, or the two are swapped.
+    #[test]
+    fn the_pause_between_purchases_is_one_to_thirty_seconds() {
+        assert_eq!(PURCHASE_GAP_MIN_SECS, 1);
+        assert_eq!(PURCHASE_GAP_MAX_SECS, 30);
+        const {
+            assert!(1 <= PURCHASE_GAP_MIN_SECS);
+            assert!(PURCHASE_GAP_MIN_SECS <= PURCHASE_GAP_MAX_SECS);
+            assert!(PURCHASE_GAP_MAX_SECS <= 30);
+        }
+    }
 }

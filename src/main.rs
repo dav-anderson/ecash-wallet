@@ -51,7 +51,11 @@ ecash-wallet [--wallet FILE] [--config FILE] [--regtest|--signet|--testnet] <com
       with the units, and deletes the purchase's key once every record of it is
       past its window. Needs air.server and air.host. Any other command also
       picks up and claims what is already there when it starts. There is nothing
-      to paste.
+      to paste. Each purchase is read and claimed on AIR sessions of its own, in
+      a random order, with a random 1 to 30 second pause between two purchases
+      (so the AIR server cannot tell they are one buyer's): with several
+      purchases this takes that much longer. A start of any other command takes
+      one purchase only, with no pause, and says how many others are waiting.
   exchange --service DID --psp N [--amounts A,B,C] [--resume ID]
       Exchange at least N PSP for ESP bound to a service (its 33-byte AIR DID,
       66 hex characters). The smallest exchange is 1 PSP. The mint's exchange is exact, so the
@@ -576,32 +580,36 @@ fn claim_records(
 /// cannot be reached) is not forgotten: it is kept and closed at the next start.
 /// Says what it settled, what it kept and what it lost; changes nothing otherwise.
 fn close_expired_psp(wallet: &mut Wallet) {
-    use ecash_wallet::mint_info::ClaimOutcome;
     match ecash_wallet::mint_info::psp_close_expired(wallet, &air_settings(), now_secs()) {
-        Ok(closed) => {
-            for r in &closed.reports {
-                match &r.what {
-                    ClaimOutcome::Failed(why) => eprintln!(
-                        "psp: purchase {}, record {}: the last resend before the window closed failed: {why}",
-                        r.id, r.index
-                    ),
-                    _ => eprintln!("psp: {}", claim_line(r)),
-                }
-            }
-            for r in &closed.kept {
-                let (ClaimOutcome::Failed(why) | ClaimOutcome::NotSent(why)) = &r.what else {
-                    continue;
-                };
-                eprintln!(
-                    "psp: purchase {}, record {}: its window has closed, and the last resend of its claim could not be sent ({why}). The purchase is kept, and the resend is tried again at the next start",
-                    r.id, r.index
-                );
-            }
-            for loss in closed.lost {
-                eprintln!("psp: {}", loss.said());
-            }
-        }
+        Ok(closed) => say_closed(closed),
         Err(e) => eprintln!("psp: closed records not deleted, retried on the next run: {e}"),
+    }
+}
+
+/// The lines about a close: what the last resends settled, what was kept for the
+/// next start and what was lost.
+fn say_closed(closed: ecash_wallet::mint_info::Closed) {
+    use ecash_wallet::mint_info::ClaimOutcome;
+    for r in &closed.reports {
+        match &r.what {
+            ClaimOutcome::Failed(why) => eprintln!(
+                "psp: purchase {}, record {}: the last resend before the window closed failed: {why}",
+                r.id, r.index
+            ),
+            _ => eprintln!("psp: {}", claim_line(r)),
+        }
+    }
+    for r in &closed.kept {
+        let (ClaimOutcome::Failed(why) | ClaimOutcome::NotSent(why)) = &r.what else {
+            continue;
+        };
+        eprintln!(
+            "psp: purchase {}, record {}: its window has closed, and the last resend of its claim could not be sent ({why}). The purchase is kept, and the resend is tried again at the next start",
+            r.id, r.index
+        );
+    }
+    for loss in closed.lost {
+        eprintln!("psp: {}", loss.said());
     }
 }
 
@@ -1770,42 +1778,52 @@ fn startup_rotation_sync(wallet: &mut Wallet) {
     }
 }
 
-/// At startup: delete what a closed window leaves, then read the next record of
-/// each purchase (one read, no waiting; `claim-psp` waits for the first record of
-/// a purchase) and claim what is owed. A purchase with no record yet, and a claim
-/// that is waiting for the PSP mint's answer, are not mentioned (the same claim is
-/// sent again at the next start). A missing `air.server` or `air.host` is said, as
-/// a note.
+/// At startup: ONE purchase, drawn at random, has what its closed windows leave
+/// closed, its next record read (one read, no waiting; `claim-psp` waits for the
+/// first record of a purchase) and what it is owed claimed, with no pause
+/// (`mint_info::psp_one_purchase`). The other purchases wait for a later start, or
+/// for `claim-psp`, which takes them all with a random pause of 1 to 30 seconds
+/// between two; a line says how many are waiting. A purchase with no record yet,
+/// and a claim that is waiting for the PSP mint's answer, are not mentioned (the
+/// same claim is sent again at the next start). A missing `air.server` or
+/// `air.host` is said, as a note.
 fn startup_psp(wallet: &mut Wallet) {
-    close_expired_psp(wallet);
     let purchases = wallet.claim_keys().len();
     if purchases == 0 {
         return;
     }
     let air = air_settings();
+    let one = match ecash_wallet::mint_info::psp_one_purchase(wallet, &air, network(), now_secs()) {
+        Ok(one) => one,
+        Err(e) => {
+            eprintln!("psp: closed records not deleted, retried on the next run: {e}");
+            return;
+        }
+    };
+    say_closed(one.closed);
     if let Err(e) = air.require() {
         eprintln!(
             "psp: {purchases} purchase(s) are held, and the PSP mint's records for them are not checked: {e}"
         );
         return;
     }
-    match ecash_wallet::mint_info::psp_pickup(wallet, &air, 0) {
-        Ok(picked) => {
-            let expired = expire_unpaid(wallet, &picked, "psp: ");
-            for p in picked.iter().filter(|p| !expired.contains(&p.id)) {
+    match &one.picked {
+        Some(Ok(p)) => {
+            let expired = expire_unpaid(wallet, std::slice::from_ref(p), "psp: ");
+            if !expired.contains(&p.id) {
                 for line in pickup_lines(p, false) {
                     eprintln!("psp: {line}");
                 }
             }
         }
-        Err(e) => {
-            eprintln!("psp: the PSP mint's records were not checked, retried on the next run: {e}");
-            return;
+        Some(Err(e)) => {
+            eprintln!("psp: the PSP mint's records were not checked, retried on the next run: {e}")
         }
+        None => {}
     }
-    match claim_records(wallet) {
-        Ok(reports) => {
-            for r in &reports {
+    match &one.claims {
+        Some(Ok(reports)) => {
+            for r in reports {
                 if !matches!(
                     r.what,
                     ecash_wallet::mint_info::ClaimOutcome::Waiting { .. }
@@ -1814,12 +1832,19 @@ fn startup_psp(wallet: &mut Wallet) {
                 }
             }
         }
-        Err(e @ WalletError::Invalid(_)) => {
+        Some(Err(e @ WalletError::Invalid(_))) => {
             eprintln!("psp: the records waiting to be claimed were not checked: {e}")
         }
-        Err(e) => eprintln!(
+        Some(Err(e)) => eprintln!(
             "psp: the records waiting to be claimed were not checked, retried on the next run: {e}"
         ),
+        None => {}
+    }
+    if one.others_pending > 0 {
+        eprintln!(
+            "psp: {} other purchase(s) are pending and were not checked at this start (one is checked per start, so the AIR server cannot tie them together); run claim-psp to check them all now",
+            one.others_pending
+        );
     }
 }
 

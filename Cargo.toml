@@ -1,6 +1,6 @@
 [package]
 name = "ecash-wallet"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2024"
 rust-version = "1.93"
 license = "MIT"
@@ -47,6 +47,10 @@ axum = "0.8"
 # routes. The wallet itself makes no HTTP call.
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time"] }
+# Only `psp_delivery` uses it, to read the test AIR server's own storage file and
+# show that two purchases were read on sessions of their own. It is the version
+# air_server already builds, so nothing new is compiled.
+rusqlite = { version = "0.39", features = ["bundled"] }
 
 [lib]
 name = "ecash_wallet"

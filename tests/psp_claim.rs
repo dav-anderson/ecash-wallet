@@ -335,6 +335,58 @@ fn two_records_on_one_key_are_each_claimed_for_their_own_units() {
     fs::remove_dir_all(&e.dir).unwrap();
 }
 
+/// T2. Two purchases, each owed a record, are both picked up (each on a session of
+/// its own) and each claimed once for its own units, whatever order the wallet
+/// takes them in, and the next start has nothing left to claim. Fails if the
+/// per-purchase loop or the shuffle drops a purchase, or claims one twice.
+#[test]
+fn two_purchases_are_each_picked_up_and_claimed_once_for_their_own_units() {
+    let mut e = env("two-purchases");
+    let one = e.buy();
+    let two = e.buy();
+    // 100 - 4 = 96 = 64 + 32, and 50 - 4 = 46 = 32 + 8 + 4 + 2
+    e.owe("aa", 100_000, one.payload.clone());
+    e.owe("bb", 50_000, two.payload.clone());
+    let picked = e.pickup();
+    let got: Vec<(&str, Vec<(u32, u64)>)> = picked
+        .iter()
+        .map(|p| {
+            let new = p.new.iter().map(|r| (r.index, r.due_units)).collect();
+            (p.id.as_str(), new)
+        })
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (one.id.as_str(), vec![(0, 96)]),
+            (two.id.as_str(), vec![(0, 46)])
+        ]
+    );
+
+    let reports = e.claim();
+    let mut claimed: Vec<(String, u32, u64)> = reports
+        .iter()
+        .map(|r| match &r.what {
+            ClaimOutcome::Claimed(s) => (r.id.clone(), r.index, s.units),
+            other => panic!("expected the notes to be claimed: {other:?}"),
+        })
+        .collect();
+    claimed.sort();
+    let mut expected = vec![(one.id.clone(), 0, 96), (two.id.clone(), 0, 46)];
+    expected.sort();
+    assert_eq!(claimed, expected);
+    // 96 + 46 = 142
+    assert_eq!(e.wallet.balance().psp, 142);
+    assert_eq!(sizes(&e.wallet), vec![2, 4, 8, 32, 32, 64]);
+    e.notes_pass_the_mint();
+    let claims = e.psp.records.lock().unwrap().claims();
+    assert_eq!((claims.claimed.payments, claims.claimed.units), (2, 142));
+    assert_eq!(e.record("aa").claimed.unwrap().response.issued_units, 96);
+    assert_eq!(e.record("bb").claimed.unwrap().response.issued_units, 46);
+    assert!(e.claim().is_empty());
+    fs::remove_dir_all(&e.dir).unwrap();
+}
+
 // ---------------------------------------------------------------- W3
 
 /// A window that closes while a claim is saved and unanswered: the saved bytes are
@@ -384,6 +436,126 @@ fn the_last_resend_before_a_window_closes_settles_a_claim_whose_answer_was_lost(
     );
     assert_eq!(claim_requests(&e.wallet), 0);
     e.notes_pass_the_mint();
+    fs::remove_dir_all(&e.dir).unwrap();
+}
+
+/// ASK 4 (P2-05). Two purchases whose windows close with a saved claim each: the
+/// last resends are sent purchase by purchase (in a random order, a pause between
+/// them, each on a session of its own), and each settles its own purchase once,
+/// with nothing lost and nothing kept. Fails if the per-purchase grouping or the
+/// shuffle in `psp_close_expired` drops a purchase (it is then reported lost and
+/// its 96 or 46 units are missing) or sends one twice.
+#[test]
+fn the_last_resends_of_two_purchases_each_settle_their_own_purchase_once() {
+    let mut e = env("close-two");
+    let one = e.buy();
+    let two = e.buy();
+    // 100 - 4 = 96 and 50 - 4 = 46 units
+    e.owe("aa", 100_000, one.payload.clone());
+    e.owe("bb", 50_000, two.payload.clone());
+    e.pickup();
+    // Both claims are taken by the PSP mint and their answers go astray: the last
+    // resend of each is answered from the PSP mint's stored answer.
+    let first = e.save_claim(&one.id, 0);
+    let second = e.save_claim(&two.id, 0);
+    e.send_elsewhere(&first.body);
+    e.send_elsewhere(&second.body);
+    let first_read: Vec<u64> = e
+        .wallet
+        .claim_keys()
+        .iter()
+        .map(|k| k.records[0].first_read_at)
+        .collect();
+    // one pickup read both, at one time
+    assert_eq!(first_read[0], first_read[1]);
+
+    let air = e.air();
+    let closed = psp_close_expired(&mut e.wallet, &air, first_read[0] + CLAIM_WINDOW_SECS).unwrap();
+    assert!(
+        closed.lost.is_empty() && closed.kept.is_empty(),
+        "{closed:?}"
+    );
+    let mut settled: Vec<(String, u32, u64)> = closed
+        .reports
+        .iter()
+        .map(|r| match &r.what {
+            ClaimOutcome::Claimed(s) => (r.id.clone(), r.index, s.units),
+            other => panic!("expected the last resend to settle: {other:?}"),
+        })
+        .collect();
+    settled.sort();
+    let mut expected = vec![(one.id.clone(), 0, 96), (two.id.clone(), 0, 46)];
+    expected.sort();
+    assert_eq!(settled, expected);
+    // 96 + 46 = 142, and both keys go with their last records
+    assert_eq!(e.wallet.balance().psp, 142);
+    assert!(e.wallet.claim_keys().is_empty());
+    assert!(e.wallet.air_requests().is_empty());
+    e.notes_pass_the_mint();
+    let claims = e.psp.records.lock().unwrap().claims();
+    assert_eq!((claims.claimed.payments, claims.claimed.units), (2, 142));
+    fs::remove_dir_all(&e.dir).unwrap();
+}
+
+/// ASK 2/7 (P2-05). A start of the real command line with two purchases owed takes
+/// ONE of them (`psp_one_purchase`): its record is read and claimed, the other
+/// purchase's cell is not read, and stderr says one other purchase is pending and
+/// names `claim-psp`. Fails if `startup_psp` goes back to `psp_pickup` and
+/// `psp_claim` over every purchase (both are read and claimed: 142 PSP, both
+/// `next_index` 1, no line).
+#[test]
+fn a_start_takes_one_purchase_of_two_and_names_claim_psp() {
+    let mut e = env("start-one");
+    let one = e.buy();
+    let two = e.buy();
+    // 100 - 4 = 96 and 50 - 4 = 46 units, both written to the AIR server
+    e.owe("aa", 100_000, one.payload.clone());
+    e.owe("bb", 50_000, two.payload.clone());
+    let air = e.air();
+    let psp_did = air.psp_did.expect("the test PSP's DID").to_hex();
+    let ran = std::process::Command::new(env!("CARGO_BIN_EXE_ecash-wallet"))
+        .env_clear()
+        .env("ECASH_WALLET_FILE", &e.wallet_path)
+        .env("ECASH_AIR_SERVER", &air.server)
+        .env("ECASH_AIR_HOST", &air.host)
+        .env("ECASH_AIR_PSP_DID", &psp_did)
+        .arg("--regtest")
+        .arg("balance")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&ran.stderr);
+    assert!(ran.status.success(), "{stderr}");
+
+    // The file as the command left it: one key read and claimed, the other not read.
+    let after = open_wallet(&e.wallet_path).unwrap();
+    let keys = after.claim_keys();
+    assert_eq!(keys.len(), 2);
+    let read: Vec<&str> = keys
+        .iter()
+        .filter(|k| k.next_index == 1)
+        .map(|k| k.id.as_str())
+        .collect();
+    let [read] = read[..] else {
+        panic!("one purchase is read at a start, not {read:?}: {stderr}");
+    };
+    let other = keys.iter().find(|k| k.id != read).unwrap();
+    assert_eq!((other.next_index, other.records.len()), (0, 0));
+    let taken = keys.iter().find(|k| k.id == read).unwrap();
+    assert!(taken.records.iter().all(|r| r.done), "{stderr}");
+    let (txid, units): (&str, u64) = if read == one.id {
+        ("aa", 96)
+    } else {
+        ("bb", 46)
+    };
+    assert_eq!(taken.records[0].txid, txid);
+    assert_eq!(after.balance().psp, u128::from(units));
+    let claims = e.psp.records.lock().unwrap().claims();
+    assert_eq!((claims.claimed.payments, claims.claimed.units), (1, units));
+    assert!(
+        stderr.contains("1 other purchase(s) are pending") && stderr.contains("claim-psp"),
+        "{stderr}"
+    );
     fs::remove_dir_all(&e.dir).unwrap();
 }
 

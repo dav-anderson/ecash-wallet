@@ -207,6 +207,14 @@ pub struct PendingExchange {
     pub request: ExchangeRequest,
     /// ESP units among the outputs that are change (see `esp.rs`).
     pub change_esp: u128,
+    /// Unix seconds, this wallet's clock: a lower bound of when the request was
+    /// first sent. It is set when the request is built, before any send, and only
+    /// ever lowered (a send before it, after the clock was set back), so the
+    /// redeemable day the ESP gives is checked against every day the exchange
+    /// could have been made on (see [`crate::keystream`]). A merge keeps the
+    /// earliest. `None` only in a wallet file saved before it was set at build;
+    /// the check then leaves the earliest day open, never the reply's day.
+    pub first_sent_at: Option<u64>,
 }
 
 /// ESP notes handed to a service, with each note's spend secret, so whoever holds
@@ -332,6 +340,36 @@ pub struct WalletData {
     /// Requests over AIR that have not ended (see `air.rs`). Local to
     /// this copy of the wallet: a merge keeps this copy's.
     pub air_requests: Vec<PendingAirRequest>,
+    /// What the wallet has read of each mint's published keys, by `psp`, `esp` or
+    /// `fsp:<service DID>` (see [`crate::keystream`]). Required in the file: a
+    /// file written by 0.8.0 does not have it and is refused.
+    pub key_streams: BTreeMap<String, crate::keystream::MintStream>,
+    /// The FSP mints this wallet has blacklisted after a failed key check (see
+    /// [`BlacklistedMint`]). Entries are removed by hand only.
+    pub blacklist: Vec<BlacklistedMint>,
+    /// The records replies needed that a mint's stream, read to its end, did not
+    /// hold: when the wallet first saw each missing, so that a restart does not
+    /// reset the wait before it is called not published (see
+    /// [`crate::keystream::Unpublished`]). An entry goes when its record is
+    /// read. Optional in the file: one written without it reads as empty.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub unpublished: BTreeMap<String, crate::keystream::Unpublished>,
+}
+
+/// An FSP mint the wallet blacklisted because it failed the key check with
+/// `fsp.blacklist_on_key_mismatch` on. The wallet sends it no request, and says
+/// so. It stays in the wallet file until an operator removes it by hand
+/// (`ecash-wallet blacklist remove --service DID`, or [`Wallet::unblacklist`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlacklistedMint {
+    /// The service whose fsp-mint it is.
+    pub service: ServiceDid,
+    /// Unix seconds, this wallet's clock: when it was blacklisted.
+    pub at: u64,
+    /// The place the check failed (`Site::name`).
+    pub site: String,
+    /// What failed, in words.
+    pub what: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -380,6 +418,30 @@ pub struct Wallet {
     path: PathBuf,
     data: WalletData,
     limits: EspLimits,
+    /// The threads that follow the mints' key streams, once started
+    /// ([`Wallet::start_key_feed`]). Not saved.
+    pub(crate) feed: Option<crate::keystream::KeyFeed>,
+    /// What to do about a failed key check. Not saved.
+    pub(crate) policy: crate::keystream::KeyPolicy,
+    /// How many times a check read a stream again on its own thread
+    /// ([`Wallet::key_rereads`]). Not saved.
+    pub(crate) rereads: u64,
+    /// The unit tests' streams, put in by `keystream::testing`, stand for what
+    /// the mints published: a fresh read without a feed reads nothing new.
+    #[cfg(test)]
+    pub(crate) streams_are_fresh: bool,
+    /// Control records (index, m, current, previous) the unit tests' ESP
+    /// published on AIR that the wallet has not read: a fresh read without a
+    /// feed takes them in.
+    #[cfg(test)]
+    pub(crate) unread_controls: Vec<(u32, u64, String, Option<String>)>,
+    /// The unit tests' AIR: each stream as a whole read of it finds it (when a
+    /// test wrote one), which may hold records the wallet has not read.
+    #[cfg(test)]
+    pub(crate) test_air: BTreeMap<String, crate::keystream::Scan>,
+    /// The unit tests' clock for the backstop; `None`: the real one.
+    #[cfg(test)]
+    pub(crate) test_now: Option<u64>,
 }
 
 /// Read a wallet file's bytes (`what` names the file in messages). A file that
@@ -429,6 +491,17 @@ impl Wallet {
             path: path.to_path_buf(),
             data,
             limits: EspLimits::default(),
+            feed: None,
+            policy: crate::keystream::KeyPolicy::default(),
+            rereads: 0,
+            #[cfg(test)]
+            streams_are_fresh: false,
+            #[cfg(test)]
+            unread_controls: Vec::new(),
+            #[cfg(test)]
+            test_air: BTreeMap::new(),
+            #[cfg(test)]
+            test_now: None,
         })
     }
 
@@ -532,6 +605,7 @@ impl Wallet {
         next.version = self.data.version.max(next.version) + 1;
         write_atomic(&self.path, &next)?;
         self.data = next;
+        self.refresh_key_feed();
         Ok(out)
     }
 
@@ -541,6 +615,7 @@ impl Wallet {
         next.version = self.data.version.max(next.version) + 1;
         write_atomic(&self.path, &next)?;
         self.data = next;
+        self.refresh_key_feed();
         Ok(())
     }
 

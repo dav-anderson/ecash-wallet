@@ -1,6 +1,6 @@
 [package]
 name = "ecash-wallet"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2024"
 rust-version = "1.93"
 license = "MIT"
@@ -23,7 +23,7 @@ secp256k1 = { version = "0.30", default-features = false, features = ["global-co
 # `air-client`, the PSP's and the ESP's calls over AIR. `air-client` needs
 # `air_server` (see the [patch.crates-io] at the end).
 # The wallet does not depend on the mint crates.
-sp-wire = { git = "https://github.com/dav-anderson/sp-wire.git", tag = "v0.6.0", features = ["seal", "air-request", "air-client"] }
+sp-wire = { git = "https://github.com/dav-anderson/sp-wire.git", tag = "v0.7.0", features = ["seal", "air-request", "air-client"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # The settings file (config.toml).
@@ -31,14 +31,17 @@ toml = "0.8"
 hex = "0.4.3"
 sha2 = "0.10"
 rand = "0.8.5"
+# The key feed's threads (keystream.rs) run sp-wire's async AIR client on a
+# runtime of their own; sp-wire's `block_on_new_runtime` makes it.
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync"] }
 
 [dev-dependencies]
 mint-core = { git = "https://github.com/dav-anderson/mint-core.git", tag = "v0.3.0" }
 # The tests run real mints in the process. They are dev-dependencies only: the
 # library and the command line link none of them.
-psp-mint = { git = "https://github.com/dav-anderson/psp-mint.git", tag = "v0.8.1" }
-esp-mint = { git = "https://github.com/dav-anderson/esp-mint.git", tag = "v0.10.0" }
-fsp-mint = { git = "https://github.com/dav-anderson/fsp-mint.git", tag = "v0.9.0" }
+psp-mint = { git = "https://github.com/dav-anderson/psp-mint.git", tag = "v0.9.0" }
+esp-mint = { git = "https://github.com/dav-anderson/esp-mint.git", tag = "v0.11.0" }
+fsp-mint = { git = "https://github.com/dav-anderson/fsp-mint.git", tag = "v0.10.0" }
 axum = "0.8"
 # Only `redeem_flow` uses it, to call the in-process ESP mint's operator (admin)
 # routes. The wallet itself makes no HTTP call.

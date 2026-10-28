@@ -126,6 +126,12 @@ ecash-wallet [--wallet FILE] [--config FILE] [--regtest|--signet|--testnet] <com
       only: if the other wallet already has the notes, the first to swap or
       spend wins; prefer reclaim for a PSP handoff); done drops the notes it
       kept once you know it was claimed.
+  blacklist list
+      The FSP mints this wallet blacklisted after they failed the key check (see
+      fsp.blacklist_on_key_mismatch), with when, where and what failed.
+  blacklist remove --service DID
+      Take an FSP mint off the blacklist, by hand: the only way an entry is ever
+      removed. Its dropped notes are not brought back.
   merge FILE
       Merge a copy of this wallet retrieved from storage (a wallet file) into
       this one: notes united, anything spent in either copy stays spent,
@@ -173,6 +179,16 @@ ecash-wallet [--wallet FILE] [--config FILE] [--regtest|--signet|--testnet] <com
   At startup, and every time it talks to an FSP mint, the wallet checks that
   mint's keys and rolls FSP on the previous keyset over to the current one.
   It asks nothing; a failure is logged and tried again next time.
+
+  Every mint publishes its keys on AIR, and before anything from a mint's reply
+  is stored the wallet checks that each key the mint signed with is the key it
+  published (the PSP's and the FSP mints' key sets; the ESP's keys for the
+  service and day, and the redeemable day of a new exchange). A mint that fails
+  is warned about loudly, naming it, what failed and where; nothing from its
+  reply is stored, and the notes and the pending request are kept. With
+  fsp.blacklist_on_key_mismatch on (an ASO's setting, off by default) a failing
+  FSP mint is also blacklisted and its notes are dropped; the SPI's PSP and ESP
+  mints are never blacklisted.
 
 The wallet file is --wallet, else $ECASH_WALLET_FILE, else
 ~/.ecash-wallet/<network>/wallet.json (main, regtest, signet, testnet).
@@ -1653,6 +1669,64 @@ fn merge_command(wallet: &mut Wallet, args: Args, start: Startup) -> Result<(), 
     Ok(())
 }
 
+/// `blacklist list` and `blacklist remove --service DID`: the FSP mints this
+/// wallet blacklisted after a failed key check. Nothing removes an entry but
+/// `remove`.
+fn blacklist_command(wallet: &mut Wallet, mut args: Args) -> Result<(), WalletError> {
+    if args.0.is_empty() {
+        return Err(WalletError::Invalid(
+            "blacklist needs list or remove. Run with --help".into(),
+        ));
+    }
+    let what = args.0.remove(0);
+    args.1 = format!("blacklist {what}");
+    match what.as_str() {
+        "list" => {
+            args.done()?;
+            if wallet.blacklist().is_empty() {
+                println!("no FSP mint is blacklisted");
+            }
+            for entry in wallet.blacklist() {
+                println!(
+                    "{}: blacklisted {} at {}: {}",
+                    entry.service.to_hex(),
+                    format_utc(entry.at),
+                    entry.site,
+                    entry.what
+                );
+            }
+            Ok(())
+        }
+        "remove" => {
+            let service = match args.flag("--service")? {
+                Some(text) => service_did(&text)?,
+                None => {
+                    return Err(WalletError::Invalid(format!(
+                        "blacklist remove needs --service DID: {}",
+                        run_as("blacklist remove")
+                    )));
+                }
+            };
+            args.done()?;
+            if wallet.unblacklist(&service)? {
+                println!(
+                    "removed the FSP mint of service {} from the blacklist. Requests to it are sent again; the notes dropped when it was blacklisted are not brought back",
+                    service.to_hex()
+                );
+                Ok(())
+            } else {
+                Err(WalletError::Unknown(format!(
+                    "the FSP mint of service {} is not blacklisted",
+                    service.to_hex()
+                )))
+            }
+        }
+        other => Err(WalletError::Invalid(format!(
+            "blacklist {other} is not a command: blacklist list, blacklist remove --service DID"
+        ))),
+    }
+}
+
 fn today() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2043,6 +2117,12 @@ fn run(raw: Vec<String>) -> Result<(), WalletError> {
         eprintln!("{warning}");
     }
     let mut wallet = Wallet::open(&path, network())?;
+    // What to do about a mint that fails the key check, and the threads that
+    // follow the mints' key streams (a command that asks no mint skips them).
+    wallet.set_key_policy(settings.key_policy());
+    if command != "blacklist" {
+        wallet.start_key_feed(&settings.air)?;
+    }
     // The startup steps use the network, so a command runs them itself once its
     // own arguments are read and checked: a user error never waits on the network.
     let start = Startup::new();
@@ -2062,6 +2142,7 @@ fn run(raw: Vec<String>) -> Result<(), WalletError> {
         ))),
         "handoff" => handoff(&mut wallet, args, start),
         "merge" => merge_command(&mut wallet, args, start),
+        "blacklist" => blacklist_command(&mut wallet, args),
         other => Err(WalletError::Invalid(format!(
             "unknown command `{other}`. Run with --help"
         ))),
@@ -2071,6 +2152,13 @@ fn run(raw: Vec<String>) -> Result<(), WalletError> {
 fn main() -> ExitCode {
     match run(env::args().skip(1).collect()) {
         Ok(()) => ExitCode::SUCCESS,
+        Err(WalletError::KeyMismatch(_)) => {
+            // The warning was printed when the check failed; once is enough.
+            eprintln!(
+                "error: the key check failed. Nothing from the reply was stored. See the warning above"
+            );
+            ExitCode::FAILURE
+        }
         Err(e) => {
             eprintln!("error: {e}");
             ExitCode::FAILURE

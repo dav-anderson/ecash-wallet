@@ -32,6 +32,7 @@ use secp256k1::SECP256K1;
 use serde::{Deserialize, Serialize};
 
 use crate::blind::PendingOutput;
+use crate::config::Party;
 use crate::error::WalletError;
 use crate::store::{Kind, StoredNote, StoredTerms, Wallet};
 
@@ -484,6 +485,14 @@ impl Wallet {
     /// The mint answered: record the new notes with their epoch, drop the
     /// inputs, and in the same write delete the swap time once no rollover of
     /// that rotation is left.
+    ///
+    /// **Before anything is stored** the keys are checked against what the mint
+    /// published on AIR (see [`crate::keystream`]): for a PSP rollover, the PSP
+    /// mint's key set; for an ESP rollover, the keys the ESP published for the
+    /// note's own service and day in the new key set (a rollover keeps the day;
+    /// the day window of a new exchange does not apply). On a mismatch nothing is
+    /// stored, the rollover stays pending, a warning is printed, and the error is
+    /// [`WalletError::KeyMismatch`].
     pub fn finish_rollover(
         &mut self,
         id: &str,
@@ -502,6 +511,38 @@ impl Wallet {
             return Err(WalletError::Mint(
                 "the rollover reply does not fit the request".into(),
             ));
+        }
+        // The shared key check, before anything is stored.
+        let signed: Vec<(u64, secp256k1::PublicKey)> = p
+            .outputs
+            .iter()
+            .zip(keys)
+            .map(|(o, key)| (o.amount, *key))
+            .collect();
+        match (p.kind, p.terms) {
+            (Kind::Psp, _) => self.check_keyset_keys(
+                Party::Psp,
+                crate::keystream::Site::FinishRollover,
+                keyset,
+                &signed,
+            )?,
+            (Kind::Esp, Some(terms)) => self.check_esp_day_keys(
+                crate::keystream::Site::FinishRollover,
+                keyset,
+                &terms.service,
+                terms.redeemable_after_day,
+                &signed,
+            )?,
+            (Kind::Esp, None) => {
+                return Err(WalletError::Invalid(format!(
+                    "rollover {id} is an ESP rollover with no terms, so its keys cannot be checked"
+                )));
+            }
+            (Kind::Fsp, _) => {
+                return Err(WalletError::Invalid(
+                    "FSP rolls over through fsp_sync".into(),
+                ));
+            }
         }
         self.update(|d| {
             d.notes.retain(|n| !p.inputs.contains(&n.id()));
@@ -829,5 +870,196 @@ mod tests {
         }
         assert_eq!(state(&w), before, "the rollover is untouched");
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ---- the key check at finish_rollover
+
+    fn pk(n: u8) -> secp256k1::PublicKey {
+        let mut bytes = [0u8; 32];
+        bytes[31] = n;
+        secp256k1::SecretKey::from_slice(&bytes)
+            .unwrap()
+            .public_key(SECP256K1)
+    }
+
+    /// A wallet file with one pending rollover `roll1` of `kind` and `terms`, one
+    /// input note and one output for each of `amounts`.
+    fn rollover_wallet(kind: Kind, terms: Option<StoredTerms>, amounts: &[u64]) -> crate::Wallet {
+        use crate::store::WalletData;
+        use secp256k1::Keypair;
+        let mut notes = Vec::new();
+        let mut outputs = Vec::new();
+        for &amount in amounts {
+            let kp = Keypair::new(SECP256K1, &mut rand::rngs::OsRng);
+            notes.push(StoredNote {
+                kind,
+                amount,
+                note: mint_types::Note {
+                    nonce: mint_types::Nonce(kp.public_key()),
+                    signature: kp.public_key(),
+                },
+                spend_secret: kp.secret_key(),
+                terms,
+                reserved_by: Some("roll1".into()),
+            });
+            outputs.push(PendingOutput::new(amount));
+        }
+        let pending = PendingRollover {
+            id: "roll1".into(),
+            kind,
+            record: psp_record(),
+            body: serde_json::json!({}),
+            inputs: notes.iter().map(StoredNote::id).collect(),
+            outputs,
+            terms,
+            schedule: "s".into(),
+        };
+        let data = WalletData {
+            network: "regtest".into(),
+            notes,
+            pending_rollovers: vec![pending],
+            ..Default::default()
+        };
+        let path = std::env::temp_dir().join(format!("wallet-roll-keys-{}.json", {
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            format!(
+                "{}-{}",
+                std::process::id(),
+                N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            )
+        }));
+        std::fs::write(&path, serde_json::to_vec(&data).unwrap()).unwrap();
+        let w = open_wallet(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        w
+    }
+
+    fn mismatch(r: Result<(), WalletError>) -> Box<crate::keystream::KeyMismatch> {
+        match r {
+            Err(WalletError::KeyMismatch(m)) => m,
+            other => panic!("expected WalletError::KeyMismatch, got {other:?}"),
+        }
+    }
+
+    /// A PSP rollover is stored only if the key set that signed is one the PSP
+    /// published and every output's key is the key it published for that amount.
+    #[test]
+    fn a_psp_rollover_is_checked_against_the_published_key_set_before_it_is_stored() {
+        use crate::keystream::{Failed, Site, testing};
+        use sp_wire::air_request::stream::KeysetRecord;
+        let published: std::collections::BTreeMap<u64, secp256k1::PublicKey> =
+            [(1, pk(1)), (2, pk(2))].into_iter().collect();
+        let id = KeysetRecord {
+            epoch: 0,
+            keys: published
+                .iter()
+                .map(|(a, k)| (sp_wire::Amount::from_units(*a), *k))
+                .collect(),
+        }
+        .id();
+        let sigs = [pk(30), pk(31)];
+
+        // A wrong key for the output of 2: nothing is stored.
+        let mut w = rollover_wallet(Kind::Psp, None, &[1, 2]);
+        testing::publish_keyset(&mut w, "psp", "aa", 0, 0, &published);
+        let before = testing::held(&w);
+        let m = mismatch(w.finish_rollover("roll1", 1, &id, &sigs, &[pk(1), pk(9)]));
+        assert_eq!((m.mint, m.site), ("PSP mint", Site::FinishRollover));
+        assert_eq!(m.failed, Failed::Key { amount: 2 });
+        assert_eq!(testing::held(&w), before);
+        assert_eq!(w.pending_rollovers().len(), 1);
+
+        // A key set the PSP has not published (yet): an error to retry, not a
+        // mismatch, and nothing changes.
+        let why = testing::retryable(w.finish_rollover(
+            "roll1",
+            1,
+            "ffffffffffffffff",
+            &sigs,
+            &[pk(1), pk(2)],
+        ));
+        assert!(
+            why.contains(&format!(
+                "has not published key set ffffffffffffffff (its key sets: {id})"
+            )),
+            "{why}"
+        );
+        assert_eq!(testing::held(&w), before);
+
+        // The published keys: stored, with the rollover gone.
+        w.finish_rollover("roll1", 1, &id, &sigs, &[pk(1), pk(2)])
+            .unwrap();
+        assert!(w.pending_rollovers().is_empty());
+        assert_eq!(w.notes().len(), 2);
+    }
+
+    /// An ESP rollover keeps the note's own day, which may be long past: it is
+    /// checked against the 64 keys the ESP published for the service and that
+    /// day, whatever the day is; the new-exchange window does not apply. A key
+    /// published for another amount is no better than any other wrong key.
+    #[test]
+    fn an_esp_rollover_is_checked_against_the_keys_of_the_notes_own_day() {
+        use crate::keystream::{Failed, Site, testing};
+        let service = sp_wire::ServiceDid::from(pk(77));
+        let terms = |day| StoredTerms {
+            service,
+            redeemable_after_day: day,
+        };
+        let generation = "1111111111111111";
+        let day_keys: Vec<secp256k1::PublicKey> = (0..64u8).map(|i| pk(i + 100)).collect();
+        // Day 100 is in 1970: far from any window a new exchange could have.
+        let mut w = rollover_wallet(Kind::Esp, Some(terms(100)), &[1, 4]);
+        testing::publish_control(&mut w, 0, 365, generation, None);
+        testing::publish_day(&mut w, generation, &service, 100, day_keys.clone());
+        let sigs = [pk(30), pk(31)];
+        let before = testing::held(&w);
+
+        // The key published for the amount 1 offered for the output of 4.
+        let m = mismatch(w.finish_rollover("roll1", 1, generation, &sigs, &[pk(100), pk(100)]));
+        assert_eq!((m.mint, m.site), ("ESP mint", Site::FinishRollover));
+        assert_eq!(m.failed, Failed::Key { amount: 4 });
+        assert_eq!(testing::held(&w), before);
+
+        // A key set the ESP's control stream does not name (yet): retry.
+        let why = testing::retryable(w.finish_rollover(
+            "roll1",
+            1,
+            "2222222222222222",
+            &sigs,
+            &[pk(100), pk(102)],
+        ));
+        assert!(
+            why.contains("has not published key set 2222222222222222 as a live key set"),
+            "{why}"
+        );
+        assert_eq!(testing::held(&w), before);
+
+        // The keys of 1 (index 0) and 4 (index 2) on day 100: stored.
+        w.finish_rollover("roll1", 1, generation, &sigs, &[pk(100), pk(102)])
+            .unwrap();
+        assert!(w.pending_rollovers().is_empty());
+        assert_eq!(w.notes().len(), 2);
+        assert!(
+            w.notes()
+                .iter()
+                .all(|n| n.terms.map(|t| t.redeemable_after_day) == Some(100))
+        );
+
+        // A rollover for a day the ESP has published nothing for (yet): an
+        // error to retry, the rollover kept.
+        let mut w = rollover_wallet(Kind::Esp, Some(terms(101)), &[1]);
+        testing::publish_control(&mut w, 0, 365, generation, None);
+        testing::publish_day(&mut w, generation, &service, 100, day_keys);
+        let before = testing::held(&w);
+        let why =
+            testing::retryable(w.finish_rollover("roll1", 1, generation, &[pk(30)], &[pk(100)]));
+        assert!(
+            why.contains(&format!(
+                "has not published the keys of this service for day 101 in key set {generation}"
+            )),
+            "{why}"
+        );
+        assert_eq!(testing::held(&w), before);
+        assert_eq!(w.pending_rollovers().len(), 1);
     }
 }

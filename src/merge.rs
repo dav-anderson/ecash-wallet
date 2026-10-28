@@ -48,6 +48,23 @@
 //! - **Everything keyed by a note or a mint** (key sets, epochs, the mints and
 //!   key sets last seen, the swap schedule) is united; where both have an entry
 //!   the local copy's is kept, because it is the one in use.
+//! - **The key check's state is never taken from the other copy**: what was
+//!   read of the mints' key streams (`key_streams`), when a record was first
+//!   seen missing (`unpublished`) and when an exchange was first sent
+//!   (`first_sent_at`) are the local copy's only. A file is anyone's to write,
+//!   and these decide whether a mint is flagged: planted key records could make
+//!   an honest mint's reply disagree, an early first-seen time could flag it
+//!   before the day is up, and a send time could move the ESP day window. The
+//!   wallet reads the streams itself (a mint it has no stream of is read from
+//!   its latest record) and times what it misses on its own clock.
+//! - **The blacklist is the local copy's only** (`blacklist`): punishment is
+//!   decided by this wallet's own key check, never by a file (anyone can write
+//!   one, and an entry in it would stop the wallet using an honest FSP mint).
+//!   An entry this wallet has is kept; nothing removes one but an operator.
+//! - **A pending exchange keeps the local copy's first-send time**
+//!   (`first_sent_at`), and one only the other copy has gets none: the day
+//!   window then has no lower edge (the earliest day is open), which can let a
+//!   wrong early day through but never calls an honest day wrong.
 //!
 //! - **Both copies are of one network.** `merge` itself does not look (the
 //!   result carries the local copy's `network`); [`Wallet::merge_from`] and
@@ -324,6 +341,16 @@ pub(crate) fn merge(local: &WalletData, stored: &WalletData) -> (WalletData, Mer
         |p| p.id.clone(),
         skip,
     );
+    // The first send time is key-check state: the local copy's only. An exchange
+    // only the other copy has gets none (no lower edge to its day window), so
+    // no time from a file can make an honest day look wrong.
+    for p in &mut m.pending_exchanges {
+        p.first_sent_at = local
+            .pending_exchanges
+            .iter()
+            .find(|q| q.id == p.id)
+            .and_then(|q| q.first_sent_at);
+    }
     m.pending_redemptions = union_list(
         &local.pending_redemptions,
         &stored.pending_redemptions,
@@ -410,6 +437,15 @@ pub(crate) fn merge(local: &WalletData, stored: &WalletData) -> (WalletData, Mer
     m.live_keysets = union_map(&local.live_keysets, &stored.live_keysets);
     m.esp_live_keysets = union_map(&local.esp_live_keysets, &stored.esp_live_keysets);
     m.swap_schedule = union_map(&local.swap_schedule, &stored.swap_schedule);
+    // The key check's state is the local copy's only: what was read of the
+    // mints' streams and when a record was first seen missing are never taken
+    // from a file (anyone can write one); the wallet reads the streams itself.
+    m.key_streams = local.key_streams.clone();
+    m.unpublished = local.unpublished.clone();
+    // The blacklist too: only this wallet's own key check blacklists a mint, so
+    // an entry in the other copy is not taken. (A mint this wallet blacklisted
+    // keeps its dropped notes gone: the ledgers count them departed.)
+    m.blacklist = local.blacklist.clone();
     // The claim keys: every one either copy holds (a key is not an ongoing
     // request, so `finished` does not drop it), the same key in both copies as one.
     m.claim_keys = union_list(

@@ -114,6 +114,8 @@ In T1, `curl -s http://127.0.0.1:3100/health` returns `"status":"ok"` and `"wire
 
 Run this once. A second run makes a second purchase (a second claim key) in the wallet file.
 
+**Wire version 5 (sp-wire 0.7.0, the key check), not rerun.** Nothing on this page was run again for it. The key-set IDs printed in the steps below (16 hex characters) are the wire version 3 and 4 ones, a hash of the 1-unit key alone; under wire version 5 every PSP and FSP ID is a hash of every key, so each differs. The steps that exchange, issue, spend, redeem or roll over now also need the mints to have published their keys on AIR (psp-mint 0.9.0, esp-mint 0.11.0 and fsp-mint 0.10.0 do, after each key set change and each request), and the wallet reads them before it stores a reply; a step that fails the check prints the WARNING described in DESIGN.md, "The key check", and stores nothing. Nothing here has been run against the new mints.
+
 **Wire version 4 (sp-wire 0.6.0), not rerun.** A purchase has no amount: `buy-psp --mint-key HEX` makes a claim key of its own and a 33-byte payload, and prints the advice to pay it once and to buy at least $5 (50 PSP). The PSP mint writes an owed record, and `claim-psp` claims it (kind 15) for what is due after the fees. The sizes, counts and balances shown in steps 5 to 12 and 23 to 25 are from the wire version 3 run, when a purchase named its notes; they are not what wire version 4 prints (a payment of $0.50 buys little or nothing after the fees), and are marked not rerun until the walkthrough is run again with a payment of $5 (50 PSP) or more.
 
 ```

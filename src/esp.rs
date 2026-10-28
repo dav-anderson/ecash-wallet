@@ -307,6 +307,9 @@ impl Wallet {
             outputs,
             request: request.clone(),
             change_esp,
+            // The time it is built is a lower bound of the time it is first
+            // sent, so the day check never falls back to the reply's time.
+            first_sent_at: Some(self.key_check_now()),
         };
         self.update(|d| {
             for note in d.notes.iter_mut().filter(|n| input_ids.contains(&n.id())) {
@@ -323,12 +326,57 @@ impl Wallet {
         })
     }
 
+    /// Note the time the exchange `id` is sent, before it is sent: this wallet's
+    /// clock, in unix seconds (no caller gives the time: it bounds the days the
+    /// ESP day check accepts, so it is not for an app to set). The exchange keeps the earliest time it has (the
+    /// time it was built, set by [`Wallet::build_exchange`], or an earlier send
+    /// if the clock was set back since): the day the ESP gives is checked against
+    /// the days from that time to the reply, so the earliest is the safe one. A
+    /// later send changes nothing and writes nothing, nor does an exchange that is
+    /// not pending.
+    pub(crate) fn mark_exchange_sent(&mut self, id: &str) -> Result<(), WalletError> {
+        let now = self.key_check_now();
+        let earlier = self
+            .pending_exchanges()
+            .iter()
+            .any(|p| p.id == id && p.first_sent_at.is_none_or(|t| now < t));
+        if !earlier {
+            return Ok(());
+        }
+        self.update(|d| {
+            if let Some(p) = d.pending_exchanges.iter_mut().find(|p| p.id == id) {
+                p.first_sent_at = Some(p.first_sent_at.map_or(now, |t| t.min(now)));
+            }
+            Ok(())
+        })
+    }
+
     /// Turn the mint's reply into ESP notes and spend the PSP notes that paid
     /// for them. Call it once, with the reply to the request `id` names.
+    ///
+    /// **Before anything is stored** the ESP's reply is checked against what the
+    /// ESP published on AIR (see [`crate::keystream`]): the redeemable day must be
+    /// one a new exchange can have (from the day of the first send, less
+    /// 300 s, to the day of the reply, plus 300 s, each plus the
+    /// published maturity rule `m`), and each key the ESP signed an output with
+    /// must be the key it published for this service and that day. On a mismatch
+    /// nothing is stored, the exchange stays pending, a warning is printed, and
+    /// the error is [`WalletError::KeyMismatch`]. The reply's time is the
+    /// wallet's clock now.
     pub fn finish_exchange(
         &mut self,
         id: &str,
         response: &ExchangeResponse,
+    ) -> Result<FinishResult, WalletError> {
+        self.finish_exchange_at(id, response, sp_wire::air_request::addr::now_secs())
+    }
+
+    /// [`Wallet::finish_exchange`] with the time of the reply given.
+    pub(crate) fn finish_exchange_at(
+        &mut self,
+        id: &str,
+        response: &ExchangeResponse,
+        replied_at: u64,
     ) -> Result<FinishResult, WalletError> {
         let pending = self
             .pending_exchanges()
@@ -348,6 +396,28 @@ impl Wallet {
                 "the reply does not have one signature and key for each output".into(),
             ));
         }
+        // The shared key check, before anything is stored: the day, then the keys.
+        // An exchange saved before its build time was recorded has no time: the
+        // earliest day is then left open (0), never the reply's day, so a reply
+        // dated before a late reply's day is not called a mismatch.
+        self.check_exchange_day_of(
+            pending.first_sent_at.unwrap_or(0),
+            replied_at,
+            response.redeemable_after_day,
+        )?;
+        let signed: Vec<(u64, secp256k1::PublicKey)> = pending
+            .outputs
+            .iter()
+            .zip(&response.keys)
+            .map(|(output, key)| (output.amount, *key))
+            .collect();
+        self.check_esp_day_keys(
+            crate::keystream::Site::FinishExchange,
+            &response.keyset,
+            &pending.service,
+            response.redeemable_after_day,
+            &signed,
+        )?;
         let terms = StoredTerms {
             service: pending.service,
             redeemable_after_day: response.redeemable_after_day,
@@ -489,6 +559,15 @@ mod tests {
     /// Open a wallet file of the test network.
     fn open_wallet(path: &std::path::Path) -> Result<crate::Wallet, crate::WalletError> {
         crate::Wallet::open(path, "regtest")
+    }
+
+    /// Mark the exchange `id` sent with the wallet's clock at `at` (the unit
+    /// tests' clock, set for the call only).
+    fn sent_at(w: &mut Wallet, id: &str, at: u64) {
+        let before = w.test_now;
+        w.test_now = Some(at);
+        w.mark_exchange_sent(id).unwrap();
+        w.test_now = before;
     }
 
     const G_X: &str = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
@@ -902,6 +981,301 @@ mod tests {
             exchange::request_hash(&again.pending_exchanges()[0].request).unwrap(),
             built.id
         );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The time of the first send is a lower bound set when the exchange is
+    /// built (before any send); a send after it (a later mark) keeps it and
+    /// writes nothing, a mark before it (a clock set back) lowers it, and an
+    /// exchange that is not pending is ignored. Fails if the build leaves it
+    /// unset, if a resend moved it later, or if it were not saved.
+    #[test]
+    fn the_first_send_time_is_set_once_and_a_resend_keeps_it() {
+        let (mut w, dir) = wallet_with("first-sent", &[4]);
+        let before = sp_wire::air_request::addr::now_secs();
+        let built = w.build_exchange(4, service(), None).unwrap();
+        let after = sp_wire::air_request::addr::now_secs();
+        let at_build = w.pending_exchanges()[0]
+            .first_sent_at
+            .expect("set at build");
+        assert!((before..=after).contains(&at_build));
+        let version = w.version();
+        sent_at(&mut w, &built.id, after + 60);
+        assert_eq!(w.pending_exchanges()[0].first_sent_at, Some(at_build));
+        assert_eq!(
+            w.version(),
+            version,
+            "a send after the build writes nothing"
+        );
+        // A clock set back since the build: the earlier time is kept.
+        sent_at(&mut w, &built.id, 1_700_000_000);
+        assert_eq!(w.pending_exchanges()[0].first_sent_at, Some(1_700_000_000));
+        let version = w.version();
+        sent_at(&mut w, &built.id, 1_700_086_400);
+        assert_eq!(w.pending_exchanges()[0].first_sent_at, Some(1_700_000_000));
+        assert_eq!(w.version(), version, "a resend writes nothing");
+        sent_at(&mut w, "nope", 1_700_086_400);
+        assert_eq!(w.version(), version);
+        // and it survives a restart
+        let again = open_wallet(w.path()).unwrap();
+        assert_eq!(
+            again.pending_exchanges()[0].first_sent_at,
+            Some(1_700_000_000)
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The first send time is key-check state (it bounds the ESP day window),
+    /// so a merge never takes it from the other copy: each copy keeps its own,
+    /// and a copy that has none keeps none (no lower edge, which never calls an
+    /// honest day wrong). Fails if a merge takes the other copy's time, earlier
+    /// or later.
+    #[test]
+    fn a_merge_keeps_the_local_first_send_time_only() {
+        let (mut local, dir) = wallet_with("merge-first-sent", &[4]);
+        let built = local.build_exchange(4, service(), None).unwrap();
+        // A file written before the time was set at build has none.
+        local
+            .update(|d| {
+                d.pending_exchanges[0].first_sent_at = None;
+                Ok(())
+            })
+            .unwrap();
+        fs::copy(local.path(), dir.join("stored.json")).unwrap();
+        fs::copy(local.path(), dir.join("unsent.json")).unwrap();
+        let mut stored = open_wallet(&dir.join("stored.json")).unwrap();
+        let mut unsent = open_wallet(&dir.join("unsent.json")).unwrap();
+        sent_at(&mut local, &built.id, 2_000);
+        sent_at(&mut stored, &built.id, 1_000);
+
+        local.merge_from(&stored.snapshot()).unwrap();
+        assert_eq!(local.pending_exchanges()[0].first_sent_at, Some(2_000));
+        stored.merge_from(&local.snapshot()).unwrap();
+        assert_eq!(stored.pending_exchanges()[0].first_sent_at, Some(1_000));
+        unsent.merge_from(&local.snapshot()).unwrap();
+        assert_eq!(unsent.pending_exchanges()[0].first_sent_at, None);
+        local
+            .merge_from(&open_wallet(&dir.join("unsent.json")).unwrap().snapshot())
+            .unwrap();
+        assert_eq!(local.pending_exchanges()[0].first_sent_at, Some(2_000));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The ESP's 64 secret keys for a (service, day), key `i` for the amount
+    /// 2^i: the keys it publishes are their public halves.
+    fn day_secrets() -> Vec<secp256k1::SecretKey> {
+        (1..=64u8)
+            .map(|i| secp256k1::SecretKey::from_slice(&[i; 32]).unwrap())
+            .collect()
+    }
+
+    fn day_keys(secrets: &[secp256k1::SecretKey]) -> Vec<secp256k1::PublicKey> {
+        secrets.iter().map(|sk| sk.public_key(SECP256K1)).collect()
+    }
+
+    /// The ESP's reply to the pending exchange: each output signed with the key
+    /// of its amount (2^i is key i), on `day`, by key set `keyset`.
+    fn reply_signed(
+        w: &Wallet,
+        secrets: &[secp256k1::SecretKey],
+        day: u64,
+        keyset: &str,
+    ) -> ExchangeResponse {
+        let pending = &w.pending_exchanges()[0];
+        let sk_of = |amount: u64| &secrets[amount.trailing_zeros() as usize];
+        ExchangeResponse {
+            keyset: keyset.to_string(),
+            service: pending.service,
+            redeemable_after_day: day,
+            signatures: pending
+                .outputs
+                .iter()
+                .map(|o| bdhke::sign_message(sk_of(o.amount), &o.blind_nonce.0))
+                .collect(),
+            keys: pending
+                .outputs
+                .iter()
+                .map(|o| sk_of(o.amount).public_key(SECP256K1))
+                .collect(),
+            fee_per_byte: 0,
+            fee_esp: 0,
+            size_bytes: 0,
+        }
+    }
+
+    fn mismatch<T: std::fmt::Debug>(
+        r: Result<T, WalletError>,
+    ) -> Box<crate::keystream::KeyMismatch> {
+        match r {
+            Err(WalletError::KeyMismatch(m)) => m,
+            other => panic!("expected WalletError::KeyMismatch, got {other:?}"),
+        }
+    }
+
+    /// Sent at 12:00 on day 20,000 (1,728,043,200) and replied the same second,
+    /// with m = 365 from the stream and the 300 s skew, the one day a new
+    /// exchange can have is 20,000 + 365 = 20,365. 20,364 and 20,366 are a
+    /// mismatch, as is a day whose keys the ESP did not publish, and as is a key
+    /// that is not the published key of its amount (the first output's, which is
+    /// not the 1-unit key). Nothing is stored in any of them. With the published
+    /// keys the reply is stored. Fails if the exchange skips the day check or the
+    /// key check, or checks only the first key.
+    #[test]
+    fn a_finished_exchange_is_checked_against_the_published_day_and_keys_before_anything_is_stored()
+    {
+        let (mut w, dir) = wallet_with("published", &[4]);
+        let built = w.build_exchange(4, service(), None).unwrap();
+        let sent = 20_000 * 86_400 + 43_200;
+        assert_eq!(sent, 1_728_043_200);
+        sent_at(&mut w, &built.id, sent);
+        let generation = "ab".repeat(8);
+        crate::keystream::testing::publish_control(&mut w, 0, 365, &generation, None);
+        let secrets = day_secrets();
+        let nothing_changed = |w: &Wallet| {
+            assert_eq!((w.balance().psp, w.balance().esp), (4, 0));
+            assert_eq!(w.pending_exchanges().len(), 1);
+        };
+
+        for day in [20_364u64, 20_366] {
+            let reply = reply_signed(&w, &secrets, day, &generation);
+            let rereads = w.key_rereads();
+            let m = mismatch(w.finish_exchange_at(&built.id, &reply, sent));
+            assert_eq!(
+                w.key_rereads(),
+                rereads + 1,
+                "one fresh read before the mismatch"
+            );
+            assert_eq!(m.mint, "ESP mint");
+            assert_eq!(m.site, crate::keystream::Site::FinishExchange);
+            assert_eq!(
+                m.failed,
+                crate::keystream::Failed::Day {
+                    day,
+                    from: 20_365,
+                    to: 20_365,
+                    rules: vec![365]
+                }
+            );
+            assert!(!m.blacklisted);
+            assert!(
+                m.warning.contains("KEY CHECK FAILED at finish_exchange"),
+                "{}",
+                m.warning
+            );
+            assert!(
+                m.warning.contains(&format!("redeemable DAY {day}")),
+                "{}",
+                m.warning
+            );
+            nothing_changed(&w);
+        }
+
+        // the day is right, and the ESP has published no keys for it (yet): an
+        // error to retry, not a mismatch
+        let reply = reply_signed(&w, &secrets, 20_365, &generation);
+        let why =
+            crate::keystream::testing::retryable(w.finish_exchange_at(&built.id, &reply, sent));
+        assert!(
+            why.contains(&format!(
+                "the ESP mint has not published the keys of this service for day 20365 in key set {generation}"
+            )),
+            "{why}"
+        );
+        nothing_changed(&w);
+
+        // it published the keys, and the key of the first output's amount is
+        // not the one it signed with
+        let first_amount = w.pending_exchanges()[0].outputs[0].amount;
+        assert!(first_amount > 1);
+        let mut published = day_keys(&secrets);
+        published[first_amount.trailing_zeros() as usize] =
+            secp256k1::SecretKey::from_slice(&[200u8; 32])
+                .unwrap()
+                .public_key(SECP256K1);
+        crate::keystream::testing::publish_day(&mut w, &generation, &service(), 20_365, published);
+        let m = mismatch(w.finish_exchange_at(&built.id, &reply, sent));
+        assert_eq!(
+            m.failed,
+            crate::keystream::Failed::Key {
+                amount: first_amount
+            }
+        );
+        nothing_changed(&w);
+
+        // the published keys are the keys it signed with: stored
+        crate::keystream::testing::publish_day(
+            &mut w,
+            &generation,
+            &service(),
+            20_365,
+            day_keys(&secrets),
+        );
+        let done = w.finish_exchange_at(&built.id, &reply, sent).unwrap();
+        assert_eq!(done.redeemable_after_day, 20_365);
+        assert_eq!(w.balance().psp, 0);
+        assert_eq!(w.balance().esp, 400_000_000_000);
+        assert!(w.pending_exchanges().is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// ASK 4: sent at 23:59:50 on day D = 20,000 and answered at 00:10 on day
+    /// D + 1 (a late reply), the ESP dated the exchange on day D, so it gives
+    /// D + 365. The time recorded when the exchange was built (lowered to the
+    /// send) makes that day allowed. The old fallback to the reply's time would
+    /// have called it a mismatch: its earliest day is day(00:10 - 300 s) + 365 =
+    /// D + 1 + 365. A wallet file from before (no time) leaves the earliest day
+    /// open. Fails if the honest day is refused either way.
+    #[test]
+    fn a_send_just_before_midnight_with_a_late_reply_is_not_a_mismatch() {
+        let (mut w, dir) = wallet_with("midnight", &[4]);
+        let built = w.build_exchange(4, service(), None).unwrap();
+        assert!(
+            w.pending_exchanges()[0].first_sent_at.is_some(),
+            "set at build"
+        );
+        let d = 20_000u64;
+        let sent = d * 86_400 + 86_390; // 23:59:50 on day D
+        let replied = (d + 1) * 86_400 + 600; // 00:10 on day D + 1
+        sent_at(&mut w, &built.id, sent);
+        assert_eq!(w.pending_exchanges()[0].first_sent_at, Some(sent));
+        let generation = "ab".repeat(8);
+        crate::keystream::testing::publish_control(&mut w, 0, 365, &generation, None);
+        let secrets = day_secrets();
+        crate::keystream::testing::publish_day(
+            &mut w,
+            &generation,
+            &service(),
+            d + 365,
+            day_keys(&secrets),
+        );
+        let reply = reply_signed(&w, &secrets, d + 365, &generation);
+
+        // what the old fallback (first send = reply time) would have said
+        let esp = w.key_streams().get("esp").unwrap().clone();
+        assert!(matches!(
+            crate::keystream::check_exchange_day(Some(&esp), replied, replied, 300, d + 365),
+            crate::keystream::Verdict::Bad(crate::keystream::Failed::Day { from, .. }) if from == d + 366
+        ));
+
+        // a wallet file from before the time was set at build: not a mismatch
+        fs::copy(w.path(), dir.join("legacy.json")).unwrap();
+        let mut legacy = open_wallet(&dir.join("legacy.json")).unwrap();
+        legacy
+            .update(|data| {
+                data.pending_exchanges[0].first_sent_at = None;
+                Ok(())
+            })
+            .unwrap();
+        crate::keystream::testing::publish_control(&mut legacy, 0, 365, &generation, None);
+        let done = legacy
+            .finish_exchange_at(&built.id, &reply, replied)
+            .unwrap();
+        assert_eq!(done.redeemable_after_day, d + 365);
+
+        let done = w.finish_exchange_at(&built.id, &reply, replied).unwrap();
+        assert_eq!(done.redeemable_after_day, d + 365);
+        assert!(w.pending_exchanges().is_empty());
+        assert_eq!(w.key_rereads(), 0, "an allowed day needs no reread");
         fs::remove_dir_all(&dir).unwrap();
     }
 

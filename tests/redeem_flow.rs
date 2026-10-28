@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex};
 
 use axum::Router;
 use ecash_wallet::config::AirSettings;
+use ecash_wallet::keystream::{Failed, Site};
 use ecash_wallet::mint_info::{fetch_redeem_fees, send_redeem, settle_fsp, sync_esp_keysets};
 use ecash_wallet::redeem::{EntryOutcome, RedeemOutcome, RedemptionState};
 use ecash_wallet::store::{HandedNote, Handover, StoredTerms};
@@ -93,6 +94,14 @@ struct Mint {
 }
 
 fn start(rt: &Runtime, dir: &Path, max_bytes: usize) -> Mint {
+    start_with(rt, dir, max_bytes, None)
+}
+
+/// As [`start`]. With `Some(spoiled)` the ESP mint publishes no key stream of its
+/// own: what is on AIR is written by hand, the maturity rule 365 and the keys for
+/// the days of the tests' notes, the mint's own (`false`) or keys that are no
+/// mint's (`true`).
+fn start_with(rt: &Runtime, dir: &Path, max_bytes: usize, by_hand: Option<bool>) -> Mint {
     // A redemption never calls the PSP.
     let esp = EspMint::open(
         &dir.join("esp"),
@@ -108,7 +117,16 @@ fn start(rt: &Runtime, dir: &Path, max_bytes: usize) -> Mint {
     let queue_path = state.queue_path.clone();
     // The listener keeps its state in a folder of its own, outside `dir`, which a
     // test removes while the listener is still running.
-    let at = EspAt::new(Arc::clone(&state), &scratch("airstate"));
+    let at = match by_hand {
+        None => EspAt::new(Arc::clone(&state), &scratch("airstate")),
+        Some(spoiled) => EspAt::new_by_hand(
+            Arc::clone(&state),
+            &scratch("airstate"),
+            &[365],
+            &[(PAST, service()), (PAST2, service()), (FUTURE, service())],
+            spoiled,
+        ),
+    };
     let air = at.air(10, 3);
     let admin = serve(
         rt,
@@ -180,7 +198,17 @@ fn send(mint: &Mint, wallet: &mut Wallet, id: String) -> RedeemOutcome {
 }
 
 /// As [`send`], to the ESP mint the `[air]` settings `air` point at.
-fn send_to(air: &AirSettings, wallet: &mut Wallet, mut id: String) -> RedeemOutcome {
+fn send_to(air: &AirSettings, wallet: &mut Wallet, id: String) -> RedeemOutcome {
+    try_send_to(air, wallet, id).unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// As [`send_to`], and the error of the call that ended it, if one did: a reply
+/// that failed the wallet's key check is [`WalletError::KeyMismatch`].
+fn try_send_to(
+    air: &AirSettings,
+    wallet: &mut Wallet,
+    mut id: String,
+) -> Result<RedeemOutcome, WalletError> {
     for _ in 0..4 {
         let body = wallet
             .pending_redemptions()
@@ -190,7 +218,7 @@ fn send_to(air: &AirSettings, wallet: &mut Wallet, mut id: String) -> RedeemOutc
             .body()
             .unwrap();
         match send_redeem(wallet, air, &body) {
-            Ok(response) => return wallet.finish_redemption(&id, &response).unwrap(),
+            Ok(response) => return wallet.finish_redemption(&id, &response),
             Err(WalletError::RedeemRefused {
                 code,
                 totals: Some(totals),
@@ -201,7 +229,7 @@ fn send_to(air: &AirSettings, wallet: &mut Wallet, mut id: String) -> RedeemOutc
                     .unwrap()
                     .id;
             }
-            Err(e) => panic!("{e}"),
+            Err(e) => return Err(e),
         }
     }
     panic!("no answer after 4 tries");
@@ -665,5 +693,90 @@ fn esp_that_fsp_mint_kept_is_exported_received_and_redeemed_once_mature() {
             .all(|n| n.terms.unwrap().redeemable_after_day == FUTURE)
     );
     assert_eq!(Queue::open(&m.esp.state.queue_path).unwrap().len(), 1);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+// ---------------------------------------------------------------- the key check
+
+/// The error of a call whose reply failed the key check.
+fn mismatch_of(e: WalletError) -> Box<ecash_wallet::keystream::KeyMismatch> {
+    match e {
+        WalletError::KeyMismatch(m) => m,
+        other => panic!("expected a key mismatch, got {other:?}"),
+    }
+}
+
+/// A declined payout reissues the notes under the keys of the notes' own days. An
+/// ESP mint that signs them with keys other than the ones it published for those
+/// days: nothing is stored, the redemption stays queued to be collected again,
+/// the warning names the decline, and the ESP is not blacklisted.
+#[test]
+fn a_decline_signed_with_keys_the_esp_did_not_publish_warns_and_stores_nothing() {
+    let dir = scratch("key-decline");
+    let rt = Runtime::new().unwrap();
+    let mint = start_with(&rt, &dir, 1 << 20, Some(true));
+    let mut wallet = open_wallet(&dir.join("wallet.json")).unwrap();
+    sync_esp_keysets(&mut wallet, &mint.air, &esp_record(&mint.air)).unwrap();
+    give(&mut wallet, PAST, vec![handed(&mint, 4 * ONE, PAST)]);
+    give(&mut wallet, PAST2, vec![handed(&mint, 2 * ONE, PAST2)]);
+    let fees = fetch_redeem_fees(&mut wallet, &mint.air).unwrap();
+    let built = wallet
+        .build_redemption(&secret(1), MEMO, &fees, now())
+        .unwrap();
+    let id = built[0].id.clone();
+    // Queueing a payout returns no notes, so nothing is checked.
+    assert_eq!(
+        send(&mint, &mut wallet, id.clone()).message,
+        "payout queued"
+    );
+
+    admin_post(
+        &mint,
+        "/payouts/decline",
+        &json!({"entry_id": id, "reason": "uptime terms were not met"}),
+    );
+    let m = mismatch_of(try_send_to(&mint.air, &mut wallet, id).unwrap_err());
+    assert_eq!((m.mint, m.site), ("ESP mint", Site::RedeemDecline));
+    assert!(matches!(m.failed, Failed::Key { .. }), "{:?}", m.failed);
+    assert!(
+        m.warning.starts_with(
+            "WARNING: KEY CHECK FAILED at finish_redemption (decline). The ESP mint (DID "
+        ),
+        "{}",
+        m.warning
+    );
+    assert!(!m.blacklisted);
+    assert!(
+        wallet.notes().is_empty(),
+        "nothing from the reply was stored"
+    );
+    assert_eq!(wallet.pending_redemptions().len(), 1, "and it stays queued");
+    assert!(wallet.blacklist().is_empty());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The same for the refund of a note the mint found immature: signed under the
+/// day of the note it refunds, with keys it did not publish.
+#[test]
+fn a_refund_signed_with_keys_the_esp_did_not_publish_warns_and_stores_nothing() {
+    let dir = scratch("key-refund");
+    let rt = Runtime::new().unwrap();
+    let mint = start_with(&rt, &dir, 1 << 20, Some(true));
+    let mut wallet = open_wallet(&dir.join("wallet.json")).unwrap();
+    sync_esp_keysets(&mut wallet, &mint.air, &esp_record(&mint.air)).unwrap();
+    give(&mut wallet, PAST, vec![handed(&mint, SMALL, PAST)]);
+    give(&mut wallet, FUTURE, vec![handed(&mint, ONE, FUTURE)]);
+    let fees = fetch_redeem_fees(&mut wallet, &mint.air).unwrap();
+    let late = (FUTURE + 1) * 86_400;
+    let b = wallet
+        .build_redemption(&secret(1), MEMO, &fees, late)
+        .unwrap()
+        .remove(0);
+    let m = mismatch_of(try_send_to(&mint.air, &mut wallet, b.id).unwrap_err());
+    assert_eq!((m.mint, m.site), ("ESP mint", Site::RedeemRefund));
+    assert!(matches!(m.failed, Failed::Key { .. }), "{:?}", m.failed);
+    assert!(!m.blacklisted);
+    assert_eq!(wallet.notes().len(), 2, "the notes are kept");
+    assert_eq!(wallet.pending_redemptions().len(), 1);
     std::fs::remove_dir_all(&dir).unwrap();
 }

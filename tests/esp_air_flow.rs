@@ -33,6 +33,7 @@ use axum::routing::post;
 use axum::{Json, Router};
 use ecash_wallet::air::{self, Party};
 use ecash_wallet::config::{AirSettings, BUILTIN_ESP_DID, BUILTIN_SPI_DID};
+use ecash_wallet::keystream::{Failed, KeyPolicy, Site};
 use ecash_wallet::mint_info::{
     esp_window, fetch_redeem_fees, rotation_sync, send_exchange, send_redeem, sync_esp_keysets,
     sync_esp_limits, verify_esp, verify_psp,
@@ -284,6 +285,18 @@ impl std::ops::Deref for Esp {
 /// PSP the ESP calls is the stand-in unless `psp_url` is given (a dead one, for
 /// the tests of a mint that cannot answer).
 fn start_esp(dir: &Path, config: Config, psp_url: Option<&str>) -> Esp {
+    start_esp_at(dir, config, psp_url, T0)
+}
+
+/// As [`start_esp`], on the system clock: for the tests that finish an exchange,
+/// whose day the wallet checks against its own clock (a send-day to reply-day
+/// window; a mint on a fixed clock months away from the wallet's would fail it,
+/// as a mint that signs for another day should).
+fn start_esp_now(dir: &Path, config: Config, psp_url: Option<&str>) -> Esp {
+    start_esp_at(dir, config, psp_url, 0)
+}
+
+fn start_esp_at(dir: &Path, config: Config, psp_url: Option<&str>, clock: u64) -> Esp {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -305,7 +318,7 @@ fn start_esp(dir: &Path, config: Config, psp_url: Option<&str>) -> Esp {
         &dir.join("esp"),
         Box::new(HttpPsp::new(psp_url.unwrap_or(&psp_base)).unwrap()),
         config,
-        T0,
+        clock,
     );
     Esp { _rt: rt, mint, psp }
 }
@@ -409,6 +422,7 @@ fn the_esp_reads_over_air_are_the_mints_own() {
     let (key, did) = mint_key();
     let dir = scratch("reads");
     let esp = start_esp(&dir, Config::default(), None);
+    common::air::esp_stream(&esp.mint.state, &server, &key, &scratch("esp-stream"));
     let listener = start_serving(&server, &key, &dir, esp.serve());
     let air = air_settings(&server, &did, 10, 3);
 
@@ -448,6 +462,7 @@ fn an_esp_rotation_rollover_goes_over_air_and_ends_with_the_notes_on_the_new_key
     let (key, did) = mint_key();
     let dir = scratch("roll");
     let esp = start_esp(&dir, Config::default(), None);
+    common::air::esp_stream(&esp.mint.state, &server, &key, &scratch("esp-stream"));
     let listener = start_serving(&server, &key, &dir, esp.serve());
     let air = air_settings(&server, &did, 10, 3);
 
@@ -487,8 +502,9 @@ fn an_exchange_over_air_is_applied_once_and_a_resent_one_gets_the_stored_answer(
     let server = server();
     let (key, did) = mint_key();
     let dir = scratch("exchange");
-    let esp = start_esp(&dir, Config::default(), None);
+    let esp = start_esp_now(&dir, Config::default(), None);
     let state_dir = scratch("exchange-state");
+    common::air::esp_stream(&esp.mint.state, &server, &key, &scratch("esp-stream"));
     let listener = start_serving(&server, &key, &state_dir, esp.serve());
     let air = air_settings(&server, &did, 10, 3);
 
@@ -527,6 +543,7 @@ fn a_redemption_goes_over_air_in_its_binary_encoding_and_a_resent_one_is_not_app
         None,
     );
     let state_dir = scratch("redeem-state");
+    common::air::esp_stream(&esp.mint.state, &server, &key, &scratch("esp-stream"));
     let listener = start_serving(&server, &key, &state_dir, esp.serve());
     let air = air_settings(&server, &did, 10, 3);
 
@@ -570,7 +587,7 @@ fn a_400_is_a_refusal_over_air_but_a_409_a_413_and_a_404_are_not() {
     let server = server();
     let (key, did) = mint_key();
     let dir = scratch("refusals");
-    let esp = start_esp(
+    let esp = start_esp_now(
         &dir,
         Config {
             redeem_max_request_bytes: 100,
@@ -579,6 +596,7 @@ fn a_400_is_a_refusal_over_air_but_a_409_a_413_and_a_404_are_not() {
         None,
     );
     let state_dir = scratch("refusals-state");
+    common::air::esp_stream(&esp.mint.state, &server, &key, &scratch("esp-stream"));
     let listener = start_serving(&server, &key, &state_dir, esp.serve());
     let air = air_settings(&server, &did, 10, 3);
 
@@ -643,6 +661,7 @@ fn a_psp_the_esp_cannot_reach_is_a_mint_error_that_keeps_the_exchange_pending() 
     // Nothing listens on port 9, where the ESP looks for its PSP.
     let esp = start_esp(&dir, Config::default(), Some("http://127.0.0.1:9"));
     let state_dir = scratch("dead-psp-state");
+    common::air::esp_stream(&esp.mint.state, &server, &key, &scratch("esp-stream"));
     let listener = start_serving(&server, &key, &state_dir, esp.serve());
     let air = air_settings(&server, &did, 10, 3);
 
@@ -679,7 +698,7 @@ fn an_unanswered_exchange_is_kept_and_the_next_call_carries_on_with_it() {
     let server = server();
     let (key, did) = mint_key();
     let dir = scratch("kept");
-    let esp = start_esp(&dir, Config::default(), None);
+    let esp = start_esp_now(&dir, Config::default(), None);
     let state_dir = scratch("kept-state");
 
     let note = esp.psp_note(4);
@@ -712,6 +731,7 @@ fn an_unanswered_exchange_is_kept_and_the_next_call_carries_on_with_it() {
     // once. The same call, made again, finds the reply of its kept request and
     // writes nothing.
     let air = air_settings(&server, &did, 10, 3);
+    common::air::esp_stream(&esp.mint.state, &server, &key, &scratch("esp-stream"));
     let listener = start_serving(&server, &key, &state_dir, esp.serve());
     wait_for_next(&state_dir, 1);
     assert!(esp.psp_spent(&note));
@@ -893,6 +913,7 @@ fn without_air_server_and_host_no_call_to_the_esp_is_made_and_the_error_names_th
     // A listener is up, and must be asked for nothing.
     let (key, did) = mint_key();
     let state_dir = scratch("required-state");
+    common::air::esp_stream(&esp.mint.state, &server, &key, &scratch("esp-stream"));
     let listener = start_serving(&server, &key, &state_dir, esp.serve());
     let air = AirSettings::default();
     assert!(!air.is_configured());
@@ -1057,4 +1078,391 @@ fn the_builtin_placeholder_esp_did_never_passes_silently() {
         Err(WalletError::Mint(why)) => assert!(!why.contains("PLACEHOLDER"), "{why}"),
         other => panic!("expected the unlistened DID to be unreachable, got {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------- the key check
+
+/// What the day records of a hand-made stream carry.
+#[derive(Clone, Copy)]
+enum HandKeys {
+    /// The keys the mint signs with.
+    True,
+    /// Keys that are no mint's.
+    Spoiled,
+}
+
+/// One exchange, from the build to `finish_exchange`, against an ESP mint (on
+/// the system clock, so the day it gives is the wallet's own today plus its
+/// maturity rule) whose key stream was written by hand: one control record for
+/// each of `rules`, and day records for the days around today plus 365, with the
+/// keys `keys` says. The blacklist setting is on, which does nothing for an ESP.
+/// The control records of `late` follow those of `rules`, but are written only
+/// after the request was sent and before `finish_exchange`: a rule the wallet has
+/// not read when the reply comes.
+///
+/// Returns what `finish_exchange` made (the ESP units), the wallet, the time the
+/// wallet recorded as the first send, and what keeps the mint and the AIR server
+/// alive until the caller is done.
+fn exchange_against_a_hand_made_stream(
+    name: &str,
+    rules: &[u64],
+    late: &[u64],
+    keys: HandKeys,
+) -> (
+    Result<u128, WalletError>,
+    Wallet,
+    Option<u64>,
+    Box<dyn std::any::Any>,
+) {
+    exchange_against_a_hand_made_stream_with(name, rules, late, keys, Late::BeforeFinish, false)
+}
+
+/// When the rules published after the send are written.
+#[derive(Clone, Copy)]
+enum Late {
+    /// Before `finish_exchange` is called.
+    BeforeFinish,
+    /// This long after `finish_exchange` is called (while the wallet checks).
+    During(Duration),
+}
+
+/// [`exchange_against_a_hand_made_stream`], with the late rules written `when`,
+/// and with `extreme` the key feed restarted before `finish_exchange` on AIR
+/// settings at their least (`air.max_skew_secs`, `air.reply_wait_secs` and
+/// `air.timeout_secs` 1), as an app could with `Wallet::start_key_feed`.
+fn exchange_against_a_hand_made_stream_with(
+    name: &str,
+    rules: &[u64],
+    late: &[u64],
+    keys: HandKeys,
+    when: Late,
+    extreme: bool,
+) -> (
+    Result<u128, WalletError>,
+    Wallet,
+    Option<u64>,
+    Box<dyn std::any::Any>,
+) {
+    let server = server();
+    let (key, did) = mint_key();
+    let dir = scratch(name);
+    let esp = start_esp_now(&dir, Config::default(), None);
+    let today = now() / 86_400;
+    let days: Vec<_> = (today + 360..=today + 370)
+        .map(|day| {
+            let published = match keys {
+                HandKeys::True => common::air::esp_day_keys(&esp.mint.state, &service(), day),
+                HandKeys::Spoiled => common::air::spoiled_keys(),
+            };
+            (day, service(), published)
+        })
+        .collect();
+    common::air::esp_published_by_hand(&server, &key, &esp.keyset, rules, &days);
+    let listener = start_serving(
+        &server,
+        &key,
+        &scratch(&format!("{name}-state")),
+        esp.serve(),
+    );
+    let air = air_settings(&server, &did, 6, 1);
+
+    let note = esp.psp_note(4);
+    let mut w = wallet_with_psp(&dir, "w", vec![note]);
+    w.set_key_policy(KeyPolicy {
+        blacklist_on_key_mismatch: true,
+        blacklist_max: 1000,
+    });
+    sync_esp_keysets(&mut w, &air, &esp_record(&air)).unwrap();
+    sync_esp_limits(&mut w, &air).unwrap();
+    let built = w.build_exchange(4, service(), None).unwrap();
+    assert!(
+        w.pending_exchanges()[0].first_sent_at.is_some(),
+        "set when the request is built"
+    );
+    let response = send_exchange(&mut w, &air, &built.request).unwrap();
+    let first_sent = w.pending_exchanges()[0].first_sent_at;
+    if extreme {
+        w.start_key_feed(&AirSettings {
+            max_skew_secs: 1,
+            reply_wait_secs: 1,
+            timeout_secs: 1,
+            ..air.clone()
+        })
+        .unwrap();
+    }
+    // The records already written are written again (same bytes: stored
+    // already); the new ones are the rules published after the send.
+    let all: Vec<u64> = rules.iter().chain(late).copied().collect();
+    let write_late = || {
+        if !late.is_empty() {
+            common::air::esp_published_by_hand(&server, &key, &esp.keyset, &all, &[]);
+        }
+    };
+    let done = match when {
+        Late::BeforeFinish => {
+            write_late();
+            w.finish_exchange(&built.id, &response)
+        }
+        Late::During(after) => thread::scope(|scope| {
+            scope.spawn(|| {
+                thread::sleep(after);
+                write_late();
+            });
+            w.finish_exchange(&built.id, &response)
+        }),
+    }
+    .map(|done| done.esp_units);
+    (done, w, first_sent, Box::new((listener, esp, server)))
+}
+
+/// An ESP mint that signs a new exchange with keys other than the ones it
+/// published for that service and day: nothing from the reply is stored (the PSP
+/// note is burned at the mint, so the request is kept to be tried again), the
+/// warning names the ESP, the site and the output, and the ESP is not
+/// blacklisted: the SPI's PSP and ESP mints only warn, whatever the setting says.
+#[test]
+fn an_exchange_signed_with_keys_the_esp_did_not_publish_warns_and_stores_nothing() {
+    let (done, w, first_sent, keep) =
+        exchange_against_a_hand_made_stream("key-exchange-keys", &[365], &[], HandKeys::Spoiled);
+    let WalletError::KeyMismatch(m) = done.unwrap_err() else {
+        panic!("expected a key mismatch");
+    };
+    assert_eq!((m.mint, m.site), ("ESP mint", Site::FinishExchange));
+    assert!(matches!(m.failed, Failed::Key { .. }), "{:?}", m.failed);
+    assert!(!m.blacklisted);
+    assert!(
+        m.warning
+            .starts_with("WARNING: KEY CHECK FAILED at finish_exchange. The ESP mint (DID "),
+        "{}",
+        m.warning
+    );
+    assert!(
+        m.warning.contains("signed the output of ")
+            && m.warning
+                .contains("with a KEY that is not the key it published"),
+        "{}",
+        m.warning
+    );
+    assert!(
+        m.warning
+            .ends_with("The SPI's PSP and ESP mints are never blacklisted: this only warns."),
+        "{}",
+        m.warning
+    );
+    assert_eq!(w.balance().esp, 0, "nothing from the reply was stored");
+    assert_eq!(w.pending_exchanges().len(), 1, "the request is kept");
+    assert_eq!(
+        w.pending_exchanges()[0].first_sent_at,
+        first_sent,
+        "and its first send time"
+    );
+    assert!(w.blacklist().is_empty());
+    assert_eq!(
+        w.key_rereads(),
+        1,
+        "the day's keys were read again from AIR once before the mismatch"
+    );
+    // The wallet stops following the mint's stream before the mint goes.
+    drop(w);
+    drop(keep);
+}
+
+/// An ESP mint that gives a new exchange a day its published maturity rule does
+/// not allow (it published `m = 300` and gave today plus 365): refused, with the
+/// day, the days that were allowed and the rule in the warning.
+#[test]
+fn an_exchange_given_a_day_the_published_rule_does_not_allow_warns_and_stores_nothing() {
+    let (done, w, _, keep) =
+        exchange_against_a_hand_made_stream("key-exchange-day", &[300], &[], HandKeys::True);
+    let WalletError::KeyMismatch(m) = done.unwrap_err() else {
+        panic!("expected a key mismatch");
+    };
+    assert_eq!((m.mint, m.site), ("ESP mint", Site::FinishExchange));
+    let today = now() / 86_400;
+    match &m.failed {
+        Failed::Day {
+            day,
+            from,
+            to,
+            rules,
+        } => {
+            assert!((today + 365..=today + 366).contains(day), "{day}");
+            assert!((today + 300..=today + 301).contains(from), "{from}");
+            assert!((today + 300..=today + 301).contains(to), "{to}");
+            assert_eq!(rules, &vec![300]);
+        }
+        other => panic!("expected a day failure, got {other:?}"),
+    }
+    assert!(
+        m.warning
+            .contains("outside the days it allows a new exchange")
+    );
+    assert!(m.warning.contains("its published maturity rule(s) m = 300"));
+    assert_eq!(w.balance().esp, 0);
+    assert_eq!(w.pending_exchanges().len(), 1);
+    assert_eq!(w.key_rereads(), 1, "one fresh read before the mismatch");
+    drop(w);
+    drop(keep);
+}
+
+/// The mint changed its maturity rule (300, then 365) and the exchange got a day
+/// under the new one: accepted. The stream's last two rules are both allowed (an
+/// exchange sent just before a change is answered just after it), the keys are
+/// the mint's own, and the wallet recorded the time of the first send.
+#[test]
+fn an_exchange_given_a_day_under_either_of_the_last_two_published_rules_is_accepted() {
+    let before = now();
+    let (done, w, first_sent, keep) =
+        exchange_against_a_hand_made_stream("key-exchange-rules", &[300, 365], &[], HandKeys::True);
+    assert_eq!(done.unwrap(), 4 * u128::from(ONE_PSP));
+    assert_eq!(w.balance().esp, 4 * u128::from(ONE_PSP));
+    assert!(w.pending_exchanges().is_empty());
+    let first_sent = first_sent.expect("the first send time was recorded");
+    assert!(first_sent >= before && first_sent <= now(), "{first_sent}");
+    assert_eq!(
+        w.key_rereads(),
+        0,
+        "a day the held rules allow needs no reread"
+    );
+    drop(w);
+    drop(keep);
+}
+
+/// The mint changed its maturity rule after the exchange was sent (T5): the
+/// wallet had read only `m = 300` when the reply came with the day today plus 365,
+/// and the control record for 365 was written meanwhile. The wallet reads the
+/// stream again before it calls the day a mismatch, and accepts the day. Fails if
+/// the day were judged by the rules the wallet had read before the reply, and
+/// if the stream were read again more than once.
+#[test]
+fn an_exchange_given_a_day_under_a_rule_published_after_the_send_is_accepted() {
+    let (done, w, _, keep) = exchange_against_a_hand_made_stream(
+        "key-exchange-late-rule",
+        &[300],
+        &[365],
+        HandKeys::True,
+    );
+    assert_eq!(done.unwrap(), 4 * u128::from(ONE_PSP));
+    assert_eq!(w.balance().esp, 4 * u128::from(ONE_PSP));
+    assert!(w.pending_exchanges().is_empty());
+    // At most one reread: the wallet's stream thread may have taken the new
+    // rule in before the reply was checked (then none is needed). The count of
+    // exactly one, with the new rule unread, is the unit test
+    // a_maturity_rule_changed_after_the_send_is_taken_in_with_exactly_one_reread.
+    assert!(w.key_rereads() <= 1, "{}", w.key_rereads());
+    drop(w);
+    drop(keep);
+}
+
+/// The same, but the rule published after the send (400) does not allow the day
+/// either (today plus 365 is under neither 300 nor 400): a mismatch that lists
+/// both rules, so the new one was read before the day was refused. Fails if the
+/// wallet never reads the stream again, or accepts a day neither rule allows.
+#[test]
+fn an_exchange_given_a_day_under_neither_the_old_nor_the_late_rule_warns() {
+    let (done, w, _, keep) = exchange_against_a_hand_made_stream(
+        "key-exchange-late-neither",
+        &[300],
+        &[400],
+        HandKeys::True,
+    );
+    let WalletError::KeyMismatch(m) = done.unwrap_err() else {
+        panic!("expected a key mismatch");
+    };
+    assert_eq!((m.mint, m.site), ("ESP mint", Site::FinishExchange));
+    match &m.failed {
+        Failed::Day { rules, .. } => {
+            assert_eq!(rules, &vec![400, 300], "latest first, both read");
+        }
+        other => panic!("expected a day failure, got {other:?}"),
+    }
+    assert_eq!(w.key_rereads(), 1, "exactly one reread before the mismatch");
+    assert_eq!(w.balance().esp, 0);
+    assert_eq!(w.pending_exchanges().len(), 1);
+    drop(w);
+    drop(keep);
+}
+
+/// An honest ESP changed its rule to 365 and its control record reaches AIR 3 s
+/// after the wallet starts checking the reply (a writer that missed a tick):
+/// with the AIR settings at their least (skew, reply wait and timeout all 1 s)
+/// the exchange is still accepted, because the key check waits its own fixed
+/// time (45 s) for the record and reads with its own least timeout (10 s), not
+/// the settings. Fails if a 1 s `air.reply_wait_secs` or `air.timeout_secs` made
+/// the wallet call an honest mint's day a mismatch.
+#[test]
+fn extreme_air_settings_do_not_flag_an_honest_esp_whose_new_rule_is_written_late() {
+    let (done, w, _, keep) = exchange_against_a_hand_made_stream_with(
+        "key-extreme-honest",
+        &[300],
+        &[365],
+        HandKeys::True,
+        Late::During(Duration::from_secs(3)),
+        true,
+    );
+    assert_eq!(done.unwrap(), 4 * u128::from(ONE_PSP));
+    assert_eq!(w.balance().esp, 4 * u128::from(ONE_PSP));
+    assert!(w.pending_exchanges().is_empty());
+    assert!(w.blacklist().is_empty());
+    drop(w);
+    drop(keep);
+}
+
+/// A cheating ESP, with the AIR settings at their least (skew, reply wait and
+/// timeout all 1 s): keys it never published are a key mismatch, and a day its
+/// published rule does not allow is a day mismatch after the fixed wait, with
+/// the window of the fixed 300 s slack (not 1 s). Fails if the extreme settings
+/// turned either into an error to retry, or a mismatch came before the wait.
+#[test]
+fn extreme_air_settings_do_not_stop_a_cheating_esp_being_flagged() {
+    let (done, w, _, keep) = exchange_against_a_hand_made_stream_with(
+        "key-extreme-keys",
+        &[365],
+        &[],
+        HandKeys::Spoiled,
+        Late::BeforeFinish,
+        true,
+    );
+    let WalletError::KeyMismatch(m) = done.unwrap_err() else {
+        panic!("expected a key mismatch");
+    };
+    assert_eq!((m.mint, m.site), ("ESP mint", Site::FinishExchange));
+    assert!(matches!(m.failed, Failed::Key { .. }), "{:?}", m.failed);
+    assert_eq!(w.balance().esp, 0);
+    assert_eq!(w.pending_exchanges().len(), 1);
+    drop(w);
+    drop(keep);
+
+    let started = Instant::now();
+    let (done, w, first_sent, keep) = exchange_against_a_hand_made_stream_with(
+        "key-extreme-day",
+        &[300],
+        &[],
+        HandKeys::True,
+        Late::BeforeFinish,
+        true,
+    );
+    let WalletError::KeyMismatch(m) = done.unwrap_err() else {
+        panic!("expected a key mismatch");
+    };
+    assert!(
+        started.elapsed() >= Duration::from_secs(45),
+        "the day is called wrong only after the fixed wait"
+    );
+    let first_sent = first_sent.expect("the first send time was recorded");
+    match &m.failed {
+        Failed::Day {
+            day, from, rules, ..
+        } => {
+            let today = now() / 86_400;
+            assert!((today + 365..=today + 366).contains(day), "{day}");
+            assert_eq!(*from, (first_sent - 300) / 86_400 + 300, "the 300 s slack");
+            assert_eq!(rules, &vec![300]);
+        }
+        other => panic!("expected a day failure, got {other:?}"),
+    }
+    assert_eq!(w.balance().esp, 0);
+    assert_eq!(w.pending_exchanges().len(), 1);
+    drop(w);
+    drop(keep);
 }

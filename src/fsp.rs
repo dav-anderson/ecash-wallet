@@ -27,6 +27,7 @@ use sp_wire::fsp::{
 };
 
 use crate::blind::PendingOutput;
+use crate::config::Party;
 use crate::error::WalletError;
 use crate::store::{HandedNote, Handover, Kind, StoredNote, StoredTerms, Wallet};
 
@@ -361,6 +362,12 @@ impl Wallet {
             .ok_or_else(|| WalletError::Unknown(format!("no pending FSP request {id}")))
     }
 
+    /// Turn the FSP mint's reply to an issue into FSP notes and spend the ESP the
+    /// request handed over. **Before anything is stored** each issued group's keys
+    /// are checked against the key set the FSP mint published on AIR (see
+    /// [`crate::keystream`]); on a mismatch nothing is stored, the request stays
+    /// pending, a warning is printed, and the error is
+    /// [`WalletError::KeyMismatch`].
     pub fn finish_fsp_issue(
         &mut self,
         id: &str,
@@ -397,6 +404,18 @@ impl Wallet {
                             "the FSP mint's reply does not fit the request".into(),
                         ));
                     }
+                    // The shared key check, before anything is stored.
+                    let signed: Vec<(u64, secp256k1::PublicKey)> = outputs[g]
+                        .iter()
+                        .zip(keys)
+                        .map(|(o, key)| (o.amount, *key))
+                        .collect();
+                    self.check_keyset_keys(
+                        Party::Fsp(p.service),
+                        crate::keystream::Site::FinishFspIssue,
+                        keyset,
+                        &signed,
+                    )?;
                     for (i, o) in outputs[g].iter().enumerate() {
                         add.push((
                             StoredNote {
@@ -627,6 +646,9 @@ impl Wallet {
         self.build_swap(service, old, 0, "rollover").map(Some)
     }
 
+    /// Turn the FSP mint's reply to a spend (or a rollover) into the change notes.
+    /// **Before anything is stored** the reply's keys are checked against the key
+    /// set the FSP mint published on AIR, as in [`Wallet::finish_fsp_issue`].
     pub fn finish_fsp_spend(
         &mut self,
         id: &str,
@@ -641,6 +663,18 @@ impl Wallet {
                 "the FSP mint's reply does not fit the request".into(),
             ));
         }
+        // The shared key check, before anything is stored.
+        let signed: Vec<(u64, secp256k1::PublicKey)> = change
+            .iter()
+            .zip(&reply.keys)
+            .map(|(o, key)| (o.amount, *key))
+            .collect();
+        self.check_keyset_keys(
+            Party::Fsp(p.service),
+            crate::keystream::Site::FinishFspSpend,
+            &reply.keyset,
+            &signed,
+        )?;
         self.update(|d| {
             d.notes.retain(|n| !inputs.contains(&n.id()));
             for i in &inputs {

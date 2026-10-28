@@ -362,7 +362,9 @@ pub fn call_with_body(
     kind: u8,
     body: &[u8],
 ) -> Result<Verified, WalletError> {
+    wallet.refuse_blacklisted(party)?;
     let cfg = ask_config(air, party)?;
+    wallet.ensure_key_feed(air);
     let mint = cfg.mint.to_hex();
     let hash = body_hash(body);
     let kept = wallet
@@ -420,7 +422,9 @@ pub fn call_with_key(
     body: &[u8],
     r: &SecretKey,
 ) -> Result<Sent, WalletError> {
+    wallet.refuse_blacklisted(party)?;
     let cfg = ask_config(air, party)?;
+    wallet.ensure_key_feed(air);
     let mint = cfg.mint.to_hex();
     let hash = body_hash(body);
     let key_hex = addr::secret_to_hex(r);

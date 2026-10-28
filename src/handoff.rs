@@ -3239,6 +3239,10 @@ mod tests {
         let key = SecretKey::from_slice(&[5u8; 32])
             .unwrap()
             .public_key(SECP256K1);
+        // the PSP mint published this key set, with that key for every amount
+        let published: BTreeMap<u64, PublicKey> =
+            p.outputs.iter().map(|o| (o.amount, key)).collect();
+        crate::keystream::testing::publish_keyset_as(&mut a, "psp", "00", 1, 1, KS_A, &published);
         a.finish_rollover(&id, 1, KS_A, &sigs, &vec![key; sigs.len()])
             .unwrap();
         let h = &a.handoffs_out()[0];

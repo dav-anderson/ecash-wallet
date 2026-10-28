@@ -19,6 +19,7 @@
 
 mod common;
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,6 +28,7 @@ use std::time::{Duration, Instant};
 
 use ecash_wallet::config::{AirSettings, BUILTIN_SPI_DID};
 use ecash_wallet::handoff::Standing;
+use ecash_wallet::keystream::{KeyPolicy, MintStream};
 use ecash_wallet::mint_info::{
     check_handoff, complete_import, psp_keys, psp_keysets, psp_post, psp_window, reclaim_handoff,
     rotation_sync, verify_psp,
@@ -503,6 +505,14 @@ fn real_psp(dir: &Path) -> PspMint {
     PspMint::open_at(&dir.join("psp"), T)
 }
 
+/// What psp-mint's listener answers, with the mint's key sets on AIR as its key
+/// stream would have them: the ones it has now at once, and after every request
+/// the ones it has then, before the reply goes out.
+fn serving(psp: &PspMint, server: &ServerRef, key: &SecretKey) -> Arc<Serve> {
+    let publisher = common::air::publisher(server, key);
+    psp.serve_publishing(addr::key_to_did(&key.public_key()), &publisher)
+}
+
 fn real_psp_with(dir: &Path, limits: Limits) -> PspMint {
     PspMint::open_with(&dir.join("psp"), T, limits)
 }
@@ -578,12 +588,7 @@ fn keys_keysets_and_rotation_over_air_are_the_mints_own() {
     let dir = scratch("keys");
     let psp = real_psp(&dir);
     let state_dir = scratch("keys-state");
-    let listener = start_serving(
-        &server,
-        &key,
-        &state_dir,
-        psp.serve(addr::key_to_did(&key.public_key())),
-    );
+    let listener = start_serving(&server, &key, &state_dir, serving(&psp, &server, &key));
     let air = air_settings(&server, &did, 10, 3);
 
     let mut wallet = open_wallet(&dir);
@@ -653,12 +658,7 @@ fn a_kept_request_is_resumed_by_a_call_of_its_own_kind_only() {
     // The PSP starts and reads slot 0, where the keys request of the try was
     // written (the old mint-info request never was). The next keys call carries
     // on with the same keys request: it finds the reply and writes nothing.
-    let listener = start_serving(
-        &server,
-        &key,
-        &state_dir,
-        psp.serve(addr::key_to_did(&key.public_key())),
-    );
+    let listener = start_serving(&server, &key, &state_dir, serving(&psp, &server, &key));
     wait_for_next(&state_dir, 1);
     let air = air_settings(&server, &did, 10, 3);
     assert!(!psp_keys(&mut wallet, &air).unwrap().is_empty());
@@ -762,12 +762,7 @@ fn a_psp_that_cannot_answer_says_so_at_once() {
     let dir = scratch("unavailable");
     let psp = real_psp(&dir);
     let state_dir = scratch("unavailable-state");
-    let listener = start_serving(
-        &server,
-        &key,
-        &state_dir,
-        psp.serve(addr::key_to_did(&key.public_key())),
-    );
+    let listener = start_serving(&server, &key, &state_dir, serving(&psp, &server, &key));
     let a = psp.note(1);
     let mut wallet = psp.wallet(&dir, "w", vec![a.clone()]);
     let body = rollover_body(&[a], &psp.keyset());
@@ -818,12 +813,7 @@ fn a_rotation_rollover_goes_over_air_and_ends_with_the_notes_on_the_new_keyset()
     let dir = scratch("roll");
     let psp = real_psp(&dir);
     let state_dir = scratch("roll-state");
-    let listener = start_serving(
-        &server,
-        &key,
-        &state_dir,
-        psp.serve(addr::key_to_did(&key.public_key())),
-    );
+    let listener = start_serving(&server, &key, &state_dir, serving(&psp, &server, &key));
     let air = air_settings(&server, &did, 10, 3);
 
     let (a, b) = (psp.note(4), psp.note(1));
@@ -885,12 +875,7 @@ fn a_rollover_resent_over_air_is_the_same_answer_and_a_kept_request_is_found_by_
     // rollover once. The same call, made again, finds the reply of its kept
     // request and writes nothing; the other call is still kept, untouched.
     let air = air_settings(&server, &did, 10, 3);
-    let listener = start_serving(
-        &server,
-        &key,
-        &state_dir,
-        psp.serve(addr::key_to_did(&key.public_key())),
-    );
+    let listener = start_serving(&server, &key, &state_dir, serving(&psp, &server, &key));
     wait_for_next(&state_dir, 2);
     let first = psp_post(&mut w, &air, "rollover", &roll).unwrap();
     assert!(psp.spent(&a) && !psp.spent(&b));
@@ -937,12 +922,7 @@ fn refusals_over_air_are_the_wallets_errors() {
     };
     let psp = real_psp_with(&dir, limits);
     let state_dir = scratch("refused-state");
-    let listener = start_serving(
-        &server,
-        &key,
-        &state_dir,
-        psp.serve(addr::key_to_did(&key.public_key())),
-    );
+    let listener = start_serving(&server, &key, &state_dir, serving(&psp, &server, &key));
     let air = air_settings(&server, &did, 10, 3);
     let (a, b) = (psp.note(1), psp.note(1));
     let mut w = psp.wallet(&dir, "w", vec![a.clone(), b.clone()]);
@@ -991,12 +971,7 @@ fn a_handoff_is_checked_swapped_and_reclaimed_over_air() {
     let dir = scratch("handoff");
     let psp = real_psp(&dir);
     let state_dir = scratch("handoff-state");
-    let listener = start_serving(
-        &server,
-        &key,
-        &state_dir,
-        psp.serve(addr::key_to_did(&key.public_key())),
-    );
+    let listener = start_serving(&server, &key, &state_dir, serving(&psp, &server, &key));
     let air = air_settings(&server, &did, 10, 3);
 
     let (a, b, c) = (psp.note(4), psp.note(1), psp.note(2));
@@ -1095,4 +1070,180 @@ fn the_builtin_placeholder_did_never_passes_silently() {
 
     // Without air.server and air.host no call is made, so there is nothing to warn about.
     assert_eq!(AirSettings::default().placeholder_warning(), None);
+}
+
+// ---------------------------------------------------------------- the key check
+
+/// Move back by a day, in the wallet file (the wallet closed), the time the
+/// wallet first read a stream without each record it is missing: what a day
+/// of waiting does, without a setting (the backstop is fixed) and without
+/// waiting a day.
+fn a_day_passes_for_the_missing_records(path: &std::path::Path) {
+    let mut file: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    let missing = file["unpublished"]
+        .as_object_mut()
+        .expect("the wallet noted a missing record");
+    assert!(!missing.is_empty());
+    for seen in missing.values_mut() {
+        let since = seen["since"].as_u64().unwrap();
+        seen["since"] = serde_json::json!(since - 86_400);
+    }
+    std::fs::write(path, serde_json::to_vec(&file).unwrap()).unwrap();
+}
+
+/// A PSP that rotates to a key set it did not publish (its stream carries one key
+/// changed in the new set): the rollover it answers is not stored, and the PSP
+/// is **not** blacklisted whatever the setting says (the SPI's PSP and ESP
+/// mints are never blacklisted). The old notes are burned at the
+/// mint by then, so the rollover stays pending and is tried again. A key set not
+/// on AIR may be one not published yet, so this is an error to retry: no
+/// warning, nothing stored, everything kept. Once the fixed backstop (a day)
+/// has passed it is a key check failure, and the PSP is still not blacklisted.
+#[test]
+fn a_rollover_under_an_unpublished_key_set_is_retried_and_the_psp_is_never_blacklisted() {
+    let server = server();
+    let (key, did) = mint_key();
+    let dir = scratch("key-roll");
+    let psp = real_psp(&dir);
+    let state_dir = scratch("key-roll-state");
+    let publisher = common::air::publisher(&server, &key);
+    let listener = start_serving(
+        &server,
+        &key,
+        &state_dir,
+        psp.serve_publishing(addr::key_to_did(&key.public_key()), &publisher),
+    );
+    let air = air_settings(&server, &did, 6, 1);
+
+    let (a, b) = (psp.note(4), psp.note(1));
+    let mut w = psp.wallet(&dir, "air", vec![a.clone(), b.clone()]);
+    // The setting that blacklists an FSP mint is on; for a PSP it does nothing.
+    w.set_key_policy(KeyPolicy {
+        blacklist_on_key_mismatch: true,
+        blacklist_max: 1000,
+    });
+    rotation_sync(&mut w, &air, Kind::Psp, &psp_record(&air)).unwrap();
+    publisher.tamper(true);
+    psp.set_clock(T + H);
+    rotation_sync(&mut w, &air, Kind::Psp, &psp_record(&air)).unwrap(); // draws the swap time
+    psp.set_clock(T + H + LATER);
+    let log = rotation_sync(&mut w, &air, Kind::Psp, &psp_record(&air)).unwrap();
+
+    let failed = log
+        .iter()
+        .find(|l| l.contains("rollover failed, retried on the next connection"))
+        .unwrap_or_else(|| panic!("the rollover should have failed its key check: {log:?}"));
+    assert!(
+        failed.contains("the PSP mint has not published key set")
+            && failed.contains("The request is kept: try again"),
+        "{failed}"
+    );
+    assert!(!failed.contains("KEY CHECK FAILED"), "{failed}");
+    assert!(!failed.contains("DROPPED"), "{failed}");
+    // The wallet kept everything: the notes it holds, and the rollover to retry.
+    assert_eq!(w.pending_rollovers().len(), 1);
+    assert_eq!(psp_total(&w), 5, "the old notes are still in the wallet");
+    assert!(w.blacklist().is_empty());
+
+    // Still not published once the backstop has passed: a key check failure,
+    // and a PSP is never blacklisted: the notes and the rollover are kept.
+    let (policy, path) = (w.key_policy(), w.path().to_path_buf());
+    drop(w);
+    a_day_passes_for_the_missing_records(&path);
+    let mut w = common::open_wallet(&path).unwrap();
+    w.set_key_policy(policy);
+    let log = rotation_sync(&mut w, &air, Kind::Psp, &psp_record(&air)).unwrap();
+    let failed = log
+        .iter()
+        .find(|l| l.contains("rollover failed, retried on the next connection"))
+        .unwrap_or_else(|| panic!("the rollover should have failed its key check: {log:?}"));
+    assert!(
+        failed.contains("KEY CHECK FAILED") && failed.contains("NOT PUBLISHED"),
+        "{failed}"
+    );
+    assert!(!failed.contains("DROPPED"), "{failed}");
+    assert_eq!(w.pending_rollovers().len(), 1);
+    assert_eq!(psp_total(&w), 5);
+    assert!(w.blacklist().is_empty());
+    listener.stop().unwrap();
+}
+
+/// A wallet follows a PSP's key stream with no request of its own: it reads the
+/// latest record when it starts, is told of a rotation by the stream (the
+/// record the PSP writes when a request makes it rotate), and, started again
+/// after it was stopped, reads forward from where its file left off.
+#[test]
+fn the_wallet_reads_the_latest_record_is_pushed_a_rotation_and_reads_forward_after_a_restart() {
+    let server = server();
+    let (key, did) = mint_key();
+    let dir = scratch("key-feed");
+    let psp = real_psp(&dir);
+    let state_dir = scratch("key-feed-state");
+    let listener = start_serving(&server, &key, &state_dir, serving(&psp, &server, &key));
+    let air = air_settings(&server, &did, 10, 3);
+
+    // A wallet that only listens, and another that makes the PSP rotate by asking.
+    let mut w = psp.wallet(&dir, "feed", vec![psp.note(4)]);
+    let mut asker = open_wallet_at(&dir, "asker");
+    let holds = |id: &str| {
+        let id = id.to_string();
+        move |streams: &BTreeMap<String, MintStream>| {
+            streams
+                .get("psp")
+                .is_some_and(|s| s.keysets.iter().any(|k| k.id == id))
+        }
+    };
+    let wait = Duration::from_secs(15);
+
+    // Started: the latest record is read.
+    let genesis = psp.keyset();
+    assert!(!w.key_feed_running());
+    w.start_key_feed(&air).unwrap();
+    assert!(w.key_feed_running());
+    assert!(w.wait_for_keys(wait, &holds(&genesis)).unwrap());
+
+    // A request at T: the PSP records its first issue then (rotation starts H later).
+    psp_window(&mut asker, &air).unwrap();
+    // The PSP rotates: the wallet is told, and has asked for nothing.
+    psp.set_clock(T + H);
+    psp_window(&mut asker, &air).unwrap();
+    let second = psp.keyset();
+    assert_ne!(second, genesis);
+    assert!(w.wait_for_keys(wait, &holds(&second)).unwrap());
+    assert!(
+        w.wait_for_keys(wait, &holds(&genesis)).unwrap(),
+        "and still holds the previous one"
+    );
+    assert!(w.air_requests().is_empty(), "the wallet asked for no keys");
+
+    // Stopped, and the PSP rotates again meanwhile.
+    drop(w);
+    psp.set_clock(T + 2 * H);
+    psp_window(&mut asker, &air).unwrap();
+    let third = psp.keyset();
+    assert_ne!(third, second);
+
+    // Started again: the wallet reads forward from its file, and the file keeps it.
+    let mut w = open_wallet_at(&dir, "feed");
+    assert!(
+        w.key_streams()["psp"]
+            .keysets
+            .iter()
+            .any(|k| k.id == second)
+    );
+    assert!(w.key_streams()["psp"].keysets.iter().all(|k| k.id != third));
+    w.start_key_feed(&air).unwrap();
+    assert!(w.wait_for_keys(wait, &holds(&third)).unwrap());
+    let kept = open_wallet_at(&dir, "feed");
+    assert!(
+        kept.key_streams()["psp"]
+            .keysets
+            .iter()
+            .any(|k| k.id == third)
+    );
+    drop(kept);
+    drop(w);
+    drop(asker);
+    listener.stop().unwrap();
 }

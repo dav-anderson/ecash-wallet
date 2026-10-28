@@ -217,7 +217,7 @@ pub const SPECS: &[Spec] = &[
         env: "ECASH_AIR_REPLY_WAIT_SECS",
         default: "30",
         units: "seconds (1 to 600)",
-        what: "How long to wait for the mint's reply to one try of a request (mint info, keys, keysets, rotation, fees, rollover, check-state, exchange, redeem, FSP issue or FSP spend). After that the same request is written again, in the next free mailbox slot.",
+        what: "How long to wait for the mint's reply to one try of a request (mint info, keys, keysets, rotation, fees, rollover, check-state, exchange, redeem, FSP issue or FSP spend). After that the same request is written again, in the next free mailbox slot. Not used by the key check, which waits a fixed 45 s for a mint's published record.",
     },
     Spec {
         key: "air.attempts",
@@ -231,7 +231,7 @@ pub const SPECS: &[Spec] = &[
         env: "ECASH_AIR_MAX_SKEW_SECS",
         default: "300",
         units: "seconds (1 to 86400)",
-        what: "How far the reply's issued_at (the mint's clock) may be from this wallet's clock before the reply is refused as stale. A reply that is older than this when it is read (a request kept from days ago) is dropped and the call starts a new request.",
+        what: "How far the reply's issued_at (the mint's clock) may be from this wallet's clock before the reply is refused as stale. A reply that is older than this when it is read (a request kept from days ago) is dropped and the call starts a new request. Not used by the key check: the ESP day check allows a fixed 300 s.",
     },
     Spec {
         key: "psp.unpaid_key_days",
@@ -241,11 +241,25 @@ pub const SPECS: &[Spec] = &[
         what: "How long a PSP purchase's claim key is kept while the PSP mint has written no record for it (the payload was never paid, or the payment never settled). After that many days from buy-psp the key is dropped, with a warning, the first time the AIR server is read and still has no record. A payment made to the payload after that is lost: nothing is left that can claim it. A key that has a record is kept by its records' own windows. 0: such a key is kept for ever.",
     },
     Spec {
+        key: "fsp.blacklist_on_key_mismatch",
+        env: "ECASH_FSP_BLACKLIST_ON_KEY_MISMATCH",
+        default: "false",
+        units: "true or false",
+        what: "What the wallet does when an FSP mint fails the key check: it signed with a key (or in a keyset) that it did not publish on AIR, a sign that it may be fingerprinting this wallet's notes. false (the default): the wallet keeps its notes and the pending request, prints a loud warning naming the mint, what failed and where, and stores nothing from that reply. true: it also BLACKLISTS that FSP mint and DROPS its notes from the wallet (removed, not backed up), and sends the mint no more requests, saying so, until an operator removes the entry by hand (`ecash-wallet blacklist remove`). Meant for an ASO, whose FSP mints are its own services'; an app that is not an ASO should leave it off. The PSP and ESP mints of the SPI are never blacklisted, whatever this is: they only warn. The blacklist is kept in the wallet file.",
+    },
+    Spec {
+        key: "fsp.blacklist_max",
+        env: "ECASH_FSP_BLACKLIST_MAX",
+        default: "1000",
+        units: "entries (0 to 1000000)",
+        what: "The most FSP mints the blacklist holds. It only grows by a mint failing the key check with fsp.blacklist_on_key_mismatch on, and nothing removes an entry but an operator. At the cap a mint that fails the check is NOT blacklisted and its notes are NOT dropped: the wallet keeps them, and the warning says the blacklist is full. No entry is ever removed to make room. 0: no cap, every entry is kept.",
+    },
+    Spec {
         key: "air.timeout_secs",
         env: "ECASH_AIR_TIMEOUT_SECS",
         default: "10",
         units: "seconds (1 to 600)",
-        what: "How long the AIR server may take to answer one Create or Read before that step fails.",
+        what: "How long the AIR server may take to answer one Create or Read before that step fails. The key check's reads of the mints' streams take at least 10 s whatever this is.",
     },
 ];
 
@@ -520,6 +534,11 @@ pub struct Settings {
     /// `psp.unpaid_key_days`: days a claim key with no owed record is kept; 0 for
     /// ever.
     pub psp_unpaid_key_days: u64,
+    /// `fsp.blacklist_on_key_mismatch`: blacklist an FSP mint that fails the key
+    /// check, and drop its notes.
+    pub fsp_blacklist_on_key_mismatch: bool,
+    /// `fsp.blacklist_max`: the most blacklist entries; 0 for no cap.
+    pub fsp_blacklist_max: u64,
 }
 
 impl Default for Settings {
@@ -529,6 +548,8 @@ impl Default for Settings {
             storage_app: StoragePolicy::default(),
             air: AirSettings::default(),
             psp_unpaid_key_days: crate::psp::DEFAULT_UNPAID_KEY_DAYS,
+            fsp_blacklist_on_key_mismatch: false,
+            fsp_blacklist_max: crate::keystream::DEFAULT_BLACKLIST_MAX,
         }
     }
 }
@@ -555,6 +576,8 @@ impl Settings {
             "air.max_skew_secs" => self.air.max_skew_secs.to_string(),
             "air.timeout_secs" => self.air.timeout_secs.to_string(),
             "psp.unpaid_key_days" => self.psp_unpaid_key_days.to_string(),
+            "fsp.blacklist_on_key_mismatch" => self.fsp_blacklist_on_key_mismatch.to_string(),
+            "fsp.blacklist_max" => self.fsp_blacklist_max.to_string(),
             _ => return None,
         })
     }
@@ -620,6 +643,18 @@ impl Settings {
             "air.max_skew_secs" => self.air.max_skew_secs = number(key, value, 1, 86_400)?,
             "air.timeout_secs" => self.air.timeout_secs = number(key, value, 1, 600)?,
             "psp.unpaid_key_days" => self.psp_unpaid_key_days = number(key, value, 0, 3650)?,
+            "fsp.blacklist_on_key_mismatch" => {
+                self.fsp_blacklist_on_key_mismatch = match value.trim() {
+                    "true" => true,
+                    "false" => false,
+                    _ => {
+                        return Err(format!("{key} = `{value}` must be true or false"));
+                    }
+                }
+            }
+            "fsp.blacklist_max" => {
+                self.fsp_blacklist_max = number(key, value, 0, crate::keystream::MAX_BLACKLIST_MAX)?
+            }
             other => return Err(format!("unknown setting `{other}`")),
         }
         Ok(())
@@ -645,6 +680,16 @@ impl Settings {
                 out
             }
             _ => vec![],
+        }
+    }
+
+    /// What the wallet does about a failed key check, from the two `fsp.`
+    /// settings (whether a mint is flagged at all is not a setting): give it to
+    /// [`crate::Wallet::set_key_policy`].
+    pub fn key_policy(&self) -> crate::keystream::KeyPolicy {
+        crate::keystream::KeyPolicy {
+            blacklist_on_key_mismatch: self.fsp_blacklist_on_key_mismatch,
+            blacklist_max: self.fsp_blacklist_max,
         }
     }
 
@@ -748,6 +793,7 @@ fn parse_file(text: &str) -> Result<Vec<(String, String)>, Vec<String>> {
             match value {
                 toml::Value::String(s) => pairs.push((key, s.clone())),
                 toml::Value::Integer(n) => pairs.push((key, n.to_string())),
+                toml::Value::Boolean(b) => pairs.push((key, b.to_string())),
                 toml::Value::Array(items) => {
                     let ids: Vec<&str> = items.iter().filter_map(|v| v.as_str()).collect();
                     if ids.len() == items.len() {
@@ -759,7 +805,7 @@ fn parse_file(text: &str) -> Result<Vec<(String, String)>, Vec<String>> {
                     }
                 }
                 _ => problems.push(format!(
-                    "{key} must be a list of strings or one string, not {}",
+                    "{key} must be a list of strings, one string, a whole number or true/false, not {}",
                     value.type_str()
                 )),
             }
@@ -1259,6 +1305,80 @@ mod tests {
         fs::remove_dir_all(&d).unwrap();
     }
 
+    /// `fsp.blacklist_on_key_mismatch` is off by default and `fsp.blacklist_max`
+    /// is 1000; the file takes a TOML boolean (and the word in quotes), the
+    /// environment takes the word, the environment wins, and anything else is
+    /// refused naming the setting. Fails if the default were on, if a TOML boolean
+    /// were refused, or if the cap accepted 1,000,001 or 0 were refused.
+    #[test]
+    fn the_blacklist_settings_default_off_and_1000_and_are_checked() {
+        let d = dir("blacklist-settings");
+        let l = load(&d, None, &no_env).unwrap();
+        assert!(!l.settings.fsp_blacklist_on_key_mismatch);
+        assert_eq!(l.settings.fsp_blacklist_max, 1000);
+        assert_eq!(
+            l.settings.get("fsp.blacklist_on_key_mismatch").as_deref(),
+            Some("false")
+        );
+        assert_eq!(l.settings.get("fsp.blacklist_max").as_deref(), Some("1000"));
+        let policy = l.settings.key_policy();
+        assert!(!policy.blacklist_on_key_mismatch);
+        assert_eq!(policy.blacklist_max, 1000);
+
+        fs::write(
+            d.join(FILE_NAME),
+            "[fsp]\nblacklist_on_key_mismatch = true\nblacklist_max = 5\n",
+        )
+        .unwrap();
+        let l = load(&d, None, &no_env).unwrap();
+        assert!(l.settings.fsp_blacklist_on_key_mismatch);
+        assert_eq!(l.settings.fsp_blacklist_max, 5);
+        assert_eq!(l.sources["fsp.blacklist_on_key_mismatch"], Source::File);
+        assert_eq!(l.sources["fsp.blacklist_max"], Source::File);
+        assert!(l.settings.key_policy().blacklist_on_key_mismatch);
+        assert_eq!(l.settings.key_policy().blacklist_max, 5);
+
+        let l = load(
+            &d,
+            None,
+            &env_of(&[
+                ("ECASH_FSP_BLACKLIST_ON_KEY_MISMATCH", "false"),
+                ("ECASH_FSP_BLACKLIST_MAX", "0"),
+            ]),
+        )
+        .unwrap();
+        assert!(
+            !l.settings.fsp_blacklist_on_key_mismatch,
+            "the variable wins"
+        );
+        assert_eq!(l.settings.fsp_blacklist_max, 0, "0 is no cap");
+        assert_eq!(
+            l.sources["fsp.blacklist_max"],
+            Source::Env("ECASH_FSP_BLACKLIST_MAX")
+        );
+        let l = load(&d, None, &env_of(&[("ECASH_FSP_BLACKLIST_MAX", "1000000")])).unwrap();
+        assert_eq!(l.settings.fsp_blacklist_max, 1_000_000);
+
+        for (var, value) in [
+            ("ECASH_FSP_BLACKLIST_MAX", "1000001"),
+            ("ECASH_FSP_BLACKLIST_MAX", "-1"),
+            ("ECASH_FSP_BLACKLIST_MAX", "lots"),
+            ("ECASH_FSP_BLACKLIST_ON_KEY_MISMATCH", "yes"),
+            ("ECASH_FSP_BLACKLIST_ON_KEY_MISMATCH", "1"),
+        ] {
+            let p = load(&d, None, &env_of(&[(var, value)])).unwrap_err();
+            assert!(p.iter().any(|x| x.contains(var)), "{var}={value}: {p:?}");
+        }
+        fs::write(d.join(FILE_NAME), "[fsp]\nblacklist_on_key_mismatch = 1\n").unwrap();
+        let p = load(&d, None, &no_env).unwrap_err();
+        assert!(
+            p.iter()
+                .any(|x| x.contains("fsp.blacklist_on_key_mismatch") && x.contains("true or false")),
+            "{p:?}"
+        );
+        fs::remove_dir_all(&d).unwrap();
+    }
+
     #[test]
     fn the_psp_and_the_esp_need_the_server_and_the_host_and_the_error_names_what_is_missing() {
         let mut air = AirSettings::default();
@@ -1334,6 +1454,47 @@ mod tests {
             p.iter()
                 .any(|x| x.contains("unknown setting `psp.minimum`")),
             "{p:?}"
+        );
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// Whether a mint is flagged is not a setting (David's rule: a user must not
+    /// be able to change what decides that a mint is punished). The backstop
+    /// for a record a mint never publishes was `key_check.unpublished_backstop_secs`
+    /// and is now a fixed day: the key is unknown in the file and has no
+    /// variable or `get`. Fails if any of them is taken.
+    #[test]
+    fn the_unpublished_backstop_is_not_a_setting() {
+        let d = dir("backstop-setting");
+        assert!(
+            SPECS
+                .iter()
+                .all(|s| !s.key.starts_with("key_check.") && !s.env.contains("BACKSTOP"))
+        );
+        let l = load(&d, None, &no_env).unwrap();
+        assert_eq!(l.settings.get("key_check.unpublished_backstop_secs"), None);
+        fs::write(
+            d.join(FILE_NAME),
+            "[key_check]\nunpublished_backstop_secs = 0\n",
+        )
+        .unwrap();
+        let p = load(&d, None, &no_env).unwrap_err();
+        assert!(
+            p.iter()
+                .any(|x| x.contains("key_check.unpublished_backstop_secs")),
+            "{p:?}"
+        );
+        // The variable is not read: the default load is unchanged.
+        fs::remove_file(d.join(FILE_NAME)).unwrap();
+        let var = "ECASH_KEY_CHECK_UNPUBLISHED_BACKSTOP_SECS";
+        let l = load(&d, None, &env_of(&[(var, "0")])).unwrap();
+        assert_eq!(
+            l.settings.key_policy(),
+            crate::keystream::KeyPolicy::default()
+        );
+        assert!(
+            !l.sources
+                .contains_key("key_check.unpublished_backstop_secs")
         );
         fs::remove_dir_all(&d).unwrap();
     }

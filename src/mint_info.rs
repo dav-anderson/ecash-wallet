@@ -860,6 +860,11 @@ pub fn send_exchange(
 ) -> Result<ExchangeResponse, WalletError> {
     let body = serde_json::to_vec(request)
         .map_err(|e| WalletError::Mint(format!("exchange over AIR: {e}")))?;
+    // The time of the first send, saved before it (a resend keeps it): the day
+    // the ESP gives is checked against the days from here to the reply.
+    let id = sp_wire::esp::exchange::request_hash(request)
+        .map_err(|e| WalletError::Invalid(e.to_string()))?;
+    wallet.mark_exchange_sent(&id)?;
     crate::air::send_esp(
         wallet,
         air,

@@ -17,6 +17,7 @@ use std::sync::atomic::Ordering;
 
 use ecash_wallet::air::Party;
 use ecash_wallet::config::{AirSettings, FspAir};
+use ecash_wallet::keystream::{Failed, KeyMismatch, KeyPolicy, Site};
 use ecash_wallet::mint_info::{
     fsp_keys, fsp_rotation, fsp_sync, send_fsp_issue, send_fsp_spend, settle_fsp,
 };
@@ -26,7 +27,7 @@ use rand::rngs::OsRng;
 use secp256k1::{Keypair, SECP256K1};
 use sp_wire::ServiceDid;
 
-use common::air::{Mints, NOW, service};
+use common::air::{Mints, NOW, StreamMode, service};
 use common::{open_wallet, scratch};
 
 const DAY: u64 = 86_400;
@@ -85,6 +86,7 @@ fn issue_pay_and_the_rollover_when_a_rotation_is_detected() {
 
     // Right at the rotation this wallet waits its staggered delay.
     m.clock.store(NOW + 5 * DAY, Ordering::SeqCst);
+    m.fsp.publish();
     let sync = fsp_sync(&mut w, &m.air, service()).unwrap();
     assert!(
         sync.log.iter().any(|l| l.contains("staggered"))
@@ -95,6 +97,7 @@ fn issue_pay_and_the_rollover_when_a_rotation_is_detected() {
     // The rotation, past the stagger (240 h period: at most 1.2 h): swapped
     // without asking.
     m.clock.store(NOW + 5 * DAY + 2 * 3600, Ordering::SeqCst);
+    m.fsp.publish();
     let sync = fsp_sync(&mut w, &m.air, service()).unwrap();
     assert!(
         sync.log.iter().any(|l| l.contains("rolled over")),
@@ -123,6 +126,7 @@ fn a_crash_after_the_mint_answered_is_finished_from_the_stored_answer() {
     let mut w = wallet_with_esp(&dir, &m, &[16]);
     issue_all(&mut w, &m);
     m.clock.store(NOW + 6 * DAY, Ordering::SeqCst);
+    m.fsp.publish();
     // Past the rotation and its stagger, so this sync rolls the notes over at once.
     let sync = fsp_sync(&mut w, &m.air, service()).unwrap();
     assert!(
@@ -149,6 +153,7 @@ fn a_crash_after_the_mint_answered_is_finished_from_the_stored_answer() {
 
     // A rollover built and never sent (crash before sending): finished later.
     m.clock.store(NOW + 15 * DAY, Ordering::SeqCst);
+    m.fsp.publish();
     let keys = fsp_keys(&mut w, &m.air, service()).unwrap();
     w.note_fsp_keys(service(), &keys).unwrap();
     assert!(w.build_fsp_rollover(service()).unwrap().is_some());
@@ -168,6 +173,7 @@ fn offline_within_the_window_rolls_over_and_beyond_it_is_lost() {
     issue_all(&mut w, &m);
     // Back 9 days after activation: the genesis set is previous for 1 more day.
     m.clock.store(NOW + 14 * DAY, Ordering::SeqCst);
+    m.fsp.publish();
     let sync = fsp_sync(&mut w, &m.air, service()).unwrap();
     assert_eq!(sync.lost, 0);
     assert_eq!(fsp_units(&w), 3);
@@ -180,6 +186,7 @@ fn offline_within_the_window_rolls_over_and_beyond_it_is_lost() {
     let mut w2 = wallet_with_esp(&dir2, &m2, &[2, 1]);
     issue_all(&mut w2, &m2);
     m2.clock.store(NOW + 15 * DAY, Ordering::SeqCst);
+    m2.fsp.publish();
     let sync = fsp_sync(&mut w2, &m2.air, service()).unwrap();
     assert_eq!(sync.lost, 3, "{:?}", sync.log);
     assert_eq!(fsp_units(&w2), 0);
@@ -197,6 +204,7 @@ fn a_failed_rollover_is_logged_and_retried_on_the_next_connection() {
     issue_all(&mut w, &m);
     m.fsp.fail_spend(true);
     m.clock.store(NOW + 6 * DAY, Ordering::SeqCst);
+    m.fsp.publish();
     let sync = fsp_sync(&mut w, &m.air, service()).unwrap();
     assert!(
         sync.log
@@ -483,4 +491,331 @@ fn the_esp_schedule_reads_the_wallets_notes() {
     assert_eq!((s.mature_now, s.by, s.total), (0, Some((day, 10)), 10));
     assert_eq!(s.months.values().sum::<u128>(), 10);
     assert_eq!(w.esp_schedule(day, None).mature_now, 10);
+}
+
+// ---------------------------------------------------------------- the key check
+
+/// The policy the tests set: the blacklist on or off, the cap as it is by default.
+fn policy(blacklist: bool) -> KeyPolicy {
+    KeyPolicy {
+        blacklist_on_key_mismatch: blacklist,
+        blacklist_max: 1000,
+    }
+}
+
+/// The error of a call whose reply failed the key check.
+fn mismatch_of(e: WalletError) -> Box<KeyMismatch> {
+    match e {
+        WalletError::KeyMismatch(m) => m,
+        other => panic!("expected a key mismatch, got {other:?}"),
+    }
+}
+
+/// An error to retry: what a check gives when the record it needs is not
+/// published (yet). Panics on a mismatch or any other error.
+fn retryable(e: WalletError) -> String {
+    match e {
+        WalletError::Mint(why)
+            if why.contains("nothing was stored") && why.contains("try again") =>
+        {
+            why
+        }
+        other => panic!("expected an error to retry, got {other:?}"),
+    }
+}
+
+/// Rewrite the keys of every key set of the FSP mint the wallet has read (in the
+/// wallet file, the wallet closed): each amount gets the key of the next one.
+/// That is the one way to have the wallet hold a published key set that
+/// disagrees with the keys its mint signs with under the same ID (an ID is the
+/// hash of the keys, so a mint cannot publish other keys under it).
+fn hold_other_keys_for(path: &std::path::Path, service: ServiceDid) {
+    let mut file: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    let name = format!("fsp:{}", service.to_hex());
+    let keysets = file["key_streams"][&name]["keysets"]
+        .as_array_mut()
+        .expect("the wallet read the mint's key sets");
+    assert!(!keysets.is_empty());
+    for ks in keysets {
+        let keys = ks["keys"].as_object_mut().unwrap();
+        let values: Vec<serde_json::Value> = keys.values().cloned().collect();
+        for (i, v) in keys.values_mut().enumerate() {
+            *v = values[(i + 1) % values.len()].clone();
+        }
+    }
+    std::fs::write(path, serde_json::to_vec(&file).unwrap()).unwrap();
+}
+
+/// An issue whose key sets the FSP mint did not publish (its stream carries one
+/// key changed in each, so the key set it signs under is not on AIR) is not
+/// stored. It is an error to retry, not a mismatch (a key set not on AIR may
+/// not be published yet): no warning, no blacklist, the request and everything
+/// the wallet holds are kept, and a retry is the same.
+#[test]
+fn an_issue_signed_with_keys_the_mint_did_not_publish_is_retried_and_stores_nothing() {
+    let dir = scratch("key-issue");
+    let m = Mints::start_with(&dir, "8", "1", None, StreamMode::Tampered);
+    let air = m.fsp.air(8, 1);
+    let mut w = wallet_with_esp(&dir, &m, &[8, 4]);
+    assert_eq!(w.key_policy(), KeyPolicy::default());
+    assert!(!w.key_policy().blacklist_on_key_mismatch);
+    w.set_key_policy(policy(true));
+    let esp_before = w.notes().len();
+    let req = w.build_fsp_issue(service(), None, 0).unwrap();
+    let why = retryable(settle_fsp(&mut w, &air, &req.hash()).unwrap_err());
+    assert!(
+        why.contains("the FSP mint has not published key set"),
+        "{why}"
+    );
+    assert!(!why.contains("KEY CHECK FAILED"), "{why}");
+    // Nothing from the reply was stored, and the request is still there to retry.
+    assert_eq!(fsp_units(&w), 0);
+    assert_eq!(w.pending_fsp().len(), 1);
+    assert_eq!(
+        w.notes().len(),
+        esp_before,
+        "the ESP notes are kept, reserved"
+    );
+    assert!(
+        w.notes()
+            .iter()
+            .any(|n| n.reserved_by.as_deref() == Some(req.hash().as_str()))
+    );
+    assert!(w.blacklist().is_empty());
+    assert!(!w.is_blacklisted(&service()));
+    // A retry is the same.
+    retryable(settle_fsp(&mut w, &air, &req.hash()).unwrap_err());
+    assert_eq!(w.pending_fsp().len(), 1);
+    assert!(w.blacklist().is_empty());
+}
+
+/// A spend whose change is signed under a key set the mint did not publish (yet),
+/// with the blacklist on: an error to retry, the notes are kept, the request is
+/// kept, the mint is not blacklisted, and the next command still talks to it.
+/// (The key set that signed is the one the mint rotated to; the genesis set it
+/// published honestly.)
+#[test]
+fn a_spend_signed_under_an_unpublished_key_set_is_retried_and_keeps_the_notes() {
+    let dir = scratch("key-spend-off");
+    let m = start(&dir);
+    let air = m.fsp.air(8, 1);
+    let mut w = wallet_with_esp(&dir, &m, &[8, 4, 1]);
+    w.set_key_policy(policy(true));
+    issue_all(&mut w, &m);
+    assert_eq!(fsp_units(&w), 13);
+
+    // The mint rotates, and what it publishes of the new key set is not what it
+    // signs with.
+    m.fsp.stream().tamper(true);
+    m.clock.store(NOW + 5 * DAY + 2 * 3600, Ordering::SeqCst);
+    m.fsp.publish();
+    let req = w.build_fsp_spend(service(), 5, "coffee").unwrap();
+    let why = retryable(settle_fsp(&mut w, &air, &req.hash()).unwrap_err());
+    assert!(
+        why.contains("the FSP mint has not published key set"),
+        "{why}"
+    );
+    assert_eq!(fsp_units(&w), 13, "the notes are kept");
+    assert_eq!(w.pending_fsp().len(), 1, "the request is kept");
+    assert!(w.blacklist().is_empty());
+    // Not blacklisted: the next call goes to the mint (and is the same).
+    retryable(settle_fsp(&mut w, &air, &req.hash()).unwrap_err());
+    assert!(w.blacklist().is_empty());
+}
+
+/// The same with `fsp.blacklist_on_key_mismatch` on: the mint is blacklisted, its
+/// notes and requests are dropped from the wallet (removed, not backed up), the
+/// next command sends it nothing and says why, the entry is in the wallet file
+/// after a restart, and it goes only when it is removed by hand.
+#[test]
+fn with_the_blacklist_on_a_failing_fsp_mint_is_blacklisted_dropped_and_not_asked_again() {
+    let dir = scratch("key-spend-on");
+    let m = start(&dir);
+    let air = m.fsp.air(8, 1);
+    let mut w = wallet_with_esp(&dir, &m, &[8, 4, 1]);
+    issue_all(&mut w, &m);
+    assert_eq!(fsp_units(&w), 13);
+
+    // The wallet holds published keys under the key set's ID that are not the
+    // keys the mint signs with: a mismatch on published records.
+    drop(w);
+    hold_other_keys_for(&dir.join("wallet.json"), service());
+    let mut w = open_wallet(&dir.join("wallet.json")).unwrap();
+    w.set_key_policy(policy(true));
+    let req = w.build_fsp_spend(service(), 5, "coffee").unwrap();
+    let e = mismatch_of(settle_fsp(&mut w, &air, &req.hash()).unwrap_err());
+    assert!(matches!(e.failed, Failed::Key { .. }), "{:?}", e.failed);
+
+    assert_eq!((e.mint, e.site), ("FSP mint", Site::FinishFspSpend));
+    assert!(e.blacklisted);
+    assert!(
+        e.warning.contains("This FSP mint is now BLACKLISTED (fsp.blacklist_on_key_mismatch is on): its notes were DROPPED from this wallet"),
+        "{}",
+        e.warning
+    );
+    assert!(w.is_blacklisted(&service()));
+    assert_eq!(w.blacklist().len(), 1);
+    assert_eq!(w.blacklist()[0].site, "finish_fsp_spend");
+    assert_eq!(fsp_units(&w), 0, "its notes are dropped");
+    assert!(w.pending_fsp().is_empty(), "and its request");
+    assert!(w.notes().iter().all(|n| n.kind != Kind::Fsp));
+
+    // The next command sends the mint nothing, and says so.
+    let e = fsp_sync(&mut w, &air, service()).unwrap_err();
+    assert!(
+        matches!(&e, WalletError::Blacklisted(why) if why.contains("BLACKLISTED") && why.contains("blacklist remove")),
+        "{e:?}"
+    );
+    assert!(
+        w.air_requests().is_empty(),
+        "nothing was written to the mint"
+    );
+    let e = fsp_keys(&mut w, &air, service()).unwrap_err();
+    assert!(matches!(e, WalletError::Blacklisted(_)), "{e:?}");
+    assert!(
+        w.air_requests().is_empty(),
+        "nothing was written to the mint"
+    );
+
+    // The blacklist is in the wallet file, and stays until it is removed by hand.
+    drop(w);
+    let mut w = open_wallet(&dir.join("wallet.json")).unwrap();
+    assert!(w.is_blacklisted(&service()));
+    assert!(w.unblacklist(&service()).unwrap());
+    assert!(w.blacklist().is_empty());
+    assert!(
+        !w.unblacklist(&service()).unwrap(),
+        "nothing left to remove"
+    );
+}
+
+/// A mint whose key sets reach AIR after its reply does (its writer is a few
+/// seconds behind): the wallet waits for the stream, up to its reply wait, and
+/// finishes the issue when the key set arrives. Nothing is decided before.
+#[test]
+fn a_key_set_published_after_the_reply_is_waited_for_and_the_issue_then_finishes() {
+    let dir = scratch("key-late");
+    let m = Mints::start_with(&dir, "20", "2", None, StreamMode::Held);
+    let air = m.fsp.air(20, 2);
+    let mut w = wallet_with_esp(&dir, &m, &[8, 4, 1]);
+    let req = w.build_fsp_issue(service(), None, 0).unwrap();
+    let text = std::thread::scope(|scope| {
+        let publisher = scope.spawn(|| {
+            // Long enough for the wallet to have the reply and be waiting.
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            m.fsp.publish()
+        });
+        let text = settle_fsp(&mut w, &air, &req.hash()).unwrap();
+        assert!(publisher.join().unwrap(), "the key sets were written then");
+        text
+    });
+    assert!(text.starts_with("issued 13 FSP"), "{text}");
+    assert_eq!(fsp_units(&w), 13);
+    assert!(w.pending_fsp().is_empty());
+    assert!(w.blacklist().is_empty());
+}
+
+/// A stream the wallet cannot read a key set from yet (nothing was published,
+/// the mint's writer is behind or the AIR server is slow) decides nothing: the
+/// call is an error to retry, the request and the notes are kept, no warning
+/// says the mint cheated, and the retry finishes once the key set is on AIR.
+#[test]
+fn a_mint_with_nothing_published_yet_is_a_retryable_error_and_not_a_mismatch() {
+    let dir = scratch("key-unready");
+    let m = Mints::start_with(&dir, "20", "2", None, StreamMode::Held);
+    let air = m.fsp.air(6, 1);
+    let mut w = wallet_with_esp(&dir, &m, &[8, 4, 1]);
+    w.set_key_policy(policy(true));
+    let req = w.build_fsp_issue(service(), None, 0).unwrap();
+    let e = settle_fsp(&mut w, &air, &req.hash()).unwrap_err();
+    assert!(
+        matches!(&e, WalletError::Mint(why) if why.contains("the FSP mint has not published key set") && why.contains("try again")),
+        "{e:?}"
+    );
+    assert_eq!(w.pending_fsp().len(), 1, "the request is kept");
+    assert!(
+        w.blacklist().is_empty(),
+        "nobody was blacklisted for being late"
+    );
+
+    m.fsp.publish();
+    let text = settle_fsp(&mut w, &air, &req.hash()).unwrap();
+    assert!(text.starts_with("issued 13 FSP"), "{text}");
+    assert!(w.pending_fsp().is_empty());
+}
+
+/// Move back by a day, in the wallet file (the wallet closed), the time the
+/// wallet first read a stream without each record it is missing: what a day
+/// of waiting does, without a setting (the backstop is fixed) and without
+/// waiting a day.
+fn a_day_passes_for_the_missing_records(path: &std::path::Path) {
+    let mut file: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    let missing = file["unpublished"]
+        .as_object_mut()
+        .expect("the wallet noted a missing record");
+    assert!(!missing.is_empty());
+    for seen in missing.values_mut() {
+        let since = seen["since"].as_u64().unwrap();
+        seen["since"] = serde_json::json!(since - 86_400);
+    }
+    std::fs::write(path, serde_json::to_vec(&file).unwrap()).unwrap();
+}
+
+/// A mint that signs an issue under a key set it never publishes is not
+/// retried for ever: the reply is an error to retry while the key set could
+/// still be late, and once the fixed backstop (a day) has passed since the
+/// wallet first read the stream without it (no newer record orders it here),
+/// the retry is a key check failure. With the blacklist on, the mint is
+/// blacklisted and the ESP notes the issue reserved (their spend secrets went
+/// to the mint) are dropped with the request.
+#[test]
+fn an_issue_under_a_key_set_never_published_is_flagged_after_the_backstop() {
+    let dir = scratch("key-backstop");
+    let m = Mints::start_with(&dir, "8", "1", None, StreamMode::Tampered);
+    let air = m.fsp.air(8, 1);
+    let mut w = wallet_with_esp(&dir, &m, &[8, 4]);
+    w.set_key_policy(policy(true));
+    let esp_before = w.notes().len();
+    let req = w.build_fsp_issue(service(), None, 0).unwrap();
+    let reserved = w
+        .notes()
+        .iter()
+        .filter(|n| n.reserved_by.as_deref() == Some(req.hash().as_str()))
+        .count();
+    assert!(reserved > 0);
+    let why = retryable(settle_fsp(&mut w, &air, &req.hash()).unwrap_err());
+    assert!(
+        why.contains("if it is still not published (a day after"),
+        "{why}"
+    );
+    assert!(w.blacklist().is_empty());
+
+    let path = w.path().to_path_buf();
+    drop(w);
+    a_day_passes_for_the_missing_records(&path);
+    let mut w = open_wallet(&path).unwrap();
+    w.set_key_policy(policy(true));
+    let e = mismatch_of(settle_fsp(&mut w, &air, &req.hash()).unwrap_err());
+    assert!(
+        matches!(e.failed, Failed::Unpublished { .. }),
+        "{:?}",
+        e.failed
+    );
+    assert!(
+        e.warning.contains("KEY CHECK FAILED") && e.warning.contains("NOT PUBLISHED"),
+        "{}",
+        e.warning
+    );
+    assert_eq!((e.mint, e.site), ("FSP mint", Site::FinishFspIssue));
+    assert!(e.blacklisted);
+    assert!(w.is_blacklisted(&service()));
+    assert!(w.pending_fsp().is_empty(), "the request is dropped");
+    assert_eq!(
+        w.notes().len(),
+        esp_before - reserved,
+        "the ESP notes the issue reserved are dropped"
+    );
+    assert!(w.notes().iter().all(|n| n.reserved_by.is_none()));
 }

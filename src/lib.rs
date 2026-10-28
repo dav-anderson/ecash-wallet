@@ -31,6 +31,11 @@
 //!   user, sealed to the user's DID key, always swapped, and reclaimable by the
 //!   sender until the receiver swaps) and an FSP handoff (a user's own new
 //!   device: FSP and the DID key, never swapped).
+//! - [`keystream`]: the keys every mint publishes on AIR, and the check, before
+//!   anything from a mint's reply is stored, that each key it signed with and each
+//!   redeemable day it gave is the one it published (the defence against a mint
+//!   that fingerprints a user's notes with a key of its own); a failed check keeps
+//!   the notes, warns loudly, and can blacklist an FSP mint.
 //! - [`merge`]: reconciling a copy of the wallet retrieved from storage with
 //!   the local one.
 //! - [`rotate`]: the automatic, staggered rollover of PSP and ESP (and the
@@ -52,6 +57,7 @@ pub mod esp;
 pub mod esp_replies;
 pub mod fsp;
 pub mod handoff;
+pub mod keystream;
 pub mod lockfile;
 pub mod merge;
 pub mod mint_info;
@@ -64,4 +70,5 @@ pub mod transfer;
 pub mod version;
 
 pub use error::WalletError;
-pub use store::{Balance, EspLimits, Kind, Wallet};
+pub use keystream::{KeyMismatch, KeyPolicy};
+pub use store::{Balance, BlacklistedMint, EspLimits, Kind, Wallet};

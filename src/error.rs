@@ -48,6 +48,15 @@ pub enum WalletError {
         url: String,
         why: sp_wire::version::WireMismatch,
     },
+    /// A mint signed with a key, or gave a redeemable day, that it did not publish
+    /// (see [`crate::keystream`]). Nothing from its reply was stored. The notes and
+    /// the pending request were kept, unless the mint is an FSP mint that was
+    /// blacklisted. The warning was printed to stderr when it was found, and is
+    /// the error's message.
+    KeyMismatch(Box<crate::keystream::KeyMismatch>),
+    /// The request is for an FSP mint this wallet has blacklisted after a failed
+    /// key check. Nothing was sent. The message says how to remove the entry.
+    Blacklisted(String),
 }
 
 /// A `400` from a mint's POST route as the wallet sees it, over HTTP or AIR (a
@@ -101,6 +110,8 @@ impl fmt::Display for WalletError {
                     "the mint at {url} cannot be used: {why}. Nothing was sent"
                 )
             }
+            WalletError::KeyMismatch(m) => write!(f, "{m}"),
+            WalletError::Blacklisted(e) => write!(f, "{e}"),
         }
     }
 }

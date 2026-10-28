@@ -108,6 +108,7 @@ use sp_wire::psp::{ClaimRequest, ClaimResponse, KeysetsResponse};
 use sp_wire::seal::{PublicKey as DidPublicKey, SecretKey as DidSecretKey};
 
 use crate::blind::PendingOutput;
+use crate::config::Party;
 use crate::error::WalletError;
 use crate::rotate::Window;
 use crate::store::{
@@ -337,7 +338,9 @@ fn point(text: &str) -> Result<PublicKey, WalletError> {
 }
 
 /// The keys of the keyset that signed, from the answer. They must be the keys the
-/// keyset's id names, or it is not to be trusted with the notes.
+/// keyset's id names (the id hashes every amount and key), or it is not to be
+/// trusted with the notes. [`Wallet::apply_claim`] then checks them against the
+/// keys the PSP mint published ([`crate::keystream`]).
 fn keys_of(
     keyset: &str,
     keysets: &KeysetsResponse,
@@ -891,6 +894,15 @@ impl Wallet {
                 )));
             }
         }
+        // The shared key check: every key of the keyset the claim is built on is
+        // the key the PSP mint published for it, not only the hash of them.
+        let every: Vec<(u64, PublicKey)> = keys.iter().map(|(a, k)| (a.units, *k)).collect();
+        self.check_keyset_keys(
+            Party::Psp,
+            crate::keystream::Site::BuildClaim,
+            &keyset,
+            &every,
+        )?;
         let outputs: Vec<PendingOutput> = amounts.into_iter().map(PendingOutput::new).collect();
 
         let secret = addr::secret_from_hex(&key.claim_secret)
@@ -1072,6 +1084,15 @@ impl Wallet {
         }
         let keys =
             keys_of(&response.keyset, &response.keysets).map_err(|e| wrong(e.to_string()))?;
+        // The shared key check, before anything is stored: every key of the
+        // keyset in the answer is the key the PSP mint published for it.
+        let every: Vec<(u64, PublicKey)> = keys.iter().map(|(a, k)| (a.units, *k)).collect();
+        self.check_keyset_keys(
+            Party::Psp,
+            crate::keystream::Site::ApplyClaim,
+            &response.keyset,
+            &every,
+        )?;
         if response.signatures.len() != saved.outputs.len() {
             return Err(wrong(format!(
                 "it has {} signature(s) for {} output(s)",
@@ -1377,6 +1398,22 @@ mod tests {
             Keyset { sks, pks, window }
         }
 
+        /// The PSP mint "publishes" this keyset on its stream, as a wallet that
+        /// follows the stream has read it: every key, by amount. The record's
+        /// index is the epoch.
+        fn publish(&self, w: &mut Wallet) {
+            let keys: BTreeMap<u64, PublicKey> =
+                self.pks.iter().map(|(a, k)| (a.units, *k)).collect();
+            crate::keystream::testing::publish_keyset(
+                w,
+                "psp",
+                "00",
+                self.window.current_epoch as u32,
+                self.window.current_epoch,
+                &keys,
+            );
+        }
+
         fn listing(&self) -> KeysetsResponse {
             let id = self.window.current_id.clone();
             let mut keysets = BTreeMap::new();
@@ -1644,6 +1681,7 @@ mod tests {
         let second = sealed(&w, &psp, &id, 1, &owed("bb", 100));
         w.apply_delivery(&id, 1, &second, SECOND).unwrap();
         let ks = Keyset::new(5);
+        ks.publish(&mut w);
 
         // 1_800_000_000 + 2_592_000 = 1_802_592_000 < 1_803_000_000
         let refused = w
@@ -1682,6 +1720,7 @@ mod tests {
         let psp = DidSecretKey::new();
         let id = bought(&mut w, &psp, 797);
         let ks = Keyset::new(5);
+        ks.publish(&mut w);
         w.build_claim(&id, 0, &ks.window, &ks.pks, FIRST + 10)
             .unwrap();
         let after = FIRST + CLAIM_WINDOW_SECS;
@@ -1718,6 +1757,7 @@ mod tests {
         let psp = DidSecretKey::new();
         let id = bought(&mut w, &psp, 797);
         let ks = Keyset::new(5);
+        ks.publish(&mut w);
         let built = w
             .build_claim(&id, 0, &ks.window, &ks.pks, FIRST + 10)
             .unwrap();
@@ -1778,6 +1818,7 @@ mod tests {
         let psp = DidSecretKey::new();
         let id = bought(&mut w, &psp, 797);
         let first = Keyset::new(5);
+        first.publish(&mut w);
         w.build_claim(&id, 0, &first.window, &first.pks, FIRST + 10)
             .unwrap();
         let e = expect::invalid(w.build_claim(&id, 0, &first.window, &first.pks, FIRST + 20));
@@ -1788,12 +1829,14 @@ mod tests {
         assert_eq!(record_state(&w, &id, 0).attempts, 1);
 
         let second = Keyset::new(6);
+        second.publish(&mut w);
         let built = w
             .build_claim(&id, 0, &second.window, &second.pks, FIRST + 30)
             .unwrap();
         assert_eq!(built.attempt, 2);
         assert_eq!(w.air_requests().len(), 1, "the old request is replaced");
         let third = Keyset::new(7);
+        third.publish(&mut w);
         assert_eq!(
             w.build_claim(&id, 0, &third.window, &third.pks, FIRST + 40)
                 .unwrap()
@@ -1801,6 +1844,7 @@ mod tests {
             3
         );
         let fourth = Keyset::new(8);
+        fourth.publish(&mut w);
         let e = expect::invalid(w.build_claim(&id, 0, &fourth.window, &fourth.pks, FIRST + 50));
         assert!(
             e.contains("3 claim(s) were built already, and the PSP mint counts 3"),
@@ -1820,6 +1864,7 @@ mod tests {
         let psp = DidSecretKey::new();
         let id = bought(&mut w, &psp, 797);
         let ks = Keyset::new(5);
+        ks.publish(&mut w);
         let e =
             expect::invalid(w.build_claim(&id, 0, &ks.window, &ks.pks, FIRST + CLAIM_WINDOW_SECS));
         assert!(
@@ -1846,6 +1891,7 @@ mod tests {
         let reply = answer(&w, &id, 0, &ks);
         w.apply_claim(&id, 0, &reply).unwrap();
         let next = Keyset::new(6);
+        next.publish(&mut w);
         let e = expect::invalid(w.build_claim(&id, 0, &next.window, &next.pks, FIRST + 20));
         assert!(e.contains("nothing is left to claim"), "{e}");
         fs::remove_dir_all(&dir).unwrap();
@@ -1861,6 +1907,7 @@ mod tests {
         let psp = DidSecretKey::new();
         let id = bought(&mut w, &psp, 797);
         let ks = Keyset::new(5);
+        ks.publish(&mut w);
         w.build_claim(&id, 0, &ks.window, &ks.pks, FIRST + 10)
             .unwrap();
         let reply = answer(&w, &id, 0, &ks);
@@ -1902,6 +1949,7 @@ mod tests {
         let psp = DidSecretKey::new();
         let id = bought(&mut w, &psp, 797);
         let ks = Keyset::new(5);
+        ks.publish(&mut w);
         w.build_claim(&id, 0, &ks.window, &ks.pks, FIRST + 10)
             .unwrap();
         let good = answer(&w, &id, 0, &ks);
@@ -1972,6 +2020,7 @@ mod tests {
         let psp = DidSecretKey::new();
         let id = bought(&mut w, &psp, 797);
         let ks = Keyset::new(5);
+        ks.publish(&mut w);
         w.build_claim(&id, 0, &ks.window, &ks.pks, FIRST + 10)
             .unwrap();
         let reply = answer(&w, &id, 0, &ks);
@@ -2039,6 +2088,7 @@ mod tests {
         assert_eq!(open[0].window_ends, 1_802_592_000);
         for epoch in 5..8 {
             let ks = Keyset::new(epoch);
+            ks.publish(&mut w);
             w.build_claim(&id, 0, &ks.window, &ks.pks, now).unwrap();
         }
         assert_eq!(w.open_claims(now)[0].status, ClaimStatus::Sent);
@@ -2098,6 +2148,7 @@ mod tests {
         let psp = DidSecretKey::new();
         let id = bought(&mut w, &psp, 797);
         let ks = Keyset::new(5);
+        ks.publish(&mut w);
         w.build_claim(&id, 0, &ks.window, &ks.pks, FIRST + 10)
             .unwrap();
         let stale = w.snapshot();
@@ -2237,6 +2288,8 @@ mod tests {
         fs::copy(a.path(), &b_path).unwrap();
         let mut b = open_wallet(&b_path).unwrap();
         let ks = Keyset::new(5);
+        ks.publish(&mut a);
+        ks.publish(&mut b);
         a.build_claim(&id, 0, &ks.window, &ks.pks, FIRST + 10)
             .unwrap();
         b.build_claim(&id, 0, &ks.window, &ks.pks, FIRST + 20)
@@ -2293,6 +2346,93 @@ mod tests {
         c.drop_other_claim(&id, 0, &other[0]).unwrap();
         let r = record_state(&c, &id, 0);
         assert!(r.others.is_empty() && r.request.is_some() && !r.done);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A claim is built only on a key set the PSP published: on keys it has not
+    /// published (yet) no claim is built, the wallet writes and sends nothing,
+    /// and the error is one to retry, not a mismatch (it may be published in a
+    /// moment).
+    #[test]
+    fn a_claim_is_not_built_on_a_key_set_the_psp_did_not_publish() {
+        let (mut w, dir) = wallet("claim-unpublished");
+        let psp = DidSecretKey::new();
+        let id = bought(&mut w, &psp, 797);
+        let ks = Keyset::new(5);
+        // The PSP published a key set, and it is another one.
+        Keyset::new(6).publish(&mut w);
+        let why = crate::keystream::testing::retryable(w.build_claim(
+            &id,
+            0,
+            &ks.window,
+            &ks.pks,
+            FIRST + 10,
+        ));
+        assert!(
+            why.contains(&format!(
+                "the PSP mint has not published key set {}",
+                ks.window.current_id
+            )),
+            "{why}"
+        );
+        assert!(w.air_requests().is_empty());
+        assert!(record_state(&w, &id, 0).request.is_none());
+        assert_eq!(record_state(&w, &id, 0).attempts, 0);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An answer is stored only if its key set is still one of the last two the
+    /// PSP published: the key set of a claim the PSP has rotated away from twice
+    /// since the claim was built is not stored from, and the claim is kept. It is
+    /// an error to retry, not a mismatch: the wallet cannot tell it from a key set
+    /// not published yet.
+    #[test]
+    fn an_answer_under_a_key_set_two_rotations_old_is_not_stored() {
+        let (mut w, dir) = wallet("claim-old");
+        let psp = DidSecretKey::new();
+        let id = bought(&mut w, &psp, 797);
+        let ks = Keyset::new(5);
+        ks.publish(&mut w);
+        w.build_claim(&id, 0, &ks.window, &ks.pks, FIRST + 10)
+            .unwrap();
+        let reply = answer(&w, &id, 0, &ks);
+
+        // One rotation on: the previous key set is still accepted ...
+        Keyset::new(6).publish(&mut w);
+        let before = crate::keystream::testing::held(&w);
+        // ... two on, it is not.
+        Keyset::new(7).publish(&mut w);
+        let before_two = crate::keystream::testing::held(&w);
+        assert_ne!(before, before_two, "the stream moved");
+        let why = crate::keystream::testing::retryable(w.apply_claim(&id, 0, &reply));
+        assert!(
+            why.contains("the PSP mint has not published key set"),
+            "{why}"
+        );
+        assert!(w.notes().is_empty(), "nothing from the answer was stored");
+        let r = record_state(&w, &id, 0);
+        assert!(!r.done && r.request.is_some(), "the claim is kept");
+        assert_eq!(crate::keystream::testing::held(&w), before_two);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The previous key set is accepted: an answer to a claim built one rotation
+    /// ago is stored.
+    #[test]
+    fn an_answer_under_the_previous_key_set_is_stored() {
+        let (mut w, dir) = wallet("claim-previous");
+        let psp = DidSecretKey::new();
+        let id = bought(&mut w, &psp, 797);
+        let ks = Keyset::new(5);
+        ks.publish(&mut w);
+        w.build_claim(&id, 0, &ks.window, &ks.pks, FIRST + 10)
+            .unwrap();
+        let reply = answer(&w, &id, 0, &ks);
+        Keyset::new(6).publish(&mut w);
+        let Applied::Settled(s) = w.apply_claim(&id, 0, &reply).unwrap() else {
+            panic!("not settled");
+        };
+        assert_eq!(s.units, 797);
         fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -974,6 +974,13 @@ impl Wallet {
     /// reports the payout's entry, and a completed or declined entry ends the
     /// redemption (a declined one gives the reissued notes back). Safe to call
     /// with a repeated reply.
+    ///
+    /// **Before anything is stored** the keys of every refund and decline output
+    /// are checked against what the ESP published on AIR for the output's own
+    /// service and day (see [`crate::keystream`]; the day window of a new exchange
+    /// does not apply). On a mismatch nothing is stored, the redemption stays
+    /// pending, a warning is printed, and the error is
+    /// [`WalletError::KeyMismatch`].
     pub fn finish_redemption(
         &mut self,
         id: &str,
@@ -1002,6 +1009,15 @@ impl Wallet {
         let mut new_keysets: Vec<(String, String)> = Vec::new();
         if first {
             for (o, signed) in pending.refund_outputs.iter().zip(&response.refund) {
+                // The shared key check, before anything is stored: the refund is
+                // signed for the note's own day (no day window applies).
+                self.check_esp_day_keys(
+                    crate::keystream::Site::RedeemRefund,
+                    &signed.keyset,
+                    &o.service,
+                    o.redeemable_after_day,
+                    &[(o.output.amount, signed.key)],
+                )?;
                 let note = StoredNote {
                     kind: Kind::Esp,
                     amount: o.output.amount,
@@ -1053,6 +1069,13 @@ impl Wallet {
                     let mut units = 0u128;
                     for (o, signed) in pending.decline_outputs.iter().zip(&view.decline_signatures)
                     {
+                        self.check_esp_day_keys(
+                            crate::keystream::Site::RedeemDecline,
+                            &signed.keyset,
+                            &o.service,
+                            o.redeemable_after_day,
+                            &[(o.output.amount, signed.key)],
+                        )?;
                         let note = StoredNote {
                             kind: Kind::Esp,
                             amount: o.output.amount,
@@ -1668,6 +1691,24 @@ mod tests {
         fs::remove_dir_all(&dir2).unwrap();
     }
 
+    /// The ESP "publishes" what a mint holding `sk` signs the outputs of `p` with:
+    /// the key set `signed` names is live, and every output's (service, day) has
+    /// the key of `sk` for all 64 amounts.
+    fn publish_for(w: &mut Wallet, p: &PendingRedemption, sk: &SecretKey) {
+        let key = sk.public_key(SECP256K1);
+        let generation = "cd".repeat(8);
+        crate::keystream::testing::publish_control(w, 0, 365, &generation, None);
+        for o in p.refund_outputs.iter().chain(&p.decline_outputs) {
+            crate::keystream::testing::publish_day(
+                w,
+                &generation,
+                &o.service,
+                o.redeemable_after_day,
+                vec![key; 64],
+            );
+        }
+    }
+
     fn signed(sk: &SecretKey, o: &TermsOutput) -> SignedOutput {
         SignedOutput {
             signature: bdhke::sign_message(sk, &o.output.blind_nonce.0),
@@ -1764,6 +1805,7 @@ mod tests {
         assert!(w.notes().is_empty());
         // declined: the decline outputs are signed, a power of two each, minus the fee
         let mint = SecretKey::new(&mut rand::rngs::OsRng);
+        publish_for(&mut w, &p, &mint);
         let sigs: Vec<_> = p.decline_outputs.iter().map(|o| signed(&mint, o)).collect();
         let declined = reply(
             &p,
@@ -2004,6 +2046,7 @@ mod tests {
         );
         let p = w.pending_redemptions()[0].clone();
         let mint = SecretKey::new(&mut rand::rngs::OsRng);
+        publish_for(&mut w, &p, &mint);
         let refund: Vec<_> = p.refund_outputs.iter().map(|o| signed(&mint, o)).collect();
         totals.fee_esp = p.fee_esp;
         let r = RedeemResponse {
